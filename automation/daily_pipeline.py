@@ -231,8 +231,9 @@ def main():
         raise RuntimeError("Comparator did not create manifest.json")
 
     manifest = json.loads(manifest_path.read_text())
-    total_changes = int(manifest.get("total_append", 0)) + int(
-        manifest.get("total_update", 0)
+    summary = manifest.get("summary", {})
+    total_changes = int(summary.get("total_append", 0)) + int(
+        summary.get("total_update", 0)
     )
 
     print("Changes:", total_changes)
@@ -260,7 +261,7 @@ def main():
         print("Worker:", result)
         if result.get("success") and (
             result.get("message") == "All ingestion jobs completed."
-            or result.get("remaining", 1) == 0
+            or result.get("progress", {}).get("remaining", 1) == 0
         ):
             break
 
