@@ -164,7 +164,7 @@ def verify_run(run_id, expected_jobs):
     for status in ["completed", "pending", "processing", "failed"]:
         r = (
             sb.table("ingestion_jobs")
-            .select("id", count="exact")
+            .select("job_id", count="exact")
             .eq("run_id", run_id)
             .eq("status", status)
             .execute()
