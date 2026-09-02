@@ -412,6 +412,102 @@ def upload_manifest(
 
 
 # ==========================================
+# Upload completion marker
+# ==========================================
+
+def upload_completion_marker(
+    timestamp,
+    results
+):
+    """
+    Validate all six datasets and upload
+    _COMPLETE.json.
+
+    If validation fails or the upload fails,
+    raise an exception so the caller can
+    treat the entire run as failed.
+    """
+
+    expected = set(DATASETS.keys())
+    actual = set(results.keys())
+
+    if actual != expected:
+        missing = expected - actual
+        raise RuntimeError(
+            "Cannot create completion marker: "
+            f"missing datasets: {sorted(missing)}"
+        )
+
+    for name in DATASETS:
+        r = results[name]
+
+        if not isinstance(r, dict):
+            raise RuntimeError(
+                "Cannot create completion marker: "
+                f"{name} has invalid result"
+            )
+
+        records = r.get("records")
+        chunks = r.get("chunks")
+
+        if not isinstance(records, int):
+            raise RuntimeError(
+                "Cannot create completion marker: "
+                f"{name} has invalid record count"
+            )
+
+        if not isinstance(chunks, int):
+            raise RuntimeError(
+                "Cannot create completion marker: "
+                f"{name} has invalid chunk count"
+            )
+
+    datasets_meta = {}
+
+    for name in DATASETS:
+        r = results[name]
+
+        datasets_meta[name] = {
+            "records": r["records"],
+            "chunks": r["chunks"],
+        }
+
+    marker = {
+        "timestamp": timestamp,
+        "completed_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "status": "complete",
+        "datasets": datasets_meta,
+    }
+
+    path = f"{timestamp}/_COMPLETE.json"
+
+    content = json.dumps(
+        marker,
+        indent=2,
+        ensure_ascii=False
+    ).encode("utf-8")
+
+    (
+        supabase
+        .storage
+        .from_(BUCKET)
+        .upload(
+            path=path,
+            file=content,
+            file_options={
+                "content-type": "application/json",
+                "cache-control": "3600",
+                "upsert": "false",
+            }
+        )
+    )
+
+    print("  ✓ Completion marker uploaded")
+
+
+# ==========================================
 # Process one dataset
 # ==========================================
 
@@ -650,6 +746,10 @@ def main():
         print()
         print(f"Timestamp folder: {timestamp}")
 
+        # ==================================
+        # COMPLETION MARKER
+        # ==================================
+
         if failed:
             print()
             print(
@@ -660,8 +760,30 @@ def main():
             raise SystemExit(1)
 
         print()
+        print("Uploading completion marker...")
+
+        try:
+            upload_completion_marker(
+                timestamp,
+                results
+            )
+        except Exception as error:
+            print()
+            print(
+                f"✗ FAILED to upload "
+                f"completion marker: {error}"
+            )
+            print(
+                "Run treated as FAILED because "
+                "_COMPLETE.json could not be "
+                "uploaded."
+            )
+            raise SystemExit(1)
+
+        print()
         print("✓ ALL 6 DATASETS SUCCESSFUL")
-        print("✓ SNAPSHOT IS READY FOR UPDATER")
+        print("✓ COMPLETION MARKER UPLOADED")
+        print("✓ SNAPSHOT IS READY FOR INGESTION")
 
     finally:
         session.close()
