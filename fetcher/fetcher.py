@@ -798,7 +798,7 @@ def main():
         # Fetch MP datasets
         # ==================================
 
-        mp_results, mp_successful, mp_failed, mp_failed = fetch_member_type(
+        mp_results, mp_successful, mp_failed, mp_failed_datasets = fetch_member_type(
             session,
             "MP",
             MP_DATASETS,
@@ -810,13 +810,13 @@ def main():
         all_results.update(mp_results)
         total_successful += mp_successful
         total_failed += mp_failed
-        all_failed_datasets.extend(mp_failed)
+        all_failed_datasets.extend(mp_failed_datasets)
 
         # ==================================
         # Fetch MLA datasets
         # ==================================
 
-        mla_results, mla_successful, mla_failed, mla_failed = fetch_member_type(
+        mla_results, mla_successful, mla_failed, mla_failed_datasets = fetch_member_type(
             session,
             "MLA",
             MLA_DATASETS,
@@ -828,7 +828,7 @@ def main():
         all_results.update(mla_results)
         total_successful += mla_successful
         total_failed += mla_failed
-        all_failed_datasets.extend(mla_failed)
+        all_failed_datasets.extend(mla_failed_datasets)
 
         # ==================================
         # Final summary
