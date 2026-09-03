@@ -6,11 +6,14 @@ Compares two complete MPLADS snapshots stored in Supabase Storage.
 Uses SQLite as a temporary local database for memory-efficient comparison.
 
 Usage:
-    python3 comparator_v2.py [--old TIMESTAMP] [--new TIMESTAMP]
+    python3 comparator_v2.py [--old TIMESTAMP] [--new TIMESTAMP] [--new-local PATH]
     python3 comparator_v2.py --old 2026-08-31T18-22-06Z --new 2026-09-01T16-50-37Z
+    python3 comparator_v2.py --old 2026-08-31T18-22-06Z --new 2026-09-01T16-50-37Z --new-local /path/to/local/snapshot
 
 If --old is omitted, reports bootstrap (no delta generated).
-If both are omitted, auto-discovers the two most recent complete snapshots.
+If --new is omitted (and --new-local not given), auto-discovers the two most recent complete snapshots.
+If --new-local is supplied, uses the local directory as the new snapshot instead of downloading from Supabase.
+  The --new timestamp is still used for manifest labeling and output naming.
 
 Output structure:
     delta_<new_timestamp>/
@@ -512,6 +515,72 @@ def download_snapshot_files(timestamp: str) -> Dict[str, Dict[str, Any]]:
     return result
 
 
+def load_local_snapshot_files(snapshot_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """
+    Validate and load a local snapshot directory as the new snapshot.
+
+    The directory is expected to follow the same structure as a Supabase
+    snapshot (as produced by the government fetcher):
+
+        <snapshot_dir>/
+            allocated_limit/
+                part_0001.ndjson
+                part_0002.ndjson
+            works_recommended/
+                part_0001.ndjson
+            ...
+
+    Returns {dataset: {local_dir, file_count}} for each dataset that has
+    part files, matching the format returned by download_snapshot_files().
+
+    Validates that:
+    - The path exists and is a directory.
+    - At least one expected dataset folder contains part_*.ndjson files.
+    - No dataset folder exists without valid part_*.ndjson files (structural
+      integrity check).
+    """
+    if not snapshot_dir.exists():
+        raise RuntimeError(
+            f"FATAL: Local snapshot path does not exist: {snapshot_dir}"
+        )
+    if not snapshot_dir.is_dir():
+        raise RuntimeError(
+            f"FATAL: Local snapshot path is not a directory: {snapshot_dir}"
+        )
+
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for dataset in DATASETS:
+        dataset_dir = snapshot_dir / dataset
+        if not dataset_dir.is_dir():
+            continue
+
+        part_files = sorted(
+            f.name for f in dataset_dir.iterdir()
+            if f.name.startswith("part_") and f.name.endswith(".ndjson")
+        )
+
+        if not part_files:
+            raise RuntimeError(
+                f"FATAL: Dataset folder '{dataset}' exists in local snapshot "
+                f"at {snapshot_dir} but contains no part_*.ndjson files."
+            )
+
+        result[dataset] = {
+            "local_dir": dataset_dir,
+            "file_count": len(part_files),
+        }
+
+    if not result:
+        raise RuntimeError(
+            f"FATAL: Local snapshot at {snapshot_dir} contains no valid "
+            f"dataset folders with part_*.ndjson files. "
+            f"Expected at least one of: {DATASETS}"
+        )
+
+    return result
+
+
 # ============================================================
 # RECORD ITERATION
 # ============================================================
@@ -925,6 +994,10 @@ def main() -> int:
     )
     parser.add_argument("--old", type=str, default=None, help="Previous snapshot timestamp")
     parser.add_argument("--new", type=str, default=None, help="New snapshot timestamp")
+    parser.add_argument("--new-local", type=str, default=None,
+                        help="Path to local directory containing the new snapshot "
+                             "(avoids downloading from Supabase; --new still required "
+                             "for timestamp label)")
     parser.add_argument("--output", type=str, default=None, help="Output directory for delta files")
     args = parser.parse_args()
 
@@ -978,9 +1051,17 @@ def main() -> int:
     # Download snapshots
     # ----------------------------------------------------------
 
-    print(f"\nDownloading new snapshot {new_timestamp}...")
-    new_files = download_snapshot_files(new_timestamp)
-    print(f"  Datasets: {list(new_files.keys())}")
+    if args.new_local and not args.new:
+        parser.error("--new is required when --new-local is supplied (used for timestamp label)")
+
+    if args.new_local:
+        print(f"\nUsing local snapshot: {args.new_local}")
+        new_files = load_local_snapshot_files(Path(args.new_local))
+        print(f"  Datasets: {list(new_files.keys())}")
+    else:
+        print(f"\nDownloading new snapshot {new_timestamp}...")
+        new_files = download_snapshot_files(new_timestamp)
+        print(f"  Datasets: {list(new_files.keys())}")
 
     old_files = {}
     if old_timestamp:

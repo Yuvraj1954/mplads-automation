@@ -1,7 +1,9 @@
 import json
 import os
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -200,7 +202,8 @@ def upload_chunk(
     dataset_name,
     timestamp,
     chunk_number,
-    records
+    records,
+    local_snapshot_dir,
 ):
     folder = f"{timestamp}/{dataset_name}"
     filename = f"part_{chunk_number:04d}.ndjson"
@@ -217,6 +220,11 @@ def upload_chunk(
 
     ndjson += "\n"
     content = ndjson.encode("utf-8")
+
+    local_dir = local_snapshot_dir / dataset_name
+    local_dir.mkdir(parents=True, exist_ok=True)
+    local_path = local_dir / filename
+    local_path.write_bytes(content)
 
     size_mb = len(content) / (1024 * 1024)
 
@@ -253,7 +261,8 @@ def upload_chunk(
 def upload_dataset(
     dataset_name,
     data,
-    timestamp
+    timestamp,
+    local_snapshot_dir,
 ):
     dataset_key, records = extract_records(
         data,
@@ -345,7 +354,8 @@ def upload_dataset(
             dataset_name=dataset_name,
             timestamp=timestamp,
             chunk_number=chunk_number,
-            records=chunk
+            records=chunk,
+            local_snapshot_dir=local_snapshot_dir,
         )
 
         uploaded_records += len(chunk)
@@ -515,7 +525,8 @@ def process_dataset(
     session,
     dataset_name,
     dataset_key,
-    timestamp
+    timestamp,
+    local_snapshot_dir,
 ):
     data = fetch_dataset(
         session,
@@ -526,7 +537,8 @@ def process_dataset(
     result = upload_dataset(
         dataset_name,
         data,
-        timestamp
+        timestamp,
+        local_snapshot_dir,
     )
 
     upload_manifest(
@@ -557,6 +569,11 @@ def main():
     print(f"Chunk size: {CHUNK_SIZE}")
     print(f"Retries after first pass: {MAX_RETRIES}")
     print("=" * 70)
+
+    local_snapshot_dir = Path(
+        tempfile.mkdtemp(prefix=f"mplads_local_{timestamp}_")
+    )
+    print(f"Local snapshot: {local_snapshot_dir}")
 
     # --------------------------------------
     # Initial session
@@ -589,7 +606,8 @@ def main():
                     session,
                     dataset_name,
                     dataset_key,
-                    timestamp
+                    timestamp,
+                    local_snapshot_dir,
                 )
 
                 results[dataset_name] = result
@@ -673,7 +691,8 @@ def main():
                             session,
                             dataset_name,
                             dataset_key,
-                            timestamp
+                            timestamp,
+                            local_snapshot_dir,
                         )
 
                         results[dataset_name] = result
@@ -784,6 +803,8 @@ def main():
         print("✓ ALL 6 DATASETS SUCCESSFUL")
         print("✓ COMPLETION MARKER UPLOADED")
         print("✓ SNAPSHOT IS READY FOR INGESTION")
+        print(f"✓ Local snapshot: {local_snapshot_dir}")
+        print(f"LOCAL_SNAPSHOT_PATH={local_snapshot_dir}")
 
     finally:
         session.close()

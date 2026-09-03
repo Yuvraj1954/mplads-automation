@@ -39,6 +39,61 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
+def run_fetcher(cmd):
+    """Run the fetcher, stream its output in real time, and capture stdout.
+
+    Returns the list of stdout lines (as strings) so callers can parse
+    machine-readable markers like LOCAL_SNAPSHOT_PATH=.
+    """
+    print("$", " ".join(map(str, cmd)))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    captured = []
+    for raw_line in iter(proc.stdout.readline, b""):
+        line = raw_line.decode("utf-8", errors="replace")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        captured.append(line)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    return captured
+
+
+EXPECTED_DATASETS = [
+    "allocated_limit",
+    "works_recommended",
+    "works_sanctioned",
+    "works_completed",
+    "expenditure",
+    "calamity",
+]
+
+
+def validate_local_snapshot(path):
+    """Validate that the local snapshot directory has the expected structure."""
+    p = Path(path)
+    if not p.exists():
+        raise RuntimeError(f"Local snapshot path does not exist: {p}")
+    if not p.is_dir():
+        raise RuntimeError(f"Local snapshot path is not a directory: {p}")
+    for dataset in EXPECTED_DATASETS:
+        dataset_dir = p / dataset
+        if not dataset_dir.is_dir():
+            raise RuntimeError(
+                f"Local snapshot missing dataset folder: {dataset}"
+            )
+        part_files = list(dataset_dir.glob("part_*.ndjson"))
+        if not part_files:
+            raise RuntimeError(
+                f"Local snapshot dataset '{dataset}' has no part_*.ndjson files"
+            )
+    print(f"Local snapshot validated: {p}")
+
+
 def list_complete_snapshots():
     rows = sb.storage.from_(BUCKET).list("", {"limit": 1000, "offset": 0})
     snapshots = []
@@ -164,7 +219,7 @@ def verify_run(run_id, expected_jobs):
     for status in ["completed", "pending", "processing", "failed"]:
         r = (
             sb.table("ingestion_jobs")
-            .select("job_id", count="exact")
+            .select("id", count="exact")
             .eq("run_id", run_id)
             .eq("status", status)
             .execute()
@@ -183,6 +238,21 @@ def verify_run(run_id, expected_jobs):
     )
 
 
+def _cleanup_local_snapshot(path):
+    """Remove the temporary local snapshot directory.
+
+    Failures are printed as warnings but do not raise, so an already-successful
+    pipeline is not marked as failed.
+    """
+    if not path:
+        return
+    try:
+        shutil.rmtree(path)
+        print(f"Local snapshot cleaned up: {path}")
+    except Exception as exc:
+        print(f"WARNING: Could not remove local snapshot {path}: {exc}")
+
+
 def main():
     if not FETCHER.exists():
         raise RuntimeError(f"Fetcher not found: {FETCHER}")
@@ -194,7 +264,20 @@ def main():
         )
 
     print("=== STEP 1: FETCH ===")
-    run([sys.executable, str(FETCHER)])
+    fetcher_output = run_fetcher([sys.executable, str(FETCHER)])
+
+    local_snapshot_path = None
+    for line in fetcher_output:
+        if line.startswith("LOCAL_SNAPSHOT_PATH="):
+            local_snapshot_path = line.split("=", 1)[1].strip()
+            break
+
+    if not local_snapshot_path:
+        raise RuntimeError(
+            "Fetcher completed but LOCAL_SNAPSHOT_PATH not found in output"
+        )
+
+    validate_local_snapshot(local_snapshot_path)
 
     snapshots = list_complete_snapshots()
     if not snapshots:
@@ -223,6 +306,7 @@ def main():
         str(COMPARATOR),
         "--old", old_ts,
         "--new", new_ts,
+        "--new-local", local_snapshot_path,
         "--output", str(workdir),
     ])
 
@@ -245,6 +329,7 @@ def main():
         print("No changes. No ingestion needed.")
         delete_delta_run(run_id)
         delete_old_raw_snapshots(snapshots[-2:])
+        _cleanup_local_snapshot(local_snapshot_path)
         return
 
     print("=== STEP 4: CREATE INGESTION JOBS ===")
@@ -272,6 +357,8 @@ def main():
     print("=== STEP 7: CLEANUP ===")
     delete_delta_run(run_id)
     delete_old_raw_snapshots(snapshots[-2:])
+
+    _cleanup_local_snapshot(local_snapshot_path)
 
     print("=== PIPELINE COMPLETE ===")
 
