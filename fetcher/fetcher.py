@@ -326,6 +326,17 @@ def upload_dataset(
 
     print(f"Records to upload: {len(records)}")
 
+    if not records and dataset_name in {
+        "works_recommended",
+        "works_sanctioned",
+        "expenditure",
+    }:
+        raise RuntimeError(
+            f"{dataset_name}: API returned 0 valid work records "
+            f"after filtering (likely returned only a summary row). "
+            f"Treating as failure so it will be retried."
+        )
+
     # --------------------------------------
     # Create chunks
     # --------------------------------------
