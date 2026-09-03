@@ -2,6 +2,11 @@ name: MPLADS Daily Pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      sync_interval_hours:
+        description: 'Sync interval in hours (default: 24)'
+        required: false
+        default: '24'
 
   schedule:
     # 00:00 UTC = 05:30 IST
@@ -33,4 +38,5 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SYNC_INTERVAL_HOURS: ${{ github.event.inputs.sync_interval_hours || '24' }}
         run: python automation/daily_pipeline.py

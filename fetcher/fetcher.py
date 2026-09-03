@@ -40,7 +40,10 @@ API_URL = (
 )
 
 BUCKET = "mplads-raw"
-COMBO = "0,0,0,2"
+
+# Combo values for MP and MLA data
+MP_COMBO = "0,0,0,2"
+MLA_COMBO = "0,0,0,1"
 
 # Number of records per NDJSON file
 CHUNK_SIZE = 2000
@@ -52,8 +55,8 @@ MAX_RETRIES = 2
 # Delay between retry attempts, in seconds.
 RETRY_DELAY_SECONDS = 5
 
-
-DATASETS = {
+# MP datasets
+MP_DATASETS = {
     "works_recommended": "Works Recommended",
     "works_sanctioned": "Works Sanctioned",
     "works_completed": "Works Completed",
@@ -61,6 +64,19 @@ DATASETS = {
     "calamity": "Amount consented for Calamity",
     "allocated_limit": "Allocated Limit for Hon'ble MPs",
 }
+
+# MLA datasets
+MLA_DATASETS = {
+    "works_recommended": "Works Recommended",
+    "works_sanctioned": "Works Sanctioned",
+    "works_completed": "Works Completed",
+    "expenditure": "Expenditure on Completed and On-going Works as on Date",
+    "calamity": "Amount consented for Calamity",
+    "allocated_limit": "Allocated Limit for Hon'ble MLAs",
+}
+
+# Combined datasets for backward compatibility
+DATASETS = MP_DATASETS
 
 
 # ==========================================
@@ -107,15 +123,16 @@ def establish_session(session):
 # Fetch one dataset
 # ==========================================
 
-def fetch_dataset(session, dataset_name, dataset_key):
+def fetch_dataset(session, dataset_name, dataset_key, combo):
     print()
     print("=" * 70)
     print(f"Fetching: {dataset_name}")
     print(f"Key:      {dataset_key}")
+    print(f"Combo:    {combo}")
     print("=" * 70)
 
     payload = {
-        "combo": COMBO,
+        "combo": combo,
         "key": dataset_key
     }
 
@@ -277,7 +294,9 @@ def upload_dataset(
     # Remove summary/non-record rows
     # --------------------------------------
 
-    if dataset_name in {
+    # Check both MP and MLA dataset names
+    base_name = dataset_name.replace("mla_", "")
+    if base_name in {
         "works_recommended",
         "works_sanctioned",
         "expenditure",
@@ -301,7 +320,7 @@ def upload_dataset(
                 f"non-work records"
             )
 
-    elif dataset_name == "works_completed":
+    elif base_name == "works_completed":
         before = len(records)
 
         records = [
@@ -326,7 +345,7 @@ def upload_dataset(
 
     print(f"Records to upload: {len(records)}")
 
-    if not records and dataset_name in {
+    if not records and base_name in {
         "works_recommended",
         "works_sanctioned",
         "expenditure",
@@ -441,7 +460,7 @@ def upload_completion_marker(
     results
 ):
     """
-    Validate all six datasets and upload
+    Validate all datasets and upload
     _COMPLETE.json.
 
     If validation fails or the upload fails,
@@ -449,7 +468,10 @@ def upload_completion_marker(
     treat the entire run as failed.
     """
 
-    expected = set(DATASETS.keys())
+    # Build expected dataset names from MP and MLA datasets
+    expected_mp = set(MP_DATASETS.keys())
+    expected_mla = {f"mla_{k}" for k in MLA_DATASETS.keys()}
+    expected = expected_mp | expected_mla
     actual = set(results.keys())
 
     if actual != expected:
@@ -459,7 +481,7 @@ def upload_completion_marker(
             f"missing datasets: {sorted(missing)}"
         )
 
-    for name in DATASETS:
+    for name in expected:
         r = results[name]
 
         if not isinstance(r, dict):
@@ -485,7 +507,7 @@ def upload_completion_marker(
 
     datasets_meta = {}
 
-    for name in DATASETS:
+    for name in expected:
         r = results[name]
 
         datasets_meta[name] = {
@@ -538,11 +560,13 @@ def process_dataset(
     dataset_key,
     timestamp,
     local_snapshot_dir,
+    combo,
 ):
     data = fetch_dataset(
         session,
         dataset_name,
-        dataset_key
+        dataset_key,
+        combo
     )
 
     result = upload_dataset(
@@ -565,6 +589,173 @@ def process_dataset(
 # Main
 # ==========================================
 
+def fetch_member_type(
+    session,
+    member_type,
+    datasets,
+    combo,
+    timestamp,
+    local_snapshot_dir,
+):
+    """Fetch all datasets for a member type (MP or MLA)."""
+    print()
+    print("=" * 70)
+    print(f"FETCHING {member_type} DATASETS")
+    print(f"Combo: {combo}")
+    print("=" * 70)
+
+    successful = 0
+    failed = 0
+    results = {}
+    failed_datasets = []
+
+    # ==================================
+    # PHASE 1: Attempt ALL datasets once
+    # ==================================
+
+    print()
+    print("=" * 70)
+    print(f"PHASE 1 — INITIAL FETCH ({member_type})")
+    print("=" * 70)
+
+    for dataset_name, dataset_key in datasets.items():
+        # Prefix dataset name for MLA to avoid conflicts
+        if member_type == "MLA":
+            storage_name = f"mla_{dataset_name}"
+        else:
+            storage_name = dataset_name
+
+        try:
+            result = process_dataset(
+                session,
+                storage_name,
+                dataset_key,
+                timestamp,
+                local_snapshot_dir,
+                combo,
+            )
+
+            results[storage_name] = result
+            successful += 1
+
+        except Exception as error:
+            print()
+            print(f"✗ {storage_name} FAILED")
+            print(f"ERROR: {error}")
+
+            failed_datasets.append({
+                "name": storage_name,
+                "key": dataset_key,
+                "error": str(error),
+            })
+
+    # ==================================
+    # PHASE 2: Retry only failures
+    # ==================================
+
+    if failed_datasets:
+        print()
+        print("=" * 70)
+        print(f"PHASE 2 — RETRY FAILED DATASETS ({member_type})")
+        print("=" * 70)
+        print(
+            f"Datasets requiring retry: "
+            f"{len(failed_datasets)}"
+        )
+
+        for retry_number in range(
+            1,
+            MAX_RETRIES + 1
+        ):
+            if not failed_datasets:
+                break
+
+            print()
+            print(
+                f"--- Retry attempt "
+                f"{retry_number}/{MAX_RETRIES} ---"
+            )
+
+            # Fresh session before each retry round.
+            try:
+                session.close()
+            except Exception:
+                pass
+
+            session = create_session()
+
+            try:
+                print("Creating fresh MPLADS session...")
+                establish_session(session)
+            except Exception as error:
+                print(
+                    f"✗ Could not establish fresh "
+                    f"session: {error}"
+                )
+
+                if retry_number < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS)
+
+                continue
+
+            next_failed = []
+
+            for item in failed_datasets:
+                dataset_name = item["name"]
+                dataset_key = item["key"]
+
+                print()
+                print(
+                    f"Retrying: {dataset_name}"
+                )
+
+                try:
+                    result = process_dataset(
+                        session,
+                        dataset_name,
+                        dataset_key,
+                        timestamp,
+                        local_snapshot_dir,
+                        combo,
+                    )
+
+                    results[dataset_name] = result
+                    successful += 1
+
+                    print(
+                        f"✓ {dataset_name} "
+                        f"succeeded on retry "
+                        f"{retry_number}"
+                    )
+
+                except Exception as error:
+                    print(
+                        f"✗ {dataset_name} "
+                        f"retry {retry_number} failed"
+                    )
+                    print(f"ERROR: {error}")
+
+                    next_failed.append({
+                        "name": dataset_name,
+                        "key": dataset_key,
+                        "error": str(error),
+                    })
+
+            failed_datasets = next_failed
+
+            if failed_datasets and retry_number < MAX_RETRIES:
+                print()
+                print(
+                    f"Waiting {RETRY_DELAY_SECONDS} "
+                    f"seconds before next retry..."
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+
+    failed = len(failed_datasets)
+
+    return results, successful, failed, failed_datasets
+
+
 def main():
     timestamp = datetime.now(
         timezone.utc
@@ -576,7 +767,8 @@ def main():
     print("MPLADS FETCH + CHUNK UPLOAD")
     print("=" * 70)
     print(f"Timestamp: {timestamp}")
-    print(f"Datasets: {len(DATASETS)}")
+    print(f"MP Datasets: {len(MP_DATASETS)}")
+    print(f"MLA Datasets: {len(MLA_DATASETS)}")
     print(f"Chunk size: {CHUNK_SIZE}")
     print(f"Retries after first pass: {MAX_RETRIES}")
     print("=" * 70)
@@ -592,10 +784,10 @@ def main():
 
     session = create_session()
 
-    successful = 0
-    failed = 0
-    results = {}
-    failed_datasets = []
+    all_results = {}
+    total_successful = 0
+    total_failed = 0
+    all_failed_datasets = []
 
     try:
         print()
@@ -603,142 +795,40 @@ def main():
         establish_session(session)
 
         # ==================================
-        # PHASE 1: Attempt ALL datasets once
+        # Fetch MP datasets
         # ==================================
 
-        print()
-        print("=" * 70)
-        print("PHASE 1 — INITIAL FETCH")
-        print("=" * 70)
+        mp_results, mp_successful, mp_failed, mp_failed = fetch_member_type(
+            session,
+            "MP",
+            MP_DATASETS,
+            MP_COMBO,
+            timestamp,
+            local_snapshot_dir,
+        )
 
-        for dataset_name, dataset_key in DATASETS.items():
-            try:
-                result = process_dataset(
-                    session,
-                    dataset_name,
-                    dataset_key,
-                    timestamp,
-                    local_snapshot_dir,
-                )
-
-                results[dataset_name] = result
-                successful += 1
-
-            except Exception as error:
-                print()
-                print(f"✗ {dataset_name} FAILED")
-                print(f"ERROR: {error}")
-
-                failed_datasets.append({
-                    "name": dataset_name,
-                    "key": dataset_key,
-                    "error": str(error),
-                })
+        all_results.update(mp_results)
+        total_successful += mp_successful
+        total_failed += mp_failed
+        all_failed_datasets.extend(mp_failed)
 
         # ==================================
-        # PHASE 2: Retry only failures
+        # Fetch MLA datasets
         # ==================================
 
-        if failed_datasets:
-            print()
-            print("=" * 70)
-            print("PHASE 2 — RETRY FAILED DATASETS")
-            print("=" * 70)
-            print(
-                f"Datasets requiring retry: "
-                f"{len(failed_datasets)}"
-            )
+        mla_results, mla_successful, mla_failed, mla_failed = fetch_member_type(
+            session,
+            "MLA",
+            MLA_DATASETS,
+            MLA_COMBO,
+            timestamp,
+            local_snapshot_dir,
+        )
 
-            still_failed = []
-
-            for retry_number in range(
-                1,
-                MAX_RETRIES + 1
-            ):
-                if not failed_datasets:
-                    break
-
-                print()
-                print(
-                    f"--- Retry attempt "
-                    f"{retry_number}/{MAX_RETRIES} ---"
-                )
-
-                # Fresh session before each retry round.
-                try:
-                    session.close()
-                except Exception:
-                    pass
-
-                session = create_session()
-
-                try:
-                    print("Creating fresh MPLADS session...")
-                    establish_session(session)
-                except Exception as error:
-                    print(
-                        f"✗ Could not establish fresh "
-                        f"session: {error}"
-                    )
-
-                    if retry_number < MAX_RETRIES:
-                        time.sleep(RETRY_DELAY_SECONDS)
-
-                    continue
-
-                next_failed = []
-
-                for item in failed_datasets:
-                    dataset_name = item["name"]
-                    dataset_key = item["key"]
-
-                    print()
-                    print(
-                        f"Retrying: {dataset_name}"
-                    )
-
-                    try:
-                        result = process_dataset(
-                            session,
-                            dataset_name,
-                            dataset_key,
-                            timestamp,
-                            local_snapshot_dir,
-                        )
-
-                        results[dataset_name] = result
-                        successful += 1
-
-                        print(
-                            f"✓ {dataset_name} "
-                            f"succeeded on retry "
-                            f"{retry_number}"
-                        )
-
-                    except Exception as error:
-                        print(
-                            f"✗ {dataset_name} "
-                            f"retry {retry_number} failed"
-                        )
-                        print(f"ERROR: {error}")
-
-                        next_failed.append({
-                            "name": dataset_name,
-                            "key": dataset_key,
-                            "error": str(error),
-                        })
-
-                failed_datasets = next_failed
-
-                if failed_datasets and retry_number < MAX_RETRIES:
-                    print()
-                    print(
-                        f"Waiting {RETRY_DELAY_SECONDS} "
-                        f"seconds before next retry..."
-                    )
-                    time.sleep(RETRY_DELAY_SECONDS)
-
-        failed = len(failed_datasets)
+        all_results.update(mla_results)
+        total_successful += mla_successful
+        total_failed += mla_failed
+        all_failed_datasets.extend(mla_failed)
 
         # ==================================
         # Final summary
@@ -749,25 +839,25 @@ def main():
         print("FETCH COMPLETE")
         print("=" * 70)
 
-        print(f"Successful: {successful}")
-        print(f"Failed:     {failed}")
+        print(f"Successful: {total_successful}")
+        print(f"Failed:     {total_failed}")
 
         print()
         print("Cloud structure:")
         print(f"{timestamp}/")
 
-        for dataset_name in results:
-            result = results[dataset_name]
+        for dataset_name in all_results:
+            result = all_results[dataset_name]
 
             print(f"├── {dataset_name}/")
             print("│   ├── manifest.json")
             print("│   └── part_0001.ndjson ...")
 
-        if failed_datasets:
+        if all_failed_datasets:
             print()
             print("Failed datasets after all retries:")
 
-            for item in failed_datasets:
+            for item in all_failed_datasets:
                 print(
                     f"  ✗ {item['name']}: "
                     f"{item['error']}"
@@ -780,7 +870,7 @@ def main():
         # COMPLETION MARKER
         # ==================================
 
-        if failed:
+        if total_failed:
             print()
             print(
                 "Run failed because one or more "
@@ -795,7 +885,7 @@ def main():
         try:
             upload_completion_marker(
                 timestamp,
-                results
+                all_results
             )
         except Exception as error:
             print()
@@ -811,7 +901,7 @@ def main():
             raise SystemExit(1)
 
         print()
-        print("✓ ALL 6 DATASETS SUCCESSFUL")
+        print("✓ ALL DATASETS SUCCESSFUL")
         print("✓ COMPLETION MARKER UPLOADED")
         print("✓ SNAPSHOT IS READY FOR INGESTION")
         print(f"✓ Local snapshot: {local_snapshot_dir}")

@@ -82,6 +82,12 @@ DATASETS = [
     "works_completed",
     "expenditure",
     "calamity",
+    "mla_allocated_limit",
+    "mla_works_recommended",
+    "mla_works_sanctioned",
+    "mla_works_completed",
+    "mla_expenditure",
+    "mla_calamity",
 ]
 
 
@@ -106,6 +112,23 @@ IDENTITY_FIELDS = {
         "MP_NAME",
     ],
     "calamity": ["MP_NAME", "CRT_DT", "CALAMITY_NAME"],
+    # MLA datasets use the same identity fields
+    "mla_allocated_limit": ["MP_NAME", "STATE_NAME", "CONSTITUENCY", "TENURE"],
+    "mla_works_recommended": ["WORK_RECOMMENDATION_DTL_ID"],
+    "mla_works_sanctioned": ["WORK_RECOMMENDATION_DTL_ID"],
+    "mla_works_completed": ["WORK_RECOMMENDATION_DTL_ID"],
+    "mla_expenditure": [
+        "WORK_RECOMMENDATION_DTL_ID",
+        "WORK_ID",
+        "EXPENDITURE_DATE",
+        "VENDOR_NAME",
+        "WORK_STATUS",
+        "FUND_DISBURSED_AMT",
+        "STATE_NAME",
+        "CONSTITUENCY",
+        "MP_NAME",
+    ],
+    "mla_calamity": ["MP_NAME", "CRT_DT", "CALAMITY_NAME"],
 }
 
 # Content fields that actually cause UPDATE in the injector.
@@ -148,6 +171,47 @@ CONTENT_FIELDS = {
     ],
     "expenditure": [],  # append-only, no content hash
     "calamity": [
+        "TYPE",
+        "CONSENTED_AMOUNT",
+    ],
+    # MLA datasets use the same content fields
+    "mla_allocated_limit": [
+        "ALLOCATED_AMT",
+        "HOUSE_OF_PARLIAMENT",
+        "TENURE_START_DATE",
+        "TENURE_END_DATE",
+    ],
+    "mla_works_recommended": [
+        "ACTIVITY_NAME",
+        "WORK_CATEGORY",
+        "WORK_DESCRIPTION",
+        "RECOMMENDATION_DATE",
+        "RECOMMENDED_AMOUNT",
+        "SANCTION_DATE",
+        "SANCTION_AMOUNT",
+        "WORK_STAGE",
+        "LETTER_NO",
+        "FLAG",
+        "FILE_STATUS",
+        "ATTACH_ID",
+    ],
+    "mla_works_sanctioned": [
+        "ACTIVITY_NAME",
+        "WORK_CATEGORY",
+        "WORK_DESCRIPTION",
+        "RECOMMENDATION_DATE",
+        "SANCTION_DATE",
+        "SANCTION_AMOUNT",
+        "WORK_STAGE",
+        "FILE_STATUS",
+        "ATTACH_ID",
+    ],
+    "mla_works_completed": [
+        "ACTUAL_END_DATE",
+        "ACTUAL_AMOUNT",
+    ],
+    "mla_expenditure": [],  # append-only, no content hash
+    "mla_calamity": [
         "TYPE",
         "CONSENTED_AMOUNT",
     ],
@@ -666,9 +730,10 @@ class ChunkWriter:
 # ============================================================
 
 def create_table_sql(dataset: str) -> str:
-    if dataset == "expenditure":
-        return """
-            CREATE TABLE IF NOT EXISTS expenditure (
+    if dataset in ("expenditure", "mla_expenditure"):
+        table_name = dataset.replace("-", "_")
+        return f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
                 fingerprint TEXT PRIMARY KEY,
                 raw_json TEXT NOT NULL
             )
@@ -702,7 +767,7 @@ def load_snapshot_to_sqlite(
     skipped = 0
     safe_dedup = 0
 
-    if dataset == "expenditure":
+    if dataset in ("expenditure", "mla_expenditure"):
         for record in iter_records(folder):
             total += 1
             if is_total_row(record):
@@ -710,11 +775,11 @@ def load_snapshot_to_sqlite(
             fp = expenditure_fingerprint(record)
             raw = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
             existing = conn.execute(
-                "SELECT raw_json FROM expenditure WHERE fingerprint = ?", (fp,)
+                f"SELECT raw_json FROM {dataset} WHERE fingerprint = ?", (fp,)
             ).fetchone()
             if existing is None:
                 conn.execute(
-                    "INSERT INTO expenditure (fingerprint, raw_json) VALUES (?, ?)",
+                    f"INSERT INTO {dataset} (fingerprint, raw_json) VALUES (?, ?)",
                     (fp, raw),
                 )
             else:
@@ -754,7 +819,7 @@ def load_snapshot_to_sqlite(
                             diffs.append((k, ev, nv))
 
                     lines = [
-                        f"CONFLICT in expenditure: same fingerprint but different content.",
+                        f"CONFLICT in {dataset}: same fingerprint but different content.",
                         f"Fingerprint: {fp}",
                         "",
                         "--- Fingerprint source fields (existing) ---",
@@ -873,12 +938,12 @@ def compare_dataset(
     update_count = 0
     unchanged_count = 0
 
-    if dataset == "expenditure":
+    if dataset in ("expenditure", "mla_expenditure"):
         old_fps = {
-            r[0] for r in old_conn.execute("SELECT fingerprint FROM expenditure")
+            r[0] for r in old_conn.execute(f"SELECT fingerprint FROM {dataset}")
         }
         new_rows = new_conn.execute(
-            "SELECT fingerprint, raw_json FROM expenditure"
+            f"SELECT fingerprint, raw_json FROM {dataset}"
         ).fetchall()
 
         new_fps = set()

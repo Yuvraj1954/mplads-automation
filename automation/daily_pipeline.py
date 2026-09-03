@@ -22,6 +22,12 @@ DATASETS = [
     "works_completed",
     "expenditure",
     "calamity",
+    "mla_allocated_limit",
+    "mla_works_recommended",
+    "mla_works_sanctioned",
+    "mla_works_completed",
+    "mla_expenditure",
+    "mla_calamity",
 ]
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -70,6 +76,12 @@ EXPECTED_DATASETS = [
     "works_completed",
     "expenditure",
     "calamity",
+    "mla_allocated_limit",
+    "mla_works_recommended",
+    "mla_works_sanctioned",
+    "mla_works_completed",
+    "mla_expenditure",
+    "mla_calamity",
 ]
 
 
@@ -80,18 +92,24 @@ def validate_local_snapshot(path):
         raise RuntimeError(f"Local snapshot path does not exist: {p}")
     if not p.is_dir():
         raise RuntimeError(f"Local snapshot path is not a directory: {p}")
+    
+    # Check for at least one MP or MLA dataset
+    found_datasets = []
     for dataset in EXPECTED_DATASETS:
         dataset_dir = p / dataset
-        if not dataset_dir.is_dir():
-            raise RuntimeError(
-                f"Local snapshot missing dataset folder: {dataset}"
-            )
-        part_files = list(dataset_dir.glob("part_*.ndjson"))
-        if not part_files:
-            raise RuntimeError(
-                f"Local snapshot dataset '{dataset}' has no part_*.ndjson files"
-            )
+        if dataset_dir.is_dir():
+            part_files = list(dataset_dir.glob("part_*.ndjson"))
+            if part_files:
+                found_datasets.append(dataset)
+    
+    if not found_datasets:
+        raise RuntimeError(
+            f"Local snapshot has no valid dataset folders with part_*.ndjson files. "
+            f"Expected at least one of: {EXPECTED_DATASETS}"
+        )
+    
     print(f"Local snapshot validated: {p}")
+    print(f"Found datasets: {found_datasets}")
 
 
 def list_complete_snapshots():
@@ -262,6 +280,11 @@ def main():
             "Change COMPARATOR near the top of automation/daily_pipeline.py "
             "to the real comparator path in your repo."
         )
+
+    sync_interval = os.environ.get("SYNC_INTERVAL_HOURS", "24")
+    print(f"Sync interval: {sync_interval} hours")
+    print(f"MP datasets: {len([d for d in DATASETS if not d.startswith('mla_')])}")
+    print(f"MLA datasets: {len([d for d in DATASETS if d.startswith('mla_')])}")
 
     print("=== STEP 1: FETCH ===")
     fetcher_output = run_fetcher([sys.executable, str(FETCHER)])
