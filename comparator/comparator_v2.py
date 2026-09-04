@@ -114,7 +114,11 @@ IDENTITY_FIELDS = {
     "calamity": ["MP_NAME", "CRT_DT", "CALAMITY_NAME"],
     # MLA datasets use the same identity fields
     "mla_allocated_limit": ["MP_NAME", "STATE_NAME", "CONSTITUENCY", "TENURE"],
-    "mla_works_recommended": ["WORK_RECOMMENDATION_DTL_ID"],
+    "mla_works_recommended": [
+    "STATE_NAME",
+    "MP_NAME",
+    "WORK_RECOMMENDATION_DTL_ID"
+    ],
     "mla_works_sanctioned": ["WORK_RECOMMENDATION_DTL_ID"],
     "mla_works_completed": ["WORK_RECOMMENDATION_DTL_ID"],
     "mla_expenditure": [
