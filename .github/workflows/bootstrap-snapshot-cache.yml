@@ -221,17 +221,6 @@ jobs:
           key: mplads-snapshot-state-${{ steps.validate.outputs.current_ts }}
 
       # -----------------------------------------------------------
-      # VERIFY: Confirm cache was created
-      # -----------------------------------------------------------
-      - name: Verify cache exists
-        working-directory: ${{ github.workspace }}/repo
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Verifying cache entries..."
-          gh cache list --key mplads-snapshot-state- --json key,createdAt --limit 5
-
-      # -----------------------------------------------------------
       # REPORT: Success summary
       # -----------------------------------------------------------
       - name: Report success
