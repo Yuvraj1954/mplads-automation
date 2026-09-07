@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          path: repo
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,12 +33,140 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r "${{ github.workspace }}/repo/requirements.txt"
 
+      # -----------------------------------------------------------
+      # CACHE RESTORE: Restore rolling snapshot cache
+      # -----------------------------------------------------------
+      - name: Restore snapshot cache
+        uses: actions/cache/restore@v4
+        id: cache-restore
+        with:
+          path: /tmp/mplads-work
+          key: mplads-snapshot-state-${{ github.run_id }}
+          restore-keys: |
+            mplads-snapshot-state-
+
+      - name: Cache restore result
+        run: |
+          if [ "${{ steps.cache-restore.outputs.cache-hit }}" == "true" ]; then
+            echo "Cache restored successfully"
+          else
+            echo "No cache found — first run or cache expired"
+          fi
+
+      # -----------------------------------------------------------
+      # VALIDATE: Ensure cache has valid previous snapshot
+      # -----------------------------------------------------------
+      - name: Validate restored cache
+        working-directory: ${{ github.workspace }}/repo
+        env:
+          MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
+        run: |
+          python3 -c "
+          import sys
+          sys.path.insert(0, 'automation')
+          from snapshot_cache import validate_cache, get_previous_timestamp, get_current_timestamp
+          from pathlib import Path
+
+          work_dir = Path('/tmp/mplads-work')
+          if not work_dir.exists():
+              print('No cache work directory found')
+              sys.exit(0)
+
+          ok, err = validate_cache(work_dir)
+          if ok:
+              prev_ts = get_previous_timestamp(work_dir)
+              curr_ts = get_current_timestamp(work_dir)
+              print(f'Cache valid: previous={prev_ts}, current={curr_ts}')
+          else:
+              print(f'Cache invalid: {err}')
+              print('Pipeline will use Supabase fallback for previous snapshot')
+          "
+
+      # -----------------------------------------------------------
+      # RUN PIPELINE
+      # -----------------------------------------------------------
       - name: Run complete MPLADS pipeline
+        working-directory: ${{ github.workspace }}/repo
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SYNC_INTERVAL_HOURS: ${{ github.event.inputs.sync_interval_hours || '24' }}
+          MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
         run: python automation/daily_pipeline.py
+
+      # -----------------------------------------------------------
+      # ROTATE: On success — move current → previous
+      # The pipeline already copied fetched snapshot to current/<new_ts>/
+      # -----------------------------------------------------------
+      - name: Rotate snapshots
+        if: success()
+        working-directory: ${{ github.workspace }}/repo
+        env:
+          MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
+        run: |
+          python3 -c "
+          import sys, shutil
+          sys.path.insert(0, 'automation')
+          from snapshot_cache import (
+              get_previous_timestamp, get_current_timestamp,
+              validate_snapshot_structure, write_metadata
+          )
+          from pathlib import Path
+
+          work_dir = Path('/tmp/mplads-work')
+          prev_dir = work_dir / 'previous'
+          curr_dir = work_dir / 'current'
+
+          old_curr_ts = None
+          for d in sorted(curr_dir.iterdir()) if curr_dir.exists() else []:
+              if d.is_dir() and not d.name.startswith('.'):
+                  old_curr_ts = d.name
+                  break
+
+          if old_curr_ts is None:
+              print('No current snapshot to rotate')
+              sys.exit(0)
+
+          # Delete old previous
+          if prev_dir.exists():
+              shutil.rmtree(prev_dir)
+
+          # Move current → previous
+          prev_dir.mkdir(parents=True, exist_ok=True)
+          shutil.move(str(curr_dir / old_curr_ts), str(prev_dir / old_curr_ts))
+          print(f'Rotated: previous={old_curr_ts}')
+
+          # Find new current (pipeline wrote it)
+          new_curr_ts = None
+          for d in sorted(curr_dir.iterdir()) if curr_dir.exists() else []:
+              if d.is_dir() and not d.name.startswith('.'):
+                  new_curr_ts = d.name
+                  break
+
+          # Update metadata
+          write_metadata(old_curr_ts, new_curr_ts or old_curr_ts, work_dir)
+          print(f'Metadata updated: previous={old_curr_ts}, current={new_curr_ts}')
+          "
+
+      # -----------------------------------------------------------
+      # SAVE: Save rolling state to new immutable cache key
+      # -----------------------------------------------------------
+      - name: Save snapshot cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/mplads-work
+          key: mplads-snapshot-state-${{ github.run_id }}-success
+
+      # -----------------------------------------------------------
+      # CLEANUP: Best-effort old cache entries
+      # -----------------------------------------------------------
+      - name: Cleanup old cache entries
+        if: success()
+        continue-on-error: true
+        run: |
+          echo "Cache cleanup is best-effort — never blocks pipeline"
+          echo "Old entries expire automatically per GitHub cache limits"

@@ -3,6 +3,8 @@ import sys
 import json
 import shutil
 import subprocess
+import time
+import argparse
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,6 +15,17 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parent.parent
 FETCHER = ROOT / "fetcher" / "fetcher.py"
 COMPARATOR = ROOT / "comparator" / "comparator_v2.py"
+
+sys.path.insert(0, str(ROOT / "automation"))
+from snapshot_cache import (
+    get_previous_local_path,
+    get_previous_timestamp,
+    get_current_timestamp,
+    validate_cache,
+    write_new_timestamp,
+    write_metadata,
+    METADATA_FILE,
+)
 
 BUCKET = "mplads-raw"
 DATASETS = [
@@ -271,7 +284,62 @@ def _cleanup_local_snapshot(path):
         print(f"WARNING: Could not remove local snapshot {path}: {exc}")
 
 
+def _write_pipeline_success(new_ts, cache_work_dir):
+    """Write pipeline success markers and preserve fetched snapshot for cache.
+
+    Copies the fetched snapshot into $WORK_DIR/current/<new_ts>/ so the
+    workflow can rotate it into the rolling cache.
+    """
+    if not cache_work_dir:
+        return
+
+    work_dir = Path(cache_work_dir)
+    write_new_timestamp(new_ts, work_dir)
+
+    prev_ts = get_previous_timestamp(work_dir)
+    if prev_ts:
+        write_metadata(prev_ts, new_ts, work_dir)
+    else:
+        write_metadata("none", new_ts, work_dir)
+
+    print(f"Pipeline success markers written to {work_dir}")
+
+
+def _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir):
+    """Copy the fetched snapshot into the cache current/ directory.
+
+    This must be called BEFORE _cleanup_local_snapshot removes the temp dir.
+    """
+    if not cache_work_dir or not local_snapshot_path:
+        return
+
+    work_dir = Path(cache_work_dir)
+    target = work_dir / "current" / new_ts
+
+    if target.exists():
+        print(f"Cache current/{new_ts} already exists, skipping copy")
+        return
+
+    src = Path(local_snapshot_path)
+    if not src.exists():
+        print(f"WARNING: Fetched snapshot {src} not found, cannot preserve for cache")
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(str(src), str(target))
+    print(f"Fetched snapshot preserved for cache: {target}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="MPLADS Daily Pipeline")
+    parser.add_argument("--skip-gemini", action="store_true",
+                        help="Skip Gemini AI analysis step")
+    parser.add_argument("--skip-ingest", action="store_true",
+                        help="Skip DB ingestion steps (stages 8a-8c)")
+    parser.add_argument("--skip-fetch", action="store_true",
+                        help="Skip government fetch (use existing current snapshot)")
+    args = parser.parse_args()
+
     if not FETCHER.exists():
         raise RuntimeError(f"Fetcher not found: {FETCHER}")
     if not COMPARATOR.exists():
@@ -286,35 +354,62 @@ def main():
     print(f"MP datasets: {len([d for d in DATASETS if not d.startswith('mla_')])}")
     print(f"MLA datasets: {len([d for d in DATASETS if d.startswith('mla_')])}")
 
+    cache_work_dir = os.environ.get("MPLADS_CACHE_WORK_DIR")
+    print(f"Cache work dir: {cache_work_dir or 'not set (Supabase-only mode)'}")
+
     print("=== STEP 1: FETCH ===")
-    fetcher_output = run_fetcher([sys.executable, str(FETCHER)])
+    if args.skip_fetch:
+        print("Skipping fetch (--skip-fetch)")
+        local_snapshot_path = None
+    else:
+        fetcher_output = run_fetcher([sys.executable, str(FETCHER)])
+        local_snapshot_path = None
+        for line in fetcher_output:
+            if line.startswith("LOCAL_SNAPSHOT_PATH="):
+                local_snapshot_path = line.split("=", 1)[1].strip()
+                break
 
-    local_snapshot_path = None
-    for line in fetcher_output:
-        if line.startswith("LOCAL_SNAPSHOT_PATH="):
-            local_snapshot_path = line.split("=", 1)[1].strip()
-            break
+    if local_snapshot_path:
+        validate_local_snapshot(local_snapshot_path)
 
-    if not local_snapshot_path:
-        raise RuntimeError(
-            "Fetcher completed but LOCAL_SNAPSHOT_PATH not found in output"
-        )
+    new_ts = os.path.basename(local_snapshot_path) if local_snapshot_path else None
 
-    validate_local_snapshot(local_snapshot_path)
+    print("=== STEP 2: GET PREVIOUS SNAPSHOT ===")
+    old_timestamp = None
+    old_local_path = None
 
-    snapshots = list_complete_snapshots()
-    if not snapshots:
-        raise RuntimeError("No complete snapshot exists after fetch")
+    if cache_work_dir:
+        cache_dir = Path(cache_work_dir)
+        ok, err = validate_cache(cache_dir)
+        if ok:
+            prev_path = get_previous_local_path(cache_dir)
+            if prev_path:
+                old_timestamp = get_previous_timestamp(cache_dir)
+                old_local_path = str(prev_path)
+                print(f"Previous snapshot from cache: {old_timestamp}")
+            else:
+                print("WARNING: Cache valid but no previous snapshot found")
+        else:
+            print(f"WARNING: Cache validation failed: {err}")
+            print("Falling back to Supabase Storage...")
 
-    for ts in snapshots[-2:]:
-        assert_snapshot_complete(ts)
+    if not old_timestamp:
+        print("Previous snapshot from Supabase Storage (fallback)")
+        snapshots = list_complete_snapshots()
+        if snapshots:
+            old_timestamp = snapshots[-1]
+            print(f"Previous snapshot from Supabase: {old_timestamp}")
 
-    if len(snapshots) < 2:
-        print("Bootstrap: only one complete snapshot exists. Nothing to compare.")
+    if not old_timestamp:
+        print("No previous snapshot found. Bootstrap mode — nothing to compare.")
+        if local_snapshot_path:
+            _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
+            _cleanup_local_snapshot(local_snapshot_path)
         return
 
-    old_ts, new_ts = snapshots[-2], snapshots[-1]
-    print("Comparing:", old_ts, "->", new_ts)
+    print("=== STEP 3: COMPARE ===")
+    if not local_snapshot_path:
+        raise RuntimeError("No new snapshot to compare (fetch was skipped or failed)")
 
     workdir = ROOT / ".automation_delta"
     if workdir.exists():
@@ -323,15 +418,18 @@ def main():
 
     run_id = f"delta_{new_ts}"
 
-    print("=== STEP 2: COMPARE ===")
-    run([
+    cmd = [
         sys.executable,
         str(COMPARATOR),
-        "--old", old_ts,
+        "--old", old_timestamp,
         "--new", new_ts,
         "--new-local", local_snapshot_path,
         "--output", str(workdir),
-    ])
+    ]
+    if old_local_path:
+        cmd.extend(["--old-local", old_local_path])
+
+    run(cmd)
 
     manifest_path = workdir / "manifest.json"
     if not manifest_path.exists():
@@ -345,17 +443,18 @@ def main():
 
     print("Changes:", total_changes)
 
-    print("=== STEP 3: UPLOAD DELTA ===")
+    print("=== STEP 4: UPLOAD DELTA ===")
     upload_delta(workdir, run_id)
 
     if total_changes == 0:
         print("No changes. No ingestion needed.")
         delete_delta_run(run_id)
-        delete_old_raw_snapshots(snapshots[-2:])
+        _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
         _cleanup_local_snapshot(local_snapshot_path)
+        _write_pipeline_success(new_ts, cache_work_dir)
         return
 
-    print("=== STEP 4: CREATE INGESTION JOBS ===")
+    print("=== STEP 5: CREATE INGESTION JOBS ===")
     controller = call_edge("mplads-controller", {"run_id": run_id})
     expected_jobs = int(controller.get("total_jobs", 0))
     if expected_jobs <= 0:
@@ -363,8 +462,18 @@ def main():
 
     print("Expected jobs:", expected_jobs)
 
-    print("=== STEP 5: RUN WORKER ===")
+    print("=== STEP 6: RUN WORKER ===")
+    worker_max_minutes = 30
+    worker_start = time.time()
+    worker_interval = 60
+
     while True:
+        elapsed = time.time() - worker_start
+        if elapsed > worker_max_minutes * 60:
+            raise RuntimeError(
+                f"Worker loop timed out after {worker_max_minutes} minutes"
+            )
+
         result = call_edge("mplads-worker", {"run_id": run_id})
         print("Worker:", result)
         if result.get("success") and (
@@ -373,15 +482,20 @@ def main():
         ):
             break
 
-    print("=== STEP 6: VERIFY ===")
+        remaining = worker_max_minutes - (elapsed / 60)
+        print(f"Worker remaining budget: {remaining:.1f} minutes")
+        time.sleep(worker_interval)
+
+    print("=== STEP 7: VERIFY ===")
     if not verify_run(run_id, expected_jobs):
         raise RuntimeError("Ingestion verification failed")
 
-    print("=== STEP 7: CLEANUP ===")
+    print("=== STEP 8: CLEANUP ===")
     delete_delta_run(run_id)
-    delete_old_raw_snapshots(snapshots[-2:])
 
+    _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
     _cleanup_local_snapshot(local_snapshot_path)
+    _write_pipeline_success(new_ts, cache_work_dir)
 
     print("=== PIPELINE COMPLETE ===")
 

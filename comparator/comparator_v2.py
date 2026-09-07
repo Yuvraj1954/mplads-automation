@@ -1067,6 +1067,9 @@ def main() -> int:
                         help="Path to local directory containing the new snapshot "
                              "(avoids downloading from Supabase; --new still required "
                              "for timestamp label)")
+    parser.add_argument("--old-local", type=str, default=None,
+                        help="Path to local directory containing the old snapshot "
+                             "(avoids downloading from Supabase)")
     parser.add_argument("--output", type=str, default=None, help="Output directory for delta files")
     args = parser.parse_args()
 
@@ -1134,9 +1137,14 @@ def main() -> int:
 
     old_files = {}
     if old_timestamp:
-        print(f"\nDownloading old snapshot {old_timestamp}...")
-        old_files = download_snapshot_files(old_timestamp)
-        print(f"  Datasets: {list(old_files.keys())}")
+        if args.old_local:
+            print(f"\nUsing local old snapshot: {args.old_local}")
+            old_files = load_local_snapshot_files(Path(args.old_local))
+            print(f"  Datasets: {list(old_files.keys())}")
+        else:
+            print(f"\nDownloading old snapshot {old_timestamp}...")
+            old_files = download_snapshot_files(old_timestamp)
+            print(f"  Datasets: {list(old_files.keys())}")
 
     # ----------------------------------------------------------
     # Compare each dataset
