@@ -150,6 +150,9 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DB2_URL: ${{ secrets.DB2_URL }}
+          DB2_SERVICE_ROLE_KEY: ${{ secrets.DB2_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           SYNC_INTERVAL_HOURS: ${{ github.event.inputs.sync_interval_hours || '24' }}
           MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
           USE_SUPABASE_FALLBACK: ${{ steps.strategy.outputs.use_supabase_fallback }}

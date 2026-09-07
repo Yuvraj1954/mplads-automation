@@ -493,7 +493,32 @@ def main():
     if not verify_run(run_id, expected_jobs):
         raise RuntimeError("Ingestion verification failed")
 
-    print("=== STEP 8: CLEANUP ===")
+    print("=== STEP 8: ANALYSIS ===")
+    from datetime import date as _date
+    from automation.pipeline_controller import run_pipeline as run_analysis
+
+    ref_date = _date.today()
+    snapshot_path = local_snapshot_path
+    skip_gemini = args.skip_gemini
+
+    if not snapshot_path:
+        raise RuntimeError("No snapshot path available for analysis (fetch was skipped or failed)")
+
+    analysis_result = run_analysis(
+        snapshot_dir=snapshot_path,
+        reference_date=ref_date,
+        delta_dir=str(workdir),
+        run_id=run_id,
+        skip_gemini=skip_gemini,
+        skip_ingest=True,
+    )
+
+    if analysis_result.get("status") not in ("SUCCESS", "DRY_RUN"):
+        raise RuntimeError(
+            f"Analysis pipeline failed: {analysis_result.get('error', 'unknown')}"
+        )
+
+    print("=== STEP 9: CLEANUP ===")
     delete_delta_run(run_id)
 
     _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
