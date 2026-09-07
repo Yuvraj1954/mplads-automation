@@ -19,20 +19,29 @@ jobs:
 
     steps:
       # -----------------------------------------------------------
-      # CHECKOUT: Clone the transport branch (not default branch)
+      # CHECKOUT: Clone main for project code (requirements.txt etc.)
+      # -----------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      # -----------------------------------------------------------
+      # CHECKOUT: Clone transport branch into separate directory
       # -----------------------------------------------------------
       - name: Checkout transport branch
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.transport_branch }}
+          path: ./bootstrap-transport
 
       - name: Confirm snapshot archives exist
         run: |
           echo "Transport branch: ${{ inputs.transport_branch }}"
-          echo "Looking for snapshot-*.tar.gz in repository root..."
+          echo "Looking for snapshot-*.tar.gz in bootstrap-transport/..."
 
           FOUND=0
-          for f in snapshot-*.tar.gz; do
+          for f in bootstrap-transport/snapshot-*.tar.gz; do
             if [ -f "$f" ]; then
               echo "  Found: $f ($(du -h "$f" | cut -f1))"
               FOUND=$((FOUND + 1))
@@ -41,8 +50,8 @@ jobs:
 
           if [ "$FOUND" -lt 2 ]; then
             echo "ERROR: Expected at least 2 snapshot-*.tar.gz files on branch '${{ inputs.transport_branch }}'"
-            echo "Files on branch root:"
-            ls -la
+            echo "Files in bootstrap-transport/:"
+            ls -la bootstrap-transport/
             exit 1
           fi
 
@@ -54,7 +63,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r repo/requirements.txt
 
       # -----------------------------------------------------------
       # COPY: Snapshot tarballs from transport branch to staging
@@ -63,7 +72,7 @@ jobs:
         run: |
           mkdir -p /tmp/bootstrap
 
-          cp snapshot-*.tar.gz /tmp/bootstrap/
+          cp bootstrap-transport/snapshot-*.tar.gz /tmp/bootstrap/
 
           ASSET_COUNT=$(ls /tmp/bootstrap/snapshot-*.tar.gz 2>/dev/null | wc -l)
           if [ "$ASSET_COUNT" -lt 2 ]; then
