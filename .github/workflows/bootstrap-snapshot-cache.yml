@@ -3,9 +3,10 @@ name: Bootstrap Snapshot Cache
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: 'GitHub Release tag containing snapshot tarballs'
+      transport_branch:
+        description: 'Temporary Git branch containing snapshot tarballs'
         required: true
+        default: 'bootstrap-snapshot-transport'
 
 concurrency:
   group: mplads-snapshot-cache
@@ -17,8 +18,35 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      # -----------------------------------------------------------
+      # CHECKOUT: Clone the transport branch (not default branch)
+      # -----------------------------------------------------------
+      - name: Checkout transport branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.transport_branch }}
+
+      - name: Confirm snapshot archives exist
+        run: |
+          echo "Transport branch: ${{ inputs.transport_branch }}"
+          echo "Looking for snapshot-*.tar.gz in repository root..."
+
+          FOUND=0
+          for f in snapshot-*.tar.gz; do
+            if [ -f "$f" ]; then
+              echo "  Found: $f ($(du -h "$f" | cut -f1))"
+              FOUND=$((FOUND + 1))
+            fi
+          done
+
+          if [ "$FOUND" -lt 2 ]; then
+            echo "ERROR: Expected at least 2 snapshot-*.tar.gz files on branch '${{ inputs.transport_branch }}'"
+            echo "Files on branch root:"
+            ls -la
+            exit 1
+          fi
+
+          echo "Found $FOUND snapshot archives"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,53 +57,21 @@ jobs:
         run: pip install -r requirements.txt
 
       # -----------------------------------------------------------
-      # DOWNLOAD: Snapshot tarballs from draft GitHub Release
+      # COPY: Snapshot tarballs from transport branch to staging
       # -----------------------------------------------------------
-      - name: Download release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Copy snapshot archives to staging
         run: |
-          echo "Downloading snapshots from release: ${{ inputs.release_tag }}"
           mkdir -p /tmp/bootstrap
 
-          # Draft releases are not accessible via /releases/tags/{tag}.
-          # Enumerate ALL releases (including drafts) and find by tag_name.
-          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases" \
-            --paginate \
-            --jq ".[] | select(.tag_name == \"${{ inputs.release_tag }}\") | .id" \
-            | head -1)
-
-          if [ -z "$RELEASE_ID" ]; then
-            echo "ERROR: No release (including drafts) found with tag '${{ inputs.release_tag }}'"
-            echo "Available releases:"
-            gh api "repos/${{ github.repository }}/releases" --paginate \
-              --jq '.[] | select(.draft) | "\(.tag_name) (draft, id=\(.id))"'
-            exit 1
-          fi
-
-          echo "Release ID: $RELEASE_ID"
-
-          # Enumerate assets and download snapshot-*.tar.gz via browser_download_url
-          gh api "repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
-            --paginate \
-            --jq '.[] | select(.name | startswith("snapshot-") and endswith(".tar.gz")) | [.name, .browser_download_url] | @tsv' \
-            | while IFS=$'\t' read -r ASSET_NAME DOWNLOAD_URL; do
-              echo "Downloading: $ASSET_NAME"
-              curl -sSfL \
-                -H "Authorization: token $GH_TOKEN" \
-                -H "Accept: application/octet-stream" \
-                "$DOWNLOAD_URL" \
-                -o "/tmp/bootstrap/$ASSET_NAME" \
-                || { echo "ERROR: Failed to download $ASSET_NAME"; exit 1; }
-            done
+          cp snapshot-*.tar.gz /tmp/bootstrap/
 
           ASSET_COUNT=$(ls /tmp/bootstrap/snapshot-*.tar.gz 2>/dev/null | wc -l)
           if [ "$ASSET_COUNT" -lt 2 ]; then
-            echo "ERROR: Expected at least 2 snapshot-*.tar.gz assets, found $ASSET_COUNT"
+            echo "ERROR: Expected at least 2 snapshot-*.tar.gz, found $ASSET_COUNT"
             exit 1
           fi
 
-          echo "Downloaded files:"
+          echo "Staged files:"
           ls -la /tmp/bootstrap/
 
       # -----------------------------------------------------------
@@ -86,7 +82,6 @@ jobs:
           mkdir -p /tmp/mplads-work/previous
           mkdir -p /tmp/mplads-work/current
 
-          # Count tarballs
           TARBALL_COUNT=$(ls /tmp/bootstrap/snapshot-*.tar.gz 2>/dev/null | wc -l)
           echo "Found $TARBALL_COUNT snapshot tarballs"
 
@@ -127,17 +122,7 @@ jobs:
           cp -r "$STAGING/$PREVIOUS_TS" /tmp/mplads-work/previous/
           cp -r "$STAGING/$CURRENT_TS" /tmp/mplads-work/current/
 
-          # Write metadata
-          cat > /tmp/mplads-work/.cache-metadata.json << 'METAEOF'
-          {
-            "previous_ts": "PLACEHOLDER",
-            "current_ts": "PLACEHOLDER",
-            "created_at": "PLACEHOLDER",
-            "bootstrap": true
-          }
-          METAEOF
-
-          # Rebuild metadata properly to avoid heredoc interpolation issues
+          # Write metadata via Python (avoids heredoc interpolation issues)
           python3 -c "
           import json
           from datetime import datetime, timezone
@@ -208,12 +193,12 @@ jobs:
               sys.exit(1)
 
           print('Both snapshots validated successfully')
-          print(f'Previous: {metadata["previous_ts"]}')
-          print(f'Current:  {metadata["current_ts"]}')
+          print(f'Previous: {metadata[\"previous_ts\"]}')
+          print(f'Current:  {metadata[\"current_ts\"]}')
 
           # Export current_ts as step output
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f'current_ts={metadata["current_ts"]}\n')
+              f.write(f'current_ts={metadata[\"current_ts\"]}\n')
           "
 
       # -----------------------------------------------------------
@@ -250,4 +235,5 @@ jobs:
           echo "Next step: Run the daily pipeline."
           echo "The pipeline will use GitHub cache for the previous snapshot."
           echo ""
-          echo "You can now delete the draft release '${{ inputs.release_tag }}'."
+          echo "You can now delete the transport branch:"
+          echo "  git push origin --delete ${{ inputs.transport_branch }}"
