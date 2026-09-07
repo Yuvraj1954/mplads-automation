@@ -28,31 +28,52 @@ jobs:
           path: repo
 
       # -----------------------------------------------------------
-      # CHECKOUT: Clone transport branch into separate directory
+      # FETCH: Retrieve transport branch into the repo clone
       # -----------------------------------------------------------
-      - name: Checkout transport branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.transport_branch }}
-          path: bootstrap-transport
+      - name: Fetch transport branch
+        working-directory: ${{ github.workspace }}/repo
+        run: |
+          git fetch --no-tags --depth=1 origin \
+            "refs/heads/${{ inputs.transport_branch }}:refs/remotes/origin/${{ inputs.transport_branch }}"
 
       # -----------------------------------------------------------
-      # DIAGNOSTIC: Verify workspace layout before install
+      # EXTRACT: Pull snapshot archives from fetched branch tree
       # -----------------------------------------------------------
-      - name: Verify workflow workspace
+      - name: Extract snapshot archives from transport branch
         run: |
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          echo "Current directory:"
-          pwd
+          TRANSPORT_REF="refs/remotes/origin/${{ inputs.transport_branch }}"
+          STAGING_DIR="$RUNNER_TEMP/bootstrap"
+          mkdir -p "$STAGING_DIR"
+
+          echo "Transport branch ref: $TRANSPORT_REF"
           echo ""
-          echo "Repository files:"
-          ls -la "$GITHUB_WORKSPACE/repo"
+
+          # List all files on the fetched branch
+          echo "Files on transport branch:"
+          git -C "${{ github.workspace }}/repo" ls-tree -r --name-only "$TRANSPORT_REF"
           echo ""
-          echo "Requirements file:"
-          test -f "$GITHUB_WORKSPACE/repo/requirements.txt" && echo "  FOUND: repo/requirements.txt" || echo "  MISSING: repo/requirements.txt"
+
+          # Extract only snapshot-*.tar.gz via git archive
+          git -C "${{ github.workspace }}/repo" archive "$TRANSPORT_REF" \
+            --format=tar \
+            -- snapshot-*.tar.gz \
+            | tar -x -C "$STAGING_DIR"
+
+          # Hard validation: exactly 2 snapshot archives
+          ARCHIVE_COUNT=$(find "$STAGING_DIR" -maxdepth 1 -name 'snapshot-*.tar.gz' | wc -l | tr -d ' ')
+          echo "Snapshot archives found: $ARCHIVE_COUNT"
+
+          if [ "$ARCHIVE_COUNT" -ne 2 ]; then
+            echo "ERROR: Expected exactly 2 snapshot-*.tar.gz archives, found $ARCHIVE_COUNT"
+            echo ""
+            echo "Full tree of transport branch:"
+            git -C "${{ github.workspace }}/repo" ls-tree -r --name-only "$TRANSPORT_REF"
+            exit 1
+          fi
+
           echo ""
-          echo "Transport files:"
-          ls -lh "$GITHUB_WORKSPACE/bootstrap-transport"
+          echo "Staged archives:"
+          ls -lh "$STAGING_DIR/snapshot-"*.tar.gz
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -63,32 +84,15 @@ jobs:
         run: python -m pip install -r "$GITHUB_WORKSPACE/repo/requirements.txt"
 
       # -----------------------------------------------------------
-      # COPY: Snapshot tarballs from transport branch to staging
-      # -----------------------------------------------------------
-      - name: Copy snapshot archives to staging
-        run: |
-          mkdir -p /tmp/bootstrap
-
-          cp "$GITHUB_WORKSPACE/bootstrap-transport/snapshot-*.tar.gz" /tmp/bootstrap/
-
-          ASSET_COUNT=$(ls /tmp/bootstrap/snapshot-*.tar.gz 2>/dev/null | wc -l)
-          if [ "$ASSET_COUNT" -lt 2 ]; then
-            echo "ERROR: Expected at least 2 snapshot-*.tar.gz, found $ASSET_COUNT"
-            exit 1
-          fi
-
-          echo "Staged files:"
-          ls -la /tmp/bootstrap/
-
-      # -----------------------------------------------------------
       # EXTRACT: Unpack tarballs
       # -----------------------------------------------------------
       - name: Extract snapshot tarballs
         run: |
+          STAGING_DIR="$RUNNER_TEMP/bootstrap"
           mkdir -p /tmp/mplads-work/previous
           mkdir -p /tmp/mplads-work/current
 
-          TARBALL_COUNT=$(ls /tmp/bootstrap/snapshot-*.tar.gz 2>/dev/null | wc -l)
+          TARBALL_COUNT=$(ls "$STAGING_DIR"/snapshot-*.tar.gz 2>/dev/null | wc -l)
           echo "Found $TARBALL_COUNT snapshot tarballs"
 
           if [ "$TARBALL_COUNT" -lt 2 ]; then
@@ -97,14 +101,14 @@ jobs:
           fi
 
           # Extract all tarballs to a staging area
-          STAGING=$(mktemp -d)
-          for tarball in /tmp/bootstrap/snapshot-*.tar.gz; do
+          EXTRACT_DIR=$(mktemp -d)
+          for tarball in "$STAGING_DIR"/snapshot-*.tar.gz; do
             echo "Extracting: $tarball"
-            tar xzf "$tarball" -C "$STAGING"
+            tar xzf "$tarball" -C "$EXTRACT_DIR"
           done
 
           # Find extracted snapshot directories
-          SNAPSHOTS=$(find "$STAGING" -mindepth 1 -maxdepth 1 -type d)
+          SNAPSHOTS=$(find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -type d)
           echo "Extracted snapshots:"
           echo "$SNAPSHOTS"
 
@@ -125,8 +129,8 @@ jobs:
           echo "Current (newer):  $CURRENT_TS"
 
           # Copy to final locations
-          cp -r "$STAGING/$PREVIOUS_TS" /tmp/mplads-work/previous/
-          cp -r "$STAGING/$CURRENT_TS" /tmp/mplads-work/current/
+          cp -r "$EXTRACT_DIR/$PREVIOUS_TS" /tmp/mplads-work/previous/
+          cp -r "$EXTRACT_DIR/$CURRENT_TS" /tmp/mplads-work/current/
 
           # Write metadata via Python (avoids heredoc interpolation issues)
           python3 -c "
@@ -146,8 +150,8 @@ jobs:
           echo "Metadata:"
           cat /tmp/mplads-work/.cache-metadata.json
 
-          # Cleanup staging
-          rm -rf "$STAGING"
+          # Cleanup extraction dir
+          rm -rf "$EXTRACT_DIR"
 
       # -----------------------------------------------------------
       # VALIDATE: Check both snapshots are complete
