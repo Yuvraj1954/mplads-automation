@@ -378,7 +378,11 @@ def main():
     old_timestamp = None
     old_local_path = None
 
-    if cache_work_dir:
+    use_supabase_fallback = os.environ.get("USE_SUPABASE_FALLBACK", "false").lower() == "true"
+
+    if use_supabase_fallback:
+        print("Supabase fallback requested by workflow — skipping cache")
+    elif cache_work_dir:
         cache_dir = Path(cache_work_dir)
         ok, err = validate_cache(cache_dir)
         if ok:
@@ -391,7 +395,6 @@ def main():
                 print("WARNING: Cache valid but no previous snapshot found")
         else:
             print(f"WARNING: Cache validation failed: {err}")
-            print("Falling back to Supabase Storage...")
 
     if not old_timestamp:
         print("Previous snapshot from Supabase Storage (fallback)")

@@ -35,33 +35,69 @@ jobs:
       - name: Install dependencies
         run: pip install -r "${{ github.workspace }}/repo/requirements.txt"
 
-      # -----------------------------------------------------------
-      # CACHE RESTORE: Restore rolling snapshot cache
-      # -----------------------------------------------------------
-      - name: Restore snapshot cache
+      # ===========================================================
+      # CACHE RESTORE: Attempt 1
+      # ===========================================================
+      - name: Restore snapshot cache (attempt 1)
         uses: actions/cache/restore@v4
-        id: cache-restore
+        id: cache-restore-1
         with:
           path: /tmp/mplads-work
           key: mplads-snapshot-state-${{ github.run_id }}
           restore-keys: |
             mplads-snapshot-state-
 
-      - name: Cache restore result
-        run: |
-          if [ "${{ steps.cache-restore.outputs.cache-hit }}" == "true" ]; then
-            echo "Cache restored successfully"
-          else
-            echo "No cache found — first run or cache expired"
-          fi
-
-      # -----------------------------------------------------------
-      # VALIDATE: Ensure cache has valid previous snapshot
-      # -----------------------------------------------------------
-      - name: Validate restored cache
+      - name: Validate cache (attempt 1)
+        id: validate-1
         working-directory: ${{ github.workspace }}/repo
-        env:
-          MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
+        run: |
+          python3 -c "
+          import sys, json
+          sys.path.insert(0, 'automation')
+          from snapshot_cache import validate_cache, get_previous_timestamp, get_current_timestamp
+          from pathlib import Path
+
+          work_dir = Path('/tmp/mplads-work')
+          if not work_dir.exists():
+              print('cache_valid=false')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=false\n')
+              sys.exit(0)
+
+          ok, err = validate_cache(work_dir)
+          if ok:
+              prev_ts = get_previous_timestamp(work_dir)
+              curr_ts = get_current_timestamp(work_dir)
+              print(f'Cache valid: previous={prev_ts}, current={curr_ts}')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=true\n')
+          else:
+              print(f'Cache invalid: {err}')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=false\n')
+          "
+
+      # ===========================================================
+      # CACHE RESTORE: Attempt 2 (only if attempt 1 failed)
+      # ===========================================================
+      - name: Clear invalid cache for retry
+        if: steps.validate-1.outputs.cache_valid != 'true'
+        run: rm -rf /tmp/mplads-work
+
+      - name: Restore snapshot cache (attempt 2)
+        if: steps.validate-1.outputs.cache_valid != 'true'
+        uses: actions/cache/restore@v4
+        id: cache-restore-2
+        with:
+          path: /tmp/mplads-work
+          key: mplads-snapshot-state-${{ github.run_id }}
+          restore-keys: |
+            mplads-snapshot-state-
+
+      - name: Validate cache (attempt 2)
+        if: steps.validate-1.outputs.cache_valid != 'true'
+        id: validate-2
+        working-directory: ${{ github.workspace }}/repo
         run: |
           python3 -c "
           import sys
@@ -71,22 +107,43 @@ jobs:
 
           work_dir = Path('/tmp/mplads-work')
           if not work_dir.exists():
-              print('No cache work directory found')
+              print('Cache still missing after retry')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=false\n')
               sys.exit(0)
 
           ok, err = validate_cache(work_dir)
           if ok:
               prev_ts = get_previous_timestamp(work_dir)
               curr_ts = get_current_timestamp(work_dir)
-              print(f'Cache valid: previous={prev_ts}, current={curr_ts}')
+              print(f'Cache valid on retry: previous={prev_ts}, current={curr_ts}')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=true\n')
           else:
-              print(f'Cache invalid: {err}')
-              print('Pipeline will use Supabase fallback for previous snapshot')
+              print(f'Cache still invalid after retry: {err}')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=false\n')
           "
 
-      # -----------------------------------------------------------
+      # ===========================================================
+      # SET FALLBACK FLAG: True only if both retries failed
+      # ===========================================================
+      - name: Determine fallback strategy
+        id: strategy
+        run: |
+          VALID_1="${{ steps.validate-1.outputs.cache_valid }}"
+          VALID_2="${{ steps.validate-2.outputs.cache_valid }}"
+          if [ "$VALID_1" == "true" ] || [ "$VALID_2" == "true" ]; then
+            echo "Cache available — normal path"
+            echo "use_supabase_fallback=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Cache unavailable after retries — Supabase fallback"
+            echo "use_supabase_fallback=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ===========================================================
       # RUN PIPELINE
-      # -----------------------------------------------------------
+      # ===========================================================
       - name: Run complete MPLADS pipeline
         working-directory: ${{ github.workspace }}/repo
         env:
@@ -95,14 +152,31 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SYNC_INTERVAL_HOURS: ${{ github.event.inputs.sync_interval_hours || '24' }}
           MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
+          USE_SUPABASE_FALLBACK: ${{ steps.strategy.outputs.use_supabase_fallback }}
         run: python automation/daily_pipeline.py
 
-      # -----------------------------------------------------------
-      # ROTATE: On success — move current → previous
-      # The pipeline already copied fetched snapshot to current/<new_ts>/
-      # -----------------------------------------------------------
-      - name: Rotate snapshots
+      # ===========================================================
+      # READ NEW TIMESTAMP: Pipeline wrote .new_timestamp on success
+      # ===========================================================
+      - name: Read new snapshot timestamp
         if: success()
+        id: new-ts
+        run: |
+          NEW_TS_FILE="/tmp/mplads-work/.new_timestamp"
+          if [ -f "$NEW_TS_FILE" ]; then
+            NEW_TS=$(cat "$NEW_TS_FILE")
+            echo "new_ts=$NEW_TS" >> "$GITHUB_OUTPUT"
+            echo "New snapshot timestamp: $NEW_TS"
+          else
+            echo "No .new_timestamp found — pipeline may have failed or had no changes"
+            echo "new_ts=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ===========================================================
+      # ROTATE: On success — move current → previous
+      # ===========================================================
+      - name: Rotate snapshots
+        if: success() && steps.new-ts.outputs.new_ts != ''
         working-directory: ${{ github.workspace }}/repo
         env:
           MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
@@ -112,7 +186,7 @@ jobs:
           sys.path.insert(0, 'automation')
           from snapshot_cache import (
               get_previous_timestamp, get_current_timestamp,
-              validate_snapshot_structure, write_metadata
+              write_metadata
           )
           from pathlib import Path
 
@@ -120,50 +194,50 @@ jobs:
           prev_dir = work_dir / 'previous'
           curr_dir = work_dir / 'current'
 
-          old_curr_ts = None
-          for d in sorted(curr_dir.iterdir()) if curr_dir.exists() else []:
-              if d.is_dir() and not d.name.startswith('.'):
-                  old_curr_ts = d.name
-                  break
+          # Find ALL current snapshot directories
+          curr_snapshots = sorted([
+              d.name for d in curr_dir.iterdir()
+              if d.is_dir() and not d.name.startswith('.')
+          ]) if curr_dir.exists() else []
 
-          if old_curr_ts is None:
-              print('No current snapshot to rotate')
+          if len(curr_snapshots) < 2:
+              # First run or no previous current — no rotation needed
+              print(f'Only {len(curr_snapshots)} current snapshot(s) — skipping rotation')
+              # Update metadata with what we have
+              old_prev = get_previous_timestamp(work_dir)
+              new_curr = curr_snapshots[-1] if curr_snapshots else None
+              write_metadata(old_prev or 'none', new_curr, work_dir)
+              print(f'Metadata: previous={old_prev or \"none\"}, current={new_curr}')
               sys.exit(0)
 
-          # Delete old previous
+          # Normal rotation: move oldest current → previous
+          old_curr_ts = curr_snapshots[0]
+          new_curr_ts = curr_snapshots[-1]
+
           if prev_dir.exists():
               shutil.rmtree(prev_dir)
 
-          # Move current → previous
           prev_dir.mkdir(parents=True, exist_ok=True)
           shutil.move(str(curr_dir / old_curr_ts), str(prev_dir / old_curr_ts))
-          print(f'Rotated: previous={old_curr_ts}')
+          print(f'Rotated: previous={old_curr_ts}, current={new_curr_ts}')
 
-          # Find new current (pipeline wrote it)
-          new_curr_ts = None
-          for d in sorted(curr_dir.iterdir()) if curr_dir.exists() else []:
-              if d.is_dir() and not d.name.startswith('.'):
-                  new_curr_ts = d.name
-                  break
-
-          # Update metadata
-          write_metadata(old_curr_ts, new_curr_ts or old_curr_ts, work_dir)
+          write_metadata(old_curr_ts, new_curr_ts, work_dir)
           print(f'Metadata updated: previous={old_curr_ts}, current={new_curr_ts}')
           "
 
-      # -----------------------------------------------------------
-      # SAVE: Save rolling state to new immutable cache key
-      # -----------------------------------------------------------
+      # ===========================================================
+      # SAVE: New immutable cache key using snapshot timestamp
+      # ===========================================================
       - name: Save snapshot cache
-        if: success()
+        if: success() && steps.new-ts.outputs.new_ts != ''
         uses: actions/cache/save@v4
         with:
           path: /tmp/mplads-work
-          key: mplads-snapshot-state-${{ github.run_id }}-success
+          key: mplads-snapshot-state-${{ steps.new-ts.outputs.new_ts }}
 
-      # -----------------------------------------------------------
+      # ===========================================================
       # CLEANUP: Best-effort old cache entries
-      # -----------------------------------------------------------
+      # ===========================================================
       - name: Cleanup old cache entries
         if: success()
         continue-on-error: true
