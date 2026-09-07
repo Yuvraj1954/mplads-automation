@@ -38,11 +38,35 @@ jobs:
           echo "Downloading snapshots from release: ${{ inputs.release_tag }}"
           mkdir -p /tmp/bootstrap
 
-          gh release download "${{ inputs.release_tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern "snapshot-*.tar.gz" \
-            --dir /tmp/bootstrap/ \
-            || { echo "ERROR: No snapshot-*.tar.gz assets found in release"; exit 1; }
+          # Resolve the release by tag via API (works for draft releases)
+          RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }}" 2>&1) || {
+            echo "ERROR: Release '${{ inputs.release_tag }}' not found"
+            echo "$RELEASE_JSON"
+            exit 1
+          }
+
+          RELEASE_ID=$(echo "$RELEASE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          echo "Release ID: $RELEASE_ID"
+
+          # List assets and download snapshot-*.tar.gz via browser_download_url
+          gh api "repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
+            --paginate \
+            --jq '.[] | select(.name | startswith("snapshot-") and endswith(".tar.gz")) | [.name, .browser_download_url] | @tsv' \
+            | while IFS=$'\t' read -r ASSET_NAME DOWNLOAD_URL; do
+              echo "Downloading: $ASSET_NAME"
+              curl -sSfL \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/octet-stream" \
+                "$DOWNLOAD_URL" \
+                -o "/tmp/bootstrap/$ASSET_NAME" \
+                || { echo "ERROR: Failed to download $ASSET_NAME"; exit 1; }
+            done
+
+          ASSET_COUNT=$(ls /tmp/bootstrap/snapshot-*.tar.gz 2>/dev/null | wc -l)
+          if [ "$ASSET_COUNT" -lt 2 ]; then
+            echo "ERROR: Expected at least 2 snapshot-*.tar.gz assets, found $ASSET_COUNT"
+            exit 1
+          fi
 
           echo "Downloaded files:"
           ls -la /tmp/bootstrap/
