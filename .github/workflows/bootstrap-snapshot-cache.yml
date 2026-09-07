@@ -224,6 +224,7 @@ jobs:
       # VERIFY: Confirm cache was created
       # -----------------------------------------------------------
       - name: Verify cache exists
+        working-directory: ${{ github.workspace }}/repo
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
