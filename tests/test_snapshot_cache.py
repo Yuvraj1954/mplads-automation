@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "automation"))
 from snapshot_cache import (
     validate_snapshot_structure,
     validate_cache,
+    validate_bootstrap_cache,
     get_previous_local_path,
     get_current_local_path,
     get_previous_timestamp,
@@ -310,6 +311,92 @@ class TestEnsureCacheDirs(unittest.TestCase):
             ensure_cache_dirs(work)
             self.assertTrue((work / PREVIOUS_DIR).exists())
             self.assertTrue((work / CURRENT_DIR).exists())
+
+
+class TestValidateBootstrapCache(unittest.TestCase):
+    """Regression tests for bootstrap cache validation (run #23 fix).
+
+    Bootstrap only needs a valid current snapshot. Previous snapshot
+    validity is irrelevant for bootstrap mode.
+    """
+
+    def test_valid_current_invalid_previous_succeeds(self):
+        """Valid current + invalid previous -> bootstrap succeeds."""
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            # Current is valid
+            _make_snapshot(work / CURRENT_DIR, "2026-09-02T00-00-00Z")
+            # Previous exists but has no _COMPLETE.json (invalid)
+            prev = work / PREVIOUS_DIR / "2026-09-01T00-00-00Z"
+            prev.mkdir(parents=True)
+            (prev / "allocated_limit").mkdir()
+            (prev / "allocated_limit" / "part_0001.ndjson").write_text("{}\n")
+
+            ok, err = validate_bootstrap_cache(work)
+            self.assertTrue(ok)
+            self.assertEqual(err, "")
+
+    def test_valid_current_missing_previous_succeeds(self):
+        """Valid current + missing previous -> bootstrap succeeds."""
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            _make_snapshot(work / CURRENT_DIR, "2026-09-02T00-00-00Z")
+            # No previous directory at all
+
+            ok, err = validate_bootstrap_cache(work)
+            self.assertTrue(ok)
+            self.assertEqual(err, "")
+
+    def test_invalid_current_fails(self):
+        """Invalid current -> bootstrap fails."""
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            # Current exists but has no _COMPLETE.json (invalid)
+            curr = work / CURRENT_DIR / "2026-09-02T00-00-00Z"
+            curr.mkdir(parents=True)
+            (curr / "allocated_limit").mkdir()
+            (curr / "allocated_limit" / "part_0001.ndjson").write_text("{}\n")
+
+            ok, err = validate_bootstrap_cache(work)
+            self.assertFalse(ok)
+            self.assertIn("Current snapshot invalid", err)
+
+    def test_missing_current_fails(self):
+        """No current snapshot -> bootstrap fails."""
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            # No current directory
+
+            ok, err = validate_bootstrap_cache(work)
+            self.assertFalse(ok)
+            self.assertIn("No current snapshot", err)
+
+    def test_no_work_dir_fails(self):
+        """Nonexistent work directory -> bootstrap fails."""
+        ok, err = validate_bootstrap_cache(Path("/nonexistent"))
+        self.assertFalse(ok)
+        self.assertIn("does not exist", err)
+
+    def test_current_with_incomplete_status_fails(self):
+        """Current snapshot with status != 'complete' -> bootstrap fails."""
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            _make_snapshot(work / CURRENT_DIR, "2026-09-02T00-00-00Z", complete=False)
+
+            ok, err = validate_bootstrap_cache(work)
+            self.assertFalse(ok)
+            self.assertIn("Current snapshot invalid", err)
+
+    def test_validate_cache_still_requires_both(self):
+        """validate_cache() still requires both previous and current (no regression)."""
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            _make_snapshot(work / CURRENT_DIR, "2026-09-02T00-00-00Z")
+            # No previous -> validate_cache should fail
+
+            ok, err = validate_cache(work)
+            self.assertFalse(ok)
+            self.assertIn("previous", err.lower())
 
 
 if __name__ == "__main__":

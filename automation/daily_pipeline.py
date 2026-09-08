@@ -23,6 +23,7 @@ from automation.snapshot_cache import (
     get_current_timestamp,
     get_current_local_path,
     validate_cache,
+    validate_bootstrap_cache,
     write_new_timestamp,
     write_metadata,
     METADATA_FILE,
@@ -403,13 +404,22 @@ def main():
             )
 
         cache_dir = Path(cache_work_dir)
+
+        # Bootstrap only needs a valid current snapshot.
+        # Validate current independently — previous snapshot is irrelevant.
+        ok, err = validate_bootstrap_cache(cache_dir)
+        if not ok:
+            raise RuntimeError(
+                f"Bootstrap cache validation failed: {err}. "
+                "Bootstrap requires a valid current snapshot in the cache. "
+                "Run the full pipeline at least once first."
+            )
+
         curr_path = get_current_local_path(cache_dir)
         if not curr_path:
-            curr_path = get_previous_local_path(cache_dir)
-        if not curr_path:
             raise RuntimeError(
-                "No valid cached snapshot found for bootstrap. "
-                "Run the full pipeline at least once first."
+                "Bootstrap: current snapshot validation passed but path resolution failed. "
+                "This should not happen — please check the cache structure."
             )
 
         snapshot_path = str(curr_path)

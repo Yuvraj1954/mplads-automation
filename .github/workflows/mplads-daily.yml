@@ -86,11 +86,11 @@ jobs:
       # CACHE RESTORE: Attempt 2 (only if attempt 1 failed)
       # ===========================================================
       - name: Clear invalid cache for retry
-        if: steps.validate-1.outputs.cache_valid != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
         run: rm -rf /tmp/mplads-work
 
       - name: Restore snapshot cache (attempt 2)
-        if: steps.validate-1.outputs.cache_valid != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
         uses: actions/cache/restore@v4
         id: cache-restore-2
         with:
@@ -100,7 +100,7 @@ jobs:
             mplads-snapshot-state-
 
       - name: Validate cache (attempt 2)
-        if: steps.validate-1.outputs.cache_valid != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
         id: validate-2
         working-directory: ${{ github.workspace }}/repo
         run: |
@@ -136,6 +136,11 @@ jobs:
       - name: Determine fallback strategy
         id: strategy
         run: |
+          if [ "${{ github.event.inputs.bootstrap }}" == "true" ]; then
+            echo "Bootstrap mode — fallback strategy not applicable"
+            echo "use_supabase_fallback=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           VALID_1="${{ steps.validate-1.outputs.cache_valid }}"
           VALID_2="${{ steps.validate-2.outputs.cache_valid }}"
           if [ "$VALID_1" == "true" ] || [ "$VALID_2" == "true" ]; then

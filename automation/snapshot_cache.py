@@ -131,6 +131,33 @@ def validate_cache(work_dir: Optional[Path] = None) -> Tuple[bool, str]:
     return True, ""
 
 
+def validate_bootstrap_cache(work_dir: Optional[Path] = None) -> Tuple[bool, str]:
+    """Validate that the cache has a valid current snapshot for bootstrap.
+
+    Unlike validate_cache(), this does NOT require a valid previous snapshot.
+    Bootstrap only needs the current snapshot because it processes the full
+    snapshot without comparing against a previous one.
+
+    Returns (is_valid, error_message).
+    """
+    work_dir = work_dir or _get_work_dir()
+
+    if not work_dir.exists():
+        return False, f"Cache work directory does not exist: {work_dir}"
+
+    # Find current snapshot
+    curr_ts = _find_snapshot_ts(work_dir / CURRENT_DIR)
+    if not curr_ts:
+        return False, "No current snapshot found in cache"
+
+    curr_dir = work_dir / CURRENT_DIR / curr_ts
+    ok, err = validate_snapshot_structure(curr_dir)
+    if not ok:
+        return False, f"Current snapshot invalid: {err}"
+
+    return True, ""
+
+
 def get_previous_local_path(work_dir: Optional[Path] = None) -> Optional[Path]:
     """Return the local path to the previous snapshot directory.
 
