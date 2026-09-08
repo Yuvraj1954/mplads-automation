@@ -19,7 +19,7 @@ concurrency:
 jobs:
   bootstrap:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 220
 
     steps:
       - name: Confirm destructive bootstrap
