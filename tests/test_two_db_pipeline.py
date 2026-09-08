@@ -884,13 +884,17 @@ class TestUpsertIdempotency:
         src = inspect.getsource(stage_persist)
         assert '["entity_type", "entity_id"]' in src
 
-    def test_stage_persist_full_rebuild_still_deletes(self):
+    def test_stage_persist_full_rebuild_only_deletes_entity_evidence(self):
         from automation.pipeline_controller import stage_persist
         import inspect
         src = inspect.getsource(stage_persist)
         assert "sb_delete" in src
-        assert "evidence_work_refs" in src
-        assert "ref_id" in src
+        assert "entity_evidence" in src
+        # evidence_work_refs must NOT be deleted by sb_delete — managed by stage 8b
+        import re
+        delete_calls = re.findall(r'sb_delete\([^)]+\)', src)
+        for call in delete_calls:
+            assert "evidence_work_refs" not in call, f"sb_delete should not target evidence_work_refs: {call}"
 
     def test_stage_gemini_uses_upsert_not_post(self):
         from automation.pipeline_controller import stage_gemini

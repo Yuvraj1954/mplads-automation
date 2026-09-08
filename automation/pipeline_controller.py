@@ -331,7 +331,7 @@ def stage_analyze(snapshot_dir, reference_date=None):
         if not m.member_name:
             m.member_name = member_name_map.get((m.member_type, m.member_id))
 
-    # Populate state_name on StateMetrics from works data
+    # Populate state_name on StateMetrics and MemberMetrics from works data
     state_name_map = {}
     for w in works:
         state_id = w.get("state_id")
@@ -341,6 +341,9 @@ def stage_analyze(snapshot_dir, reference_date=None):
     for s in pipeline.state_metrics:
         if not s.state_name:
             s.state_name = state_name_map.get(s.state_id)
+    for m in pipeline.member_metrics:
+        if not m.state_name and m.state_id:
+            m.state_name = state_name_map.get(m.state_id)
 
     # Inject zero-work members from allocated_limit snapshots
     pipeline.member_metrics = inject_zero_work_members(
@@ -505,9 +508,20 @@ def stage_analytics_persist(pipeline_result, anomaly_result):
     # Upsert all records to DB2
     written = 0
 
-    sb_upsert(db2_url, db2_key, "overall_metrics", overall,
-              conflict_cols=["scope"])
-    written += len(overall)
+    # Guard: skip overall_metrics upsert if all values are zero
+    # This prevents a subsequent run with empty snapshot from overwriting
+    # real data with zeros (the member_metrics empty-body guard already
+    # protects member_metrics, but overall_metrics always produces 3 rows)
+    has_real_data = any(
+        r.get("total_works", 0) > 0 or r.get("sanctioned_amount", 0) > 0
+        for r in overall
+    )
+    if has_real_data:
+        sb_upsert(db2_url, db2_key, "overall_metrics", overall,
+                  conflict_cols=["scope"])
+        written += len(overall)
+    else:
+        print("  WARNING: Skipping overall_metrics upsert (all zeros - empty snapshot?)")
 
     # Member metrics in batches
     batch_size = 200
@@ -684,7 +698,8 @@ def stage_persist(evidence_records, affected_keys=None):
         records_to_write = affected_records
     else:
         print("  Full rebuild: deleting old evidence...")
-        sb_delete(db2_url, db2_key, "evidence_work_refs", {"ref_id": "gte.0"})
+        # Only delete entity_evidence — evidence_work_refs are managed by
+        # stage_evidence_work_refs (Stage 8b) and must NOT be wiped here
         sb_delete(db2_url, db2_key, "entity_evidence", {"evidence_id": "gte.0"})
         records_to_write = evidence_records
 

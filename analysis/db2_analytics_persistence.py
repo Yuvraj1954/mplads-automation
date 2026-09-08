@@ -251,11 +251,13 @@ def _member_to_record(m, anomaly_map, master_ctx):
     if not member_name and master:
         member_name = master.get("member_name")
 
-    # Get state name
-    state_name = None
-    master_data = master_ctx.get((m.member_type, m.member_id))
-    if master_data:
-        state_name = master_data.get("state_name")
+    # Get state name — prefer MemberMetrics.state_name (set from works data),
+    # fall back to master_population_context (for zero-work members)
+    state_name = getattr(m, 'state_name', None)
+    if not state_name:
+        master_data = master_ctx.get((m.member_type, m.member_id))
+        if master_data:
+            state_name = master_data.get("state_name")
 
     # Get tenure info
     house_name = None
