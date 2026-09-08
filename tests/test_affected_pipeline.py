@@ -253,29 +253,21 @@ class TestAffectedIdentityMapping:
             ds_dir.mkdir(parents=True)
 
             records = [
-                {"WORK_RECOMMENDATION_DTL_ID": "12345", "mp_name": "Test MP", "state_id": "S1"},
-                {"WORK_RECOMMENDATION_DTL_ID": "12346", "mp_name": "Test MP2", "state_id": "S2"},
+                {"WORK_RECOMMENDATION_DTL_ID": "12345"},
+                {"WORK_RECOMMENDATION_DTL_ID": "12346"},
             ]
             with open(ds_dir / "part_0001.ndjson", "w") as f:
                 for r in records:
                     f.write(json.dumps(r) + "\n")
 
-            with patch("automation.pipeline_controller.load_config"):
-                with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
-                    with patch("automation.pipeline_controller.sb_get", return_value=[{
-                        "work_id": 100,
-                        "member_type": "MP",
-                        "member_id": 500,
-                        "state_id": "S1",
-                    }]):
-                        result = stage_affected(str(delta_dir), "test_run")
+            result = stage_affected(str(delta_dir), "test_run")
 
             assert len(result["affected_work_dtls"]) == 2
             assert "12345" in result["affected_work_dtls"]
             assert "12346" in result["affected_work_dtls"]
 
-    def test_dtl_id_lookup_returns_internal_ids(self):
-        """DB1 lookup via source_work_id returns internal member IDs."""
+    def test_mp_dtl_produces_snapshot_work_id(self):
+        """MP DTL_ID produces snapshot work_id = int(DTL_ID)."""
         from automation.pipeline_controller import stage_affected
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -286,44 +278,30 @@ class TestAffectedIdentityMapping:
             with open(ds_dir / "part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "99999"}) + "\n")
 
-            mock_rows = [{
-                "work_id": 5000,
-                "member_type": "MP",
-                "member_id": 300,
-                "state_id": "S10",
-            }]
+            result = stage_affected(str(delta_dir), "test_run")
 
-            with patch("automation.pipeline_controller.load_config"):
-                with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
-                    with patch("automation.pipeline_controller.sb_get", return_value=mock_rows):
-                        result = stage_affected(str(delta_dir), "test_run")
+            assert 99999 in result["affected_work_ids"]
+            assert result["work_count"] == 1
 
-            assert 5000 in result["affected_work_ids"]
-            assert ("MP", 300) in result["affected_members"]
-            assert "S10" in result["affected_states"]
-
-    def test_missing_dtl_gracefully_handled(self):
-        """DTL ID not found in DB1 is handled gracefully."""
+    def test_mla_dtl_produces_snapshot_work_id_with_offset(self):
+        """MLA DTL_ID produces snapshot work_id = int(DTL_ID) + 1_000_000."""
         from automation.pipeline_controller import stage_affected
 
         with tempfile.TemporaryDirectory() as tmpdir:
             delta_dir = Path(tmpdir) / "delta"
-            ds_dir = delta_dir / "works_recommended"
+            ds_dir = delta_dir / "mla_works_recommended"
             ds_dir.mkdir(parents=True)
 
             with open(ds_dir / "part_0001.ndjson", "w") as f:
-                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "NOEXIST"}) + "\n")
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "88888"}) + "\n")
 
-            with patch("automation.pipeline_controller.load_config"):
-                with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
-                    with patch("automation.pipeline_controller.sb_get", return_value=[]):
-                        result = stage_affected(str(delta_dir), "test_run")
+            result = stage_affected(str(delta_dir), "test_run")
 
-            assert result["member_count"] == 0
-            assert result["work_count"] == 0
+            assert 1_088_888 in result["affected_work_ids"]
+            assert result["work_count"] == 1
 
-    def test_raw_state_id_fallback(self):
-        """Raw state_id from records is used as fallback."""
+    def test_source_work_id_never_used_for_lookup(self):
+        """source_work_id is never queried — only DTL_ID is used."""
         from automation.pipeline_controller import stage_affected
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -333,16 +311,113 @@ class TestAffectedIdentityMapping:
 
             with open(ds_dir / "part_0001.ndjson", "w") as f:
                 f.write(json.dumps({
-                    "WORK_RECOMMENDATION_DTL_ID": "111",
-                    "state_id": "FALLBACK_STATE"
+                    "WORK_RECOMMENDATION_DTL_ID": "55555",
+                    "source_work_id": "Construction of Road",
                 }) + "\n")
 
-            with patch("automation.pipeline_controller.load_config"):
-                with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
-                    with patch("automation.pipeline_controller.sb_get", return_value=[]):
-                        result = stage_affected(str(delta_dir), "test_run")
+            result = stage_affected(str(delta_dir), "test_run")
 
-            assert "FALLBACK_STATE" in result["affected_states"]
+            assert 55555 in result["affected_work_ids"]
+            assert "55555" in result["affected_work_dtls"]
+
+    def test_member_id_empty_initially(self):
+        """affected_members is empty initially (derived in stage_analyze_affected)."""
+        from automation.pipeline_controller import stage_affected
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            delta_dir = Path(tmpdir) / "delta"
+            ds_dir = delta_dir / "works_recommended"
+            ds_dir.mkdir(parents=True)
+
+            with open(ds_dir / "part_0001.ndjson", "w") as f:
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "111"}) + "\n")
+
+            result = stage_affected(str(delta_dir), "test_run")
+
+            assert result["member_count"] == 0
+            assert result["affected_members"] == set()
+
+    def test_no_nonexistent_columns_selected(self):
+        """No DB1 query with nonexistent columns is made."""
+        from automation.pipeline_controller import stage_affected
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            delta_dir = Path(tmpdir) / "delta"
+            ds_dir = delta_dir / "works_recommended"
+            ds_dir.mkdir(parents=True)
+
+            with open(ds_dir / "part_0001.ndjson", "w") as f:
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "222"}) + "\n")
+
+            result = stage_affected(str(delta_dir), "test_run")
+
+            assert result["work_count"] == 1
+            assert 222 in result["affected_work_ids"]
+
+    def test_mla_affected_works_included(self):
+        """MLA affected works get correct offset work_ids."""
+        from automation.pipeline_controller import stage_affected
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            delta_dir = Path(tmpdir) / "delta"
+
+            mp_dir = delta_dir / "works_recommended"
+            mp_dir.mkdir(parents=True)
+            with open(mp_dir / "part_0001.ndjson", "w") as f:
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "100"}) + "\n")
+
+            mla_dir = delta_dir / "mla_works_sanctioned"
+            mla_dir.mkdir(parents=True)
+            with open(mla_dir / "part_0001.ndjson", "w") as f:
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "200"}) + "\n")
+
+            result = stage_affected(str(delta_dir), "test_run")
+
+            assert 100 in result["affected_work_ids"]
+            assert 1_000_200 in result["affected_work_ids"]
+            assert result["work_count"] == 2
+
+    def test_multiple_mp_and_mla_dtls(self):
+        """Multiple MP + MLA DTLs produce correct work_ids."""
+        from automation.pipeline_controller import stage_affected
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            delta_dir = Path(tmpdir) / "delta"
+
+            mp_dir = delta_dir / "works_completed"
+            mp_dir.mkdir(parents=True)
+            with open(mp_dir / "part_0001.ndjson", "w") as f:
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "111"}) + "\n")
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "222"}) + "\n")
+
+            mla_dir = delta_dir / "mla_works_completed"
+            mla_dir.mkdir(parents=True)
+            with open(mla_dir / "part_0001.ndjson", "w") as f:
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "333"}) + "\n")
+
+            result = stage_affected(str(delta_dir), "test_run")
+
+            assert result["work_count"] == 3
+            assert 111 in result["affected_work_ids"]
+            assert 222 in result["affected_work_ids"]
+            assert 1_000_333 in result["affected_work_ids"]
+
+    def test_unknown_dtl_ids_produce_work_ids(self):
+        """Unknown DTL IDs still produce snapshot work_ids (no DB check needed)."""
+        from automation.pipeline_controller import stage_affected
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            delta_dir = Path(tmpdir) / "delta"
+            ds_dir = delta_dir / "works_recommended"
+            ds_dir.mkdir(parents=True)
+
+            with open(ds_dir / "part_0001.ndjson", "w") as f:
+                f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "999999"}) + "\n")
+
+            result = stage_affected(str(delta_dir), "test_run")
+
+            assert 999999 in result["affected_work_ids"]
+            assert result["work_count"] == 1
 
 
 # ============================================================

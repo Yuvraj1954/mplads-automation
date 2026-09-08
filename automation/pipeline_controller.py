@@ -253,12 +253,13 @@ def stage_affected(delta_dir=None, run_id=None):
     print("\n=== STAGE 5: AFFECTED ENTITIES ===")
 
     affected_work_dtls = []
-    affected_raw_records = []
+    affected_work_ids = set()
 
     if delta_dir and Path(delta_dir).exists():
         for dataset_dir in Path(delta_dir).iterdir():
             if not dataset_dir.is_dir():
                 continue
+            is_mla = dataset_dir.name.startswith("mla_")
             for part_file in dataset_dir.glob("part_*.ndjson"):
                 with open(part_file) as f:
                     for line in f:
@@ -272,48 +273,19 @@ def stage_affected(delta_dir=None, run_id=None):
 
                         dtl_id = record.get("WORK_RECOMMENDATION_DTL_ID")
                         if dtl_id:
-                            affected_work_dtls.append(str(dtl_id))
-                            affected_raw_records.append(record)
+                            dtl_str = str(dtl_id)
+                            affected_work_dtls.append(dtl_str)
+                            snapshot_work_id = int(dtl_str) + (1_000_000 if is_mla else 0)
+                            affected_work_ids.add(snapshot_work_id)
 
     print(f"  Delta work DTL IDs: {len(affected_work_dtls)}")
+    print(f"  Snapshot work IDs: {len(affected_work_ids)}")
 
+    # Member and state identity is derived in stage_analyze_affected()
+    # after pipeline runs, from affected_work_ids + pipeline.work_analyses.
+    # No DB1 lookup needed — DTL_ID is the universal identity bridge.
     affected_members = set()
     affected_states = set()
-    affected_work_ids = set()
-
-    if affected_work_dtls:
-        cfg = load_config(require_db2=False)
-        db1_url, db1_key = get_db1()
-
-        # Look up internal work_ids from DB1 works table using source_work_id
-        for dtl_id in affected_work_dtls:
-            try:
-                rows = sb_get(db1_url, db1_key, "works", {
-                    "select": "work_id,member_type,member_id,state_id",
-                    "source_work_id": f"eq.{dtl_id}",
-                    "limit": 1,
-                })
-                if rows:
-                    w = rows[0]
-                    work_id = w.get("work_id")
-                    member_type = w.get("member_type")
-                    member_id = w.get("member_id")
-                    state_id = w.get("state_id")
-
-                    if work_id:
-                        affected_work_ids.add(work_id)
-                    if member_type and member_id:
-                        affected_members.add((member_type, member_id))
-                    if state_id:
-                        affected_states.add(state_id)
-            except Exception as exc:
-                print(f"  WARNING: DTL lookup failed for {dtl_id}: {exc}")
-
-        # Also try to map raw mp_id/mla_id as fallback for works not yet in DB1
-        for record in affected_raw_records:
-            state_id = record.get("state_id")
-            if state_id and state_id not in affected_states:
-                affected_states.add(state_id)
 
     result = {
         "affected_members": affected_members,
@@ -471,16 +443,6 @@ def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
         if not m.state_name and m.state_id:
             m.state_name = state_name_map.get(m.state_id)
 
-    # Filter to affected members only for downstream stages
-    affected_member_metrics = [
-        m for m in pipeline.member_metrics
-        if (m.member_type, m.member_id) in affected_members
-    ]
-    affected_state_metrics = [
-        s for s in pipeline.state_metrics
-        if s.state_id in affected_states
-    ]
-
     # Filter work_analyses to affected works only
     affected_work_ids = affected_result.get("affected_work_ids", set())
     affected_work_analyses = [
@@ -497,6 +459,36 @@ def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
         if wa.work_id in time_sensitive and wa.work_id not in affected_work_ids
     ]
     affected_work_analyses.extend(time_sensitive_analyses)
+
+    # Derive affected member/state identity from affected work analyses.
+    # This bridges DTL_ID → snapshot work_id → (member_type, member_id) / state_id.
+    derived_members = set()
+    derived_states = set()
+    for wa in affected_work_analyses:
+        derived_members.add((wa.member_type, wa.member_id))
+        if wa.state_id:
+            derived_states.add(wa.state_id)
+
+    # Update affected_result in-place so downstream stages get correct identity
+    if derived_members:
+        affected_result["affected_members"] = derived_members
+        affected_result["member_count"] = len(derived_members)
+    if derived_states:
+        affected_result["affected_states"] = derived_states
+        affected_result["state_count"] = len(derived_states)
+
+    # Re-filter using derived identity
+    affected_members = affected_result.get("affected_members", set())
+    affected_states = affected_result.get("affected_states", set())
+
+    affected_member_metrics = [
+        m for m in pipeline.member_metrics
+        if (m.member_type, m.member_id) in affected_members
+    ]
+    affected_state_metrics = [
+        s for s in pipeline.state_metrics
+        if s.state_id in affected_states
+    ]
 
     print(f"  Affected member metrics: {len(affected_member_metrics)}")
     print(f"  Affected state metrics: {len(affected_state_metrics)}")
@@ -1344,7 +1336,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 timing["affected"] = _elapsed(t5)
 
             # Check if there are any affected entities
-            if affected_result and affected_result["member_count"] == 0:
+            if affected_result and affected_result["work_count"] == 0:
                 print("\n=== NO AFFECTED ENTITIES — SKIPPING ANALYSIS ===")
                 results["stages"]["analyze"] = {"skipped": True, "reason": "no_affected_entities"}
                 results["stages"]["anomaly"] = {"skipped": True, "reason": "no_affected_entities"}
