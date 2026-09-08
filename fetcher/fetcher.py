@@ -466,20 +466,14 @@ def upload_manifest(
 # Upload completion marker
 # ==========================================
 
-def upload_completion_marker(
-    timestamp,
-    results
-):
-    """
-    Validate all datasets and upload
-    _COMPLETE.json.
+def build_completion_marker(timestamp, results):
+    """Build and validate the canonical _COMPLETE.json marker.
 
-    If validation fails or the upload fails,
-    raise an exception so the caller can
-    treat the entire run as failed.
-    """
+    Validates that all expected datasets are present with valid metadata.
+    Returns a single marker dict used for both local write and cloud upload.
 
-    # Build expected dataset names from MP and MLA datasets
+    Raises RuntimeError if validation fails.
+    """
     expected_mp = set(MP_DATASETS.keys())
     expected_mla = {f"mla_{k}" for k in MLA_DATASETS.keys()}
     expected = expected_mp | expected_mla
@@ -526,7 +520,7 @@ def upload_completion_marker(
             "chunks": r["chunks"],
         }
 
-    marker = {
+    return {
         "timestamp": timestamp,
         "completed_at": datetime.now(
             timezone.utc
@@ -535,7 +529,14 @@ def upload_completion_marker(
         "datasets": datasets_meta,
     }
 
-    path = f"{timestamp}/_COMPLETE.json"
+
+def upload_completion_marker(marker):
+    """Upload a pre-built completion marker to Supabase Storage.
+
+    The marker dict is serialized and uploaded as _COMPLETE.json
+    under the marker's timestamp path. Raises on upload failure.
+    """
+    path = f"{marker['timestamp']}/_COMPLETE.json"
 
     content = json.dumps(
         marker,
@@ -908,27 +909,27 @@ def main():
             raise SystemExit(1)
 
         print()
-        print("Uploading completion marker...")
+        print("Writing completion marker...")
 
-        if local_only:
-            marker = {
-                "timestamp": timestamp,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "status": "complete",
-                "datasets": {
-                    name: {"records": r["records"], "chunks": r["chunks"]}
-                    for name, r in all_results.items()
-                },
-            }
-            marker_path = local_snapshot_dir / "_COMPLETE.json"
-            marker_path.write_text(json.dumps(marker, indent=2, ensure_ascii=False))
-            print(f"  ✓ Local completion marker written: {marker_path}")
-        else:
+        try:
+            marker = build_completion_marker(timestamp, all_results)
+        except Exception as error:
+            print()
+            print(
+                f"✗ FAILED to build "
+                f"completion marker: {error}"
+            )
+            raise SystemExit(1)
+
+        marker_path = local_snapshot_dir / "_COMPLETE.json"
+        marker_path.write_text(
+            json.dumps(marker, indent=2, ensure_ascii=False)
+        )
+        print(f"  ✓ Local completion marker written: {marker_path}")
+
+        if not local_only:
             try:
-                upload_completion_marker(
-                    timestamp,
-                    all_results
-                )
+                upload_completion_marker(marker)
             except Exception as error:
                 print()
                 print(
@@ -944,7 +945,9 @@ def main():
 
         print()
         print("✓ ALL DATASETS SUCCESSFUL")
-        print("✓ COMPLETION MARKER UPLOADED")
+        print("✓ COMPLETION MARKER WRITTEN")
+        if not local_only:
+            print("✓ COMPLETION MARKER UPLOADED")
         print("✓ SNAPSHOT IS READY FOR INGESTION")
         print(f"✓ Local snapshot: {local_snapshot_dir}")
         print(f"LOCAL_SNAPSHOT_PATH={local_snapshot_dir}")
