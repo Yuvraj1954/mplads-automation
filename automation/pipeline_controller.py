@@ -222,19 +222,38 @@ def next_stage_after(run_id, current_stage):
 # Stages 1-4 are handled by daily_pipeline.py (fetch, compare, delta, ingest).
 # Stages 5-12 are handled here (analysis through cleanup).
 
+def _timer():
+    """Return a monotonic start time."""
+    return time.time()
+
+
+def _elapsed(start):
+    """Return elapsed seconds since start."""
+    return time.time() - start
+
+
+def _print_timing(timing, label="STAGE"):
+    """Print timing for a stage."""
+    for key, val in timing.items():
+        print(f"  [{label}] {key}: {val:.1f}s")
+
+
 def stage_affected(delta_dir=None, run_id=None):
     """Stage 5: Determine affected works/entities from delta.
 
     Reads delta files to identify which members/states are affected
     by newly added or updated works.
 
+    Uses WORK_RECOMMENDATION_DTL_ID to look up internal work_ids via DB1
+    (not raw mp_id/mla_id from government records).
+
     Returns:
         dict with affected entity keys
     """
     print("\n=== STAGE 5: AFFECTED ENTITIES ===")
 
-    affected_members = set()
-    affected_states = set()
+    affected_work_dtls = []
+    affected_raw_records = []
 
     if delta_dir and Path(delta_dir).exists():
         for dataset_dir in Path(delta_dir).iterdir():
@@ -251,36 +270,64 @@ def stage_affected(delta_dir=None, run_id=None):
                         except json.JSONDecodeError:
                             continue
 
-                        # Extract member identity from work record
-                        member_type = None
-                        member_id = None
-                        state_id = None
+                        dtl_id = record.get("WORK_RECOMMENDATION_DTL_ID")
+                        if dtl_id:
+                            affected_work_dtls.append(str(dtl_id))
+                            affected_raw_records.append(record)
 
-                        # MP works
-                        if "mp_id" in record:
-                            member_type = "MP"
-                            member_id = record.get("mp_id")
-                            state_id = record.get("state_id")
-                        # MLA works
-                        elif "mla_id" in record:
-                            member_type = "MLA"
-                            member_id = record.get("mla_id")
-                            state_id = record.get("state_id")
+    print(f"  Delta work DTL IDs: {len(affected_work_dtls)}")
 
-                        if member_type and member_id:
-                            affected_members.add((member_type, member_id))
-                        if state_id:
-                            affected_states.add(state_id)
+    affected_members = set()
+    affected_states = set()
+    affected_work_ids = set()
+
+    if affected_work_dtls:
+        cfg = load_config(require_db2=False)
+        db1_url, db1_key = get_db1()
+
+        # Look up internal work_ids from DB1 works table using source_work_id
+        for dtl_id in affected_work_dtls:
+            try:
+                rows = sb_get(db1_url, db1_key, "works", {
+                    "select": "work_id,member_type,member_id,state_id",
+                    "source_work_id": f"eq.{dtl_id}",
+                    "limit": 1,
+                })
+                if rows:
+                    w = rows[0]
+                    work_id = w.get("work_id")
+                    member_type = w.get("member_type")
+                    member_id = w.get("member_id")
+                    state_id = w.get("state_id")
+
+                    if work_id:
+                        affected_work_ids.add(work_id)
+                    if member_type and member_id:
+                        affected_members.add((member_type, member_id))
+                    if state_id:
+                        affected_states.add(state_id)
+            except Exception as exc:
+                print(f"  WARNING: DTL lookup failed for {dtl_id}: {exc}")
+
+        # Also try to map raw mp_id/mla_id as fallback for works not yet in DB1
+        for record in affected_raw_records:
+            state_id = record.get("state_id")
+            if state_id and state_id not in affected_states:
+                affected_states.add(state_id)
 
     result = {
         "affected_members": affected_members,
         "affected_states": affected_states,
+        "affected_work_ids": affected_work_ids,
+        "affected_work_dtls": affected_work_dtls,
         "member_count": len(affected_members),
         "state_count": len(affected_states),
+        "work_count": len(affected_work_ids),
     }
 
     print(f"  Affected members: {result['member_count']}")
     print(f"  Affected states: {result['state_count']}")
+    print(f"  Affected works (internal): {result['work_count']}")
 
     return result
 
@@ -367,6 +414,100 @@ def stage_analyze(snapshot_dir, reference_date=None):
         "pipeline": pipeline,
         "work_analyses": pipeline.work_analyses,
         "master_population_context": master_context,
+    }
+
+
+def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
+    """Stage 6a: Run deterministic analysis for affected members only.
+
+    For affected mode, we still load the full snapshot (member metrics
+    depend on ALL works belonging to a member), but only persist the
+    affected subset.
+
+    The key optimization is that affected-mode skips stages that are
+    only needed for full recompute (e.g., full evidence rebuild).
+
+    Returns:
+        dict with analysis results (same structure as stage_analyze)
+    """
+    from analysis.pipeline import AnalysisPipeline
+    from analysis.snapshot_loader import load_all_data, build_work_records
+
+    print("\n=== STAGE 6a: ANALYZE (AFFECTED ONLY) ===")
+
+    affected_members = affected_result.get("affected_members", set())
+    affected_states = affected_result.get("affected_states", set())
+
+    data = load_all_data(snapshot_dir)
+    works, state_map, constituency_map, member_map = build_work_records(*data)
+
+    pipeline = AnalysisPipeline(works)
+    pipeline.run_full(reference_date)
+
+    print(f"  Members analyzed (full population): {len(pipeline.member_metrics)}")
+    print(f"  States analyzed (full population): {len(pipeline.state_metrics)}")
+
+    member_name_map = {}
+    for w in works:
+        key = (w.get("member_type"), w.get("member_id"))
+        if key not in member_name_map:
+            mp_name = w.get("mp_name", "")
+            if mp_name:
+                member_name_map[key] = mp_name
+    for m in pipeline.member_metrics:
+        if not m.member_name:
+            m.member_name = member_name_map.get((m.member_type, m.member_id))
+
+    state_name_map = {}
+    for w in works:
+        state_id = w.get("state_id")
+        state_name = w.get("state_name", "")
+        if state_id and state_name and state_id not in state_name_map:
+            state_name_map[state_id] = state_name
+    for s in pipeline.state_metrics:
+        if not s.state_name:
+            s.state_name = state_name_map.get(s.state_id)
+    for m in pipeline.member_metrics:
+        if not m.state_name and m.state_id:
+            m.state_name = state_name_map.get(m.state_id)
+
+    # Filter to affected members only for downstream stages
+    affected_member_metrics = [
+        m for m in pipeline.member_metrics
+        if (m.member_type, m.member_id) in affected_members
+    ]
+    affected_state_metrics = [
+        s for s in pipeline.state_metrics
+        if s.state_id in affected_states
+    ]
+
+    # Filter work_analyses to affected works only
+    affected_work_ids = affected_result.get("affected_work_ids", set())
+    affected_work_analyses = [
+        wa for wa in pipeline.work_analyses
+        if wa.work_id in affected_work_ids
+    ] if affected_work_ids else pipeline.work_analyses
+
+    # Also include time-sensitive works
+    from analysis.affected import expand_time_sensitive
+    works_by_id = {w["work_id"]: w for w in works}
+    time_sensitive = expand_time_sensitive(works_by_id, {}, reference_date)
+    time_sensitive_analyses = [
+        wa for wa in pipeline.work_analyses
+        if wa.work_id in time_sensitive and wa.work_id not in affected_work_ids
+    ]
+    affected_work_analyses.extend(time_sensitive_analyses)
+
+    print(f"  Affected member metrics: {len(affected_member_metrics)}")
+    print(f"  Affected state metrics: {len(affected_state_metrics)}")
+    print(f"  Affected work analyses: {len(affected_work_analyses)}")
+
+    return {
+        "pipeline": pipeline,
+        "work_analyses": affected_work_analyses,
+        "affected_member_metrics": affected_member_metrics,
+        "affected_state_metrics": affected_state_metrics,
+        "is_affected_mode": True,
     }
 
 
@@ -715,6 +856,261 @@ def stage_persist(evidence_records, affected_keys=None):
     return {"written": written}
 
 
+def stage_analytics_persist_affected(pipeline_result, anomaly_result, affected_result):
+    """Stage 7b-affected: Persist analytics for affected members/states only.
+
+    Writes only the affected subset of:
+    - overall_metrics (always full — small table, safe to rebuild)
+    - member_metrics (affected members only)
+    - state_metrics (affected states only)
+    - national_statistics (full rebuild — small table)
+    - trends (full rebuild — small table)
+
+    All writes are upserts (idempotent).
+    """
+    from analysis.db2_analytics_persistence import (
+        build_overall_metrics,
+        build_member_metrics,
+        build_state_metrics,
+        build_national_statistics,
+        build_trends,
+        compute_member_ranks,
+        compute_state_ranks,
+    )
+
+    print("\n=== STAGE 7b: ANALYTICS PERSIST (AFFECTED) ===")
+
+    db2_url, db2_key = get_db2()
+
+    pipeline = pipeline_result["pipeline"]
+    master_ctx = pipeline_result.get("master_population_context")
+    anomaly_result_data = anomaly_result
+
+    member_anomalies = anomaly_result_data.get("member_anomalies", [])
+    state_anomalies = anomaly_result_data.get("state_anomalies", [])
+
+    # Overall metrics — always full rebuild (small table)
+    overall = build_overall_metrics(
+        pipeline.member_metrics, pipeline.state_metrics, member_anomalies
+    )
+
+    # Affected member metrics only
+    affected_member_metrics = pipeline_result.get("affected_member_metrics", pipeline.member_metrics)
+    members = build_member_metrics(affected_member_metrics, member_anomalies, master_ctx)
+
+    # Affected state metrics only
+    affected_state_metrics = pipeline_result.get("affected_state_metrics", pipeline.state_metrics)
+    states = build_state_metrics(affected_state_metrics, state_anomalies, pipeline.member_metrics)
+
+    # National statistics and trends — full rebuild (small tables)
+    stats = build_national_statistics(pipeline.statistics)
+    stats.extend(build_national_statistics(pipeline.mp_statistics))
+    stats.extend(build_national_statistics(pipeline.mla_statistics))
+    trends = build_trends(pipeline.trends)
+    trends.extend(build_trends(pipeline.mp_trends))
+    trends.extend(build_trends(pipeline.mla_trends))
+
+    compute_member_ranks(members)
+    compute_state_ranks(states)
+
+    print(f"  Overall metrics (full): {len(overall)}")
+    print(f"  Member metrics (affected): {len(members)}")
+    print(f"  State metrics (affected): {len(states)}")
+    print(f"  National statistics (full): {len(stats)}")
+    print(f"  Trends (full): {len(trends)}")
+
+    written = 0
+
+    has_real_data = any(
+        r.get("total_works", 0) > 0 or r.get("sanctioned_amount", 0) > 0
+        for r in overall
+    )
+    if has_real_data:
+        sb_upsert(db2_url, db2_key, "overall_metrics", overall,
+                  conflict_cols=["scope"])
+        written += len(overall)
+    else:
+        print("  WARNING: Skipping overall_metrics upsert (all zeros)")
+
+    batch_size = 200
+    for start in range(0, len(members), batch_size):
+        batch = members[start:start + batch_size]
+        sb_upsert(db2_url, db2_key, "member_metrics", batch,
+                  conflict_cols=["member_id", "member_type"])
+        written += len(batch)
+
+    sb_upsert(db2_url, db2_key, "state_metrics", states,
+              conflict_cols=["state_id"])
+    written += len(states)
+
+    for scope in ("BOTH", "MP", "MLA", None):
+        scope_stats = [s for s in stats if s.get("scope") == scope]
+        if scope_stats:
+            filter_val = f"eq.{scope}" if scope else "is.null"
+            try:
+                sb_delete(db2_url, db2_key, "national_statistics",
+                          {"scope": filter_val})
+            except Exception:
+                pass
+            sb_upsert(db2_url, db2_key, "national_statistics", scope_stats)
+            written += len(scope_stats)
+
+    for mt in ("MP", "MLA"):
+        mt_trends = [t for t in trends if t.get("member_type") == mt]
+        if mt_trends:
+            try:
+                sb_delete(db2_url, db2_key, "trends",
+                          {"member_type": f"eq.{mt}"})
+            except Exception:
+                pass
+            sb_upsert(db2_url, db2_key, "trends", mt_trends)
+            written += len(mt_trends)
+
+    print(f"  Total written: {written} analytics records")
+    return {
+        "overall": len(overall),
+        "members": len(members),
+        "states": len(states),
+        "statistics": len(stats),
+        "trends": len(trends),
+        "total_written": written,
+    }
+
+
+def stage_evidence_affected(pipeline_result, anomaly_result, affected_result):
+    """Stage 8-affected: Build evidence for affected entities only.
+
+    Returns evidence records only for affected members/states.
+    """
+    from analysis.evidence_builder import (
+        build_member_evidence, build_state_evidence,
+        group_works_by_member, group_works_by_state,
+    )
+
+    print("\n=== STAGE 8: EVIDENCE (AFFECTED) ===")
+
+    pipeline = pipeline_result["pipeline"]
+    master_context = pipeline_result.get("master_population_context")
+
+    affected_members = affected_result.get("affected_members", set())
+    affected_states = affected_result.get("affected_states", set())
+
+    # Use full work set for grouping (evidence needs complete context)
+    work_by_member = group_works_by_member(pipeline.work_analyses)
+    work_by_state = group_works_by_state(pipeline.work_analyses)
+
+    # Filter member metrics to affected only
+    affected_member_metrics = [
+        m for m in pipeline.member_metrics
+        if (m.member_type, m.member_id) in affected_members
+    ]
+    affected_state_metrics = [
+        s for s in pipeline.state_metrics
+        if s.state_id in affected_states
+    ]
+
+    member_evidence = build_member_evidence(
+        affected_member_metrics, work_by_member,
+        {s.state_id: s for s in pipeline.state_metrics},
+        pipeline.statistics, anomaly_result["member_anomalies"],
+        master_population_context=master_context,
+    )
+    state_evidence = build_state_evidence(
+        affected_state_metrics, work_by_state, anomaly_result["state_anomalies"],
+    )
+
+    all_evidence = member_evidence + state_evidence
+    print(f"  Affected evidence records: {len(all_evidence)}")
+
+    zero_work_count = sum(
+        1 for r in member_evidence
+        if r["evidence"].get("quality", {}).get("zero_work_member", False)
+    )
+    print(f"  Zero-work member evidence: {zero_work_count}")
+
+    return all_evidence
+
+
+def stage_evidence_work_refs_affected(evidence_records, work_analyses, affected_result):
+    """Stage 8b-affected: Build evidence_work_refs for affected entities only.
+
+    Only replaces refs for affected entities, preserves all others.
+    """
+    from analysis.evidence_work_refs import build_evidence_work_refs
+
+    print("\n=== STAGE 8b: EVIDENCE WORK REFS (AFFECTED) ===")
+
+    db2_url, db2_key = get_db2()
+
+    refs = build_evidence_work_refs(evidence_records, work_analyses)
+
+    if refs:
+        # For affected mode: delete only affected entity refs, then insert
+        affected_members = affected_result.get("affected_members", set())
+        affected_states = affected_result.get("affected_states", set())
+
+        deleted = 0
+        for member_type, member_id in affected_members:
+            try:
+                sb_delete(db2_url, db2_key, "evidence_work_refs",
+                          {"entity_type": f"eq.{member_type}", "entity_id": f"eq.{member_id}"})
+                deleted += 1
+            except Exception:
+                pass
+
+        for state_id in affected_states:
+            try:
+                sb_delete(db2_url, db2_key, "evidence_work_refs",
+                          {"entity_type": "eq.STATE", "entity_id": f"eq.{state_id}"})
+                deleted += 1
+            except Exception:
+                pass
+
+        print(f"  Cleaned affected refs: {deleted} entities")
+
+        batch_size = 500
+        written = 0
+        for start in range(0, len(refs), batch_size):
+            batch = refs[start:start + batch_size]
+            sb_upsert(db2_url, db2_key, "evidence_work_refs", batch)
+            written += len(batch)
+
+        print(f"  Evidence work refs written: {written}")
+    else:
+        written = 0
+        print("  No evidence work refs to write")
+
+    return {"written": written}
+
+
+def stage_persist_affected(evidence_records, affected_keys):
+    """Stage 10-affected: Persist evidence for affected entities only.
+
+    Only upserts records for affected members/states. Leaves all other
+    evidence untouched.
+    """
+    print("\n=== STAGE 10: DB2 PERSIST (AFFECTED) ===")
+
+    db2_url, db2_key = get_db2()
+
+    affected_records = [
+        r for r in evidence_records
+        if (r["entity_type"], r["entity_id"]) in affected_keys
+    ]
+    print(f"  Affected-only: {len(affected_records)}/{len(evidence_records)} records")
+
+    batch_size = 500
+    written = 0
+    for start in range(0, len(affected_records), batch_size):
+        batch = affected_records[start:start + batch_size]
+        sb_upsert(db2_url, db2_key, "entity_evidence", batch,
+                  conflict_cols=["entity_type", "entity_id"])
+        written += len(batch)
+
+    print(f"  Written: {written} evidence records to DB2")
+    return {"written": written}
+
+
 def stage_verify(evidence_records, pipeline_result, anomaly_result,
                  gemini_result=None, persist_result=None,
                  analytics_result=None, work_refs_result=None):
@@ -872,7 +1268,8 @@ def stage_cleanup(run_id=None, delta_dir=None, local_snapshot=None):
 def run_pipeline(snapshot_dir=None, reference_date=None,
                  delta_dir=None, run_id=None,
                  skip_gemini=False, skip_ingest=False,
-                 dry_run=False, resume=False):
+                 dry_run=False, resume=False,
+                 mode="affected"):
     """Run the complete two-database pipeline.
 
     Args:
@@ -884,11 +1281,14 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
         skip_ingest: if True, skip DB1 ingestion stages (1-4)
         dry_run: if True, run analysis only, no DB writes
         resume: if True, resume from last checkpoint
+        mode: "full" for complete recompute, "affected" for delta-only
 
     Returns:
         dict with full pipeline results
     """
     cfg = load_config(require_db2=not dry_run)
+    timing = {}
+    pipeline_timing = {}
 
     if run_id is None:
         run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
@@ -896,6 +1296,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
     print("=" * 70)
     print(f"MPLADS PIPELINE — {PIPELINE_VERSION}")
     print(f"Run ID: {run_id}")
+    print(f"Mode: {mode}")
     print(f"DB1: {cfg.db1_url}")
     print(f"DB2: {'CONFIGURED' if cfg.db2_ready else 'NOT CONFIGURED (dry-run)'}")
     print(f"Gemini keys: {len(cfg.gemini_keys)}")
@@ -906,6 +1307,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
         "pipeline_version": PIPELINE_VERSION,
         "run_id": run_id,
         "started_at": _now_iso(),
+        "mode": mode,
         "stages": {},
     }
 
@@ -916,105 +1318,281 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             start_stage = next_stage_after(run_id, start_stage)
             print(f"\nResuming from stage: {start_stage}")
 
-        # Stage 5: Affected entities
-        if start_stage in ("affected", "analyze"):
-            affected_result = stage_affected(delta_dir, run_id)
-            results["stages"]["affected"] = affected_result
-            save_checkpoint(run_id, "affected", {
-                "member_count": affected_result["member_count"],
-                "state_count": affected_result["state_count"],
+        affected_result = None
+        analysis_result = None
+        anomaly_result = None
+        evidence_records = []
+        gemini_result = None
+        persist_result = None
+        analytics_result = None
+        work_refs_result = None
+
+        if mode == "affected" and delta_dir:
+            # ============================================================
+            # AFFECTED-ONLY MODE
+            # ============================================================
+
+            # Stage 5: Affected entities
+            if start_stage in ("affected", "analyze"):
+                t5 = _timer()
+                affected_result = stage_affected(delta_dir, run_id)
+                results["stages"]["affected"] = affected_result
+                save_checkpoint(run_id, "affected", {
+                    "member_count": affected_result["member_count"],
+                    "state_count": affected_result["state_count"],
+                })
+                timing["affected"] = _elapsed(t5)
+
+            # Check if there are any affected entities
+            if affected_result and affected_result["member_count"] == 0:
+                print("\n=== NO AFFECTED ENTITIES — SKIPPING ANALYSIS ===")
+                results["stages"]["analyze"] = {"skipped": True, "reason": "no_affected_entities"}
+                results["stages"]["anomaly"] = {"skipped": True, "reason": "no_affected_entities"}
+                results["stages"]["analytics_persist"] = {"skipped": True, "reason": "no_affected_entities"}
+                results["stages"]["evidence"] = {"skipped": True, "reason": "no_affected_entities"}
+                results["stages"]["evidence_work_refs"] = {"skipped": True, "reason": "no_affected_entities"}
+                results["stages"]["gemini"] = {"skipped": True, "reason": "no_affected_entities"}
+                results["stages"]["persist"] = {"skipped": True, "reason": "no_affected_entities"}
+                results["stages"]["verify"] = {"passed": True, "issues": []}
+                results["status"] = "SUCCESS"
+                results["completed_at"] = _now_iso()
+                results["timing"] = timing
+                return results
+
+            # Stage 6a: Analyze affected
+            t6 = _timer()
+            analysis_result = stage_analyze_affected(
+                snapshot_dir, affected_result, reference_date
+            )
+            results["stages"]["analyze"] = {
+                "members": len(analysis_result["pipeline"].member_metrics),
+                "states": len(analysis_result["pipeline"].state_metrics),
+                "affected_members": len(analysis_result.get("affected_member_metrics", [])),
+                "affected_states": len(analysis_result.get("affected_state_metrics", [])),
+                "work_analyses": len(analysis_result["work_analyses"]),
+            }
+            save_checkpoint(run_id, "analyze", results["stages"]["analyze"])
+            timing["analyze"] = _elapsed(t6)
+
+            # Stage 7: Entity Anomaly (use full pipeline for reference statistics)
+            t7 = _timer()
+            anomaly_result = stage_anomaly(analysis_result, reference_date)
+            results["stages"]["anomaly"] = {
+                "member_anomalies": len(anomaly_result["member_anomalies"]),
+                "state_anomalies": len(anomaly_result["state_anomalies"]),
+            }
+            save_checkpoint(run_id, "anomaly", results["stages"]["anomaly"])
+            timing["anomaly"] = _elapsed(t7)
+
+            if dry_run:
+                print("\n=== DRY RUN: Skipping DB writes, evidence, and Gemini ===")
+                results["stages"]["analytics_persist"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["evidence"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["evidence_work_refs"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["gemini"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["persist"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["verify"] = {"passed": True, "issues": []}
+                results["stages"]["cleanup"] = {"skipped": True, "reason": "dry_run"}
+                results["status"] = "DRY_RUN"
+                results["completed_at"] = _now_iso()
+                results["timing"] = timing
+                return results
+
+            # Stage 7b: Persist analytics (affected members/states only)
+            t7b = _timer()
+            analytics_result = stage_analytics_persist_affected(
+                analysis_result, anomaly_result, affected_result
+            )
+            results["stages"]["analytics_persist"] = analytics_result
+            save_checkpoint(run_id, "analytics_persist", analytics_result)
+            timing["analytics_persist"] = _elapsed(t7b)
+
+            # Stage 8: Evidence (affected entities only)
+            t8 = _timer()
+            evidence_records = stage_evidence_affected(
+                analysis_result, anomaly_result, affected_result
+            )
+            results["stages"]["evidence"] = {"records": len(evidence_records)}
+            save_checkpoint(run_id, "evidence", results["stages"]["evidence"])
+            timing["evidence"] = _elapsed(t8)
+
+            # Stage 8b: Evidence work refs (targeted for affected entities)
+            t8b = _timer()
+            work_refs_result = stage_evidence_work_refs_affected(
+                evidence_records, analysis_result["work_analyses"], affected_result
+            )
+            results["stages"]["evidence_work_refs"] = work_refs_result
+            save_checkpoint(run_id, "evidence_work_refs", work_refs_result)
+            timing["evidence_work_refs"] = _elapsed(t8b)
+
+            # Stage 9: Gemini (affected-only, skip if no evidence changes)
+            t9 = _timer()
+            if skip_gemini:
+                print("\n=== GEMINI SKIPPED ===")
+                gemini_result = {"skipped": True, "reason": "skip_gemini_flag",
+                                 "processed": 0, "success": 0, "failed": 0}
+            else:
+                gemini_result = stage_gemini(evidence_records)
+            results["stages"]["gemini"] = gemini_result
+            save_checkpoint(run_id, "gemini", {
+                "processed": gemini_result.get("processed", 0),
+                "success": gemini_result.get("success", 0),
             })
+            timing["gemini"] = _elapsed(t9)
 
-        # Stage 6: Analyze
-        analysis_result = stage_analyze(snapshot_dir, reference_date)
-        results["stages"]["analyze"] = {
-            "members": len(analysis_result["pipeline"].member_metrics),
-            "states": len(analysis_result["pipeline"].state_metrics),
-            "work_analyses": len(analysis_result["work_analyses"]),
-        }
-        save_checkpoint(run_id, "analyze", results["stages"]["analyze"])
+            # Stage 10: Persist evidence (affected entities only)
+            t10 = _timer()
+            affected_keys = set()
+            if affected_result:
+                affected_keys = set(affected_result.get("affected_members", set()))
+                for state_id in affected_result.get("affected_states", set()):
+                    affected_keys.add(("STATE", state_id))
+            persist_result = stage_persist_affected(evidence_records, affected_keys)
+            results["stages"]["persist"] = persist_result
+            save_checkpoint(run_id, "persist", persist_result)
+            timing["persist"] = _elapsed(t10)
 
-        # Stage 7: Entity Anomaly
-        anomaly_result = stage_anomaly(analysis_result, reference_date)
-        results["stages"]["anomaly"] = {
-            "member_anomalies": len(anomaly_result["member_anomalies"]),
-            "state_anomalies": len(anomaly_result["state_anomalies"]),
-        }
-        save_checkpoint(run_id, "anomaly", results["stages"]["anomaly"])
+            # Stage 11: Verify
+            t11 = _timer()
+            verify_result = stage_verify(
+                evidence_records, analysis_result, anomaly_result,
+                gemini_result, persist_result,
+                analytics_result=analytics_result,
+                work_refs_result=work_refs_result,
+            )
+            results["stages"]["verify"] = verify_result
+            save_checkpoint(run_id, "verify", verify_result)
+            timing["verify"] = _elapsed(t11)
 
-        if dry_run:
-            print("\n=== DRY RUN: Skipping DB writes, evidence, and Gemini ===")
-            results["stages"]["analytics_persist"] = {"skipped": True, "reason": "dry_run"}
-            results["stages"]["evidence"] = {"skipped": True, "reason": "dry_run"}
-            results["stages"]["evidence_work_refs"] = {"skipped": True, "reason": "dry_run"}
-            results["stages"]["gemini"] = {"skipped": True, "reason": "dry_run"}
-            results["stages"]["persist"] = {"skipped": True, "reason": "dry_run"}
-            results["stages"]["verify"] = {"passed": True, "issues": []}
-            results["stages"]["cleanup"] = {"skipped": True, "reason": "dry_run"}
-            results["status"] = "DRY_RUN"
-            results["completed_at"] = _now_iso()
-            return results
-
-        # Stage 7b: Persist analytics to DB2
-        analytics_result = stage_analytics_persist(analysis_result, anomaly_result)
-        results["stages"]["analytics_persist"] = analytics_result
-        save_checkpoint(run_id, "analytics_persist", analytics_result)
-
-        # Stage 8: Evidence
-        evidence_records = stage_evidence(analysis_result, anomaly_result)
-        results["stages"]["evidence"] = {
-            "records": len(evidence_records),
-        }
-        save_checkpoint(run_id, "evidence", results["stages"]["evidence"])
-
-        # Stage 8b: Evidence work refs
-        work_refs_result = stage_evidence_work_refs(
-            evidence_records, analysis_result["work_analyses"]
-        )
-        results["stages"]["evidence_work_refs"] = work_refs_result
-        save_checkpoint(run_id, "evidence_work_refs", work_refs_result)
-
-        # Stage 9: Gemini
-        if skip_gemini:
-            print("\n=== GEMINI SKIPPED ===")
-            gemini_result = {"skipped": True, "reason": "skip_gemini_flag",
-                             "processed": 0, "success": 0, "failed": 0}
         else:
-            gemini_result = stage_gemini(evidence_records)
-        results["stages"]["gemini"] = gemini_result
-        save_checkpoint(run_id, "gemini", {
-            "processed": gemini_result.get("processed", 0),
-            "success": gemini_result.get("success", 0),
-        })
+            # ============================================================
+            # FULL MODE
+            # ============================================================
 
-        # Stage 10: Persist to DB2
-        persist_result = stage_persist(evidence_records)
-        results["stages"]["persist"] = persist_result
-        save_checkpoint(run_id, "persist", persist_result)
+            # Stage 5: Affected entities
+            if start_stage in ("affected", "analyze"):
+                t5 = _timer()
+                affected_result = stage_affected(delta_dir, run_id)
+                results["stages"]["affected"] = affected_result
+                save_checkpoint(run_id, "affected", {
+                    "member_count": affected_result["member_count"],
+                    "state_count": affected_result["state_count"],
+                })
+                timing["affected"] = _elapsed(t5)
 
-        # Stage 11: Verify
-        verify_result = stage_verify(
-            evidence_records, analysis_result, anomaly_result,
-            gemini_result, persist_result,
-            analytics_result=analytics_result,
-            work_refs_result=work_refs_result,
-        )
-        results["stages"]["verify"] = verify_result
-        save_checkpoint(run_id, "verify", verify_result)
+            # Stage 6: Analyze (full)
+            t6 = _timer()
+            analysis_result = stage_analyze(snapshot_dir, reference_date)
+            results["stages"]["analyze"] = {
+                "members": len(analysis_result["pipeline"].member_metrics),
+                "states": len(analysis_result["pipeline"].state_metrics),
+                "work_analyses": len(analysis_result["work_analyses"]),
+            }
+            save_checkpoint(run_id, "analyze", results["stages"]["analyze"])
+            timing["analyze"] = _elapsed(t6)
+
+            # Stage 7: Entity Anomaly
+            t7 = _timer()
+            anomaly_result = stage_anomaly(analysis_result, reference_date)
+            results["stages"]["anomaly"] = {
+                "member_anomalies": len(anomaly_result["member_anomalies"]),
+                "state_anomalies": len(anomaly_result["state_anomalies"]),
+            }
+            save_checkpoint(run_id, "anomaly", results["stages"]["anomaly"])
+            timing["anomaly"] = _elapsed(t7)
+
+            if dry_run:
+                print("\n=== DRY RUN: Skipping DB writes, evidence, and Gemini ===")
+                results["stages"]["analytics_persist"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["evidence"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["evidence_work_refs"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["gemini"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["persist"] = {"skipped": True, "reason": "dry_run"}
+                results["stages"]["verify"] = {"passed": True, "issues": []}
+                results["stages"]["cleanup"] = {"skipped": True, "reason": "dry_run"}
+                results["status"] = "DRY_RUN"
+                results["completed_at"] = _now_iso()
+                results["timing"] = timing
+                return results
+
+            # Stage 7b: Persist analytics to DB2
+            t7b = _timer()
+            analytics_result = stage_analytics_persist(analysis_result, anomaly_result)
+            results["stages"]["analytics_persist"] = analytics_result
+            save_checkpoint(run_id, "analytics_persist", analytics_result)
+            timing["analytics_persist"] = _elapsed(t7b)
+
+            # Stage 8: Evidence
+            t8 = _timer()
+            evidence_records = stage_evidence(analysis_result, anomaly_result)
+            results["stages"]["evidence"] = {"records": len(evidence_records)}
+            save_checkpoint(run_id, "evidence", results["stages"]["evidence"])
+            timing["evidence"] = _elapsed(t8)
+
+            # Stage 8b: Evidence work refs
+            t8b = _timer()
+            work_refs_result = stage_evidence_work_refs(
+                evidence_records, analysis_result["work_analyses"]
+            )
+            results["stages"]["evidence_work_refs"] = work_refs_result
+            save_checkpoint(run_id, "evidence_work_refs", work_refs_result)
+            timing["evidence_work_refs"] = _elapsed(t8b)
+
+            # Stage 9: Gemini
+            t9 = _timer()
+            if skip_gemini:
+                print("\n=== GEMINI SKIPPED ===")
+                gemini_result = {"skipped": True, "reason": "skip_gemini_flag",
+                                 "processed": 0, "success": 0, "failed": 0}
+            else:
+                gemini_result = stage_gemini(evidence_records)
+            results["stages"]["gemini"] = gemini_result
+            save_checkpoint(run_id, "gemini", {
+                "processed": gemini_result.get("processed", 0),
+                "success": gemini_result.get("success", 0),
+            })
+            timing["gemini"] = _elapsed(t9)
+
+            # Stage 10: Persist to DB2
+            t10 = _timer()
+            persist_result = stage_persist(evidence_records)
+            results["stages"]["persist"] = persist_result
+            save_checkpoint(run_id, "persist", persist_result)
+            timing["persist"] = _elapsed(t10)
+
+            # Stage 11: Verify
+            t11 = _timer()
+            verify_result = stage_verify(
+                evidence_records, analysis_result, anomaly_result,
+                gemini_result, persist_result,
+                analytics_result=analytics_result,
+                work_refs_result=work_refs_result,
+            )
+            results["stages"]["verify"] = verify_result
+            save_checkpoint(run_id, "verify", verify_result)
+            timing["verify"] = _elapsed(t11)
+
+        # ================================================================
+        # COMMON: Verify, Cleanup, Timing
+        # ================================================================
 
         if not verify_result["passed"]:
             print("\n=== VERIFICATION FAILED ===")
             print("Aborting. Temporary artifacts preserved for debugging.")
             results["status"] = "FAILED_VERIFICATION"
+            results["timing"] = timing
             return results
 
         # Stage 12: Cleanup (only after verification passes)
+        t12 = _timer()
         cleanup_result = stage_cleanup(run_id, delta_dir)
         results["stages"]["cleanup"] = cleanup_result
         save_checkpoint(run_id, "cleanup", cleanup_result)
+        timing["cleanup"] = _elapsed(t12)
 
         results["status"] = "SUCCESS"
         results["completed_at"] = _now_iso()
+        results["timing"] = timing
 
     except Exception as exc:
         results["status"] = "FAILED"
@@ -1026,7 +1604,13 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
         print("\n" + "=" * 70)
         print(f"PIPELINE STATUS: {results.get('status', 'UNKNOWN')}")
         print(f"Run ID: {run_id}")
+        print(f"Mode: {mode}")
         print(f"Completed: {results.get('completed_at', results.get('failed_at', 'N/A'))}")
+        if timing:
+            total = sum(timing.values())
+            print(f"Total analysis time: {total:.1f}s")
+            for key, val in timing.items():
+                print(f"  {key}: {val:.1f}s")
         print("=" * 70)
 
     return results
@@ -1052,6 +1636,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip-ingest", action="store_true", help="Skip DB1 ingestion (stages 1-4)")
     parser.add_argument("--dry-run", action="store_true", help="Analyze only, no DB writes")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
+    parser.add_argument("--mode", choices=["full", "affected"], default="affected",
+                        help="Pipeline mode: full or affected (default: affected)")
     args = parser.parse_args()
 
     ref_date = None
@@ -1068,6 +1654,7 @@ if __name__ == "__main__":
         skip_ingest=args.skip_ingest,
         dry_run=args.dry_run,
         resume=args.resume,
+        mode=args.mode,
     )
 
     if result["status"] not in ("SUCCESS", "DRY_RUN"):

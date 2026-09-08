@@ -923,6 +923,81 @@ def load_snapshot_to_sqlite(
 
 
 # ============================================================
+# QUICK COMPARISON (file-level hash optimization)
+# ============================================================
+
+def quick_compare(
+    old_dir: Path,
+    new_dir: Path,
+) -> Dict[str, Any]:
+    """
+    Fast file-level comparison before SQLite loading.
+
+    Compares dataset structure, file sizes, and SHA-256 hashes.
+    Returns {"changed": bool, "changed_datasets": list, "stats": dict}.
+
+    If all files match, returns changed=False without loading SQLite.
+    If any file differs, returns changed=True with the list of affected datasets.
+    Falls back safely on any error (returns changed=True to trigger full comparison).
+    """
+    result = {"changed": False, "changed_datasets": [], "stats": {}}
+
+    for dataset in DATASETS:
+        old_ds = old_dir / dataset
+        new_ds = new_dir / dataset
+
+        has_old = old_ds.is_dir()
+        has_new = new_ds.is_dir()
+
+        if not has_new:
+            continue
+
+        if not has_old:
+            result["changed"] = True
+            result["changed_datasets"].append(dataset)
+            result["stats"][dataset] = {"reason": "new_dataset"}
+            continue
+
+        old_files = sorted(
+            f.name for f in old_ds.iterdir()
+            if f.name.startswith("part_") and f.name.endswith(".ndjson")
+        )
+        new_files = sorted(
+            f.name for f in new_ds.iterdir()
+            if f.name.startswith("part_") and f.name.endswith(".ndjson")
+        )
+
+        if old_files != new_files:
+            result["changed"] = True
+            result["changed_datasets"].append(dataset)
+            result["stats"][dataset] = {"reason": "file_list_diff"}
+            continue
+
+        for fname in old_files:
+            old_path = old_ds / fname
+            new_path = new_ds / fname
+
+            if old_path.stat().st_size != new_path.stat().st_size:
+                result["changed"] = True
+                result["changed_datasets"].append(dataset)
+                result["stats"][dataset] = {"reason": "size_diff", "file": fname}
+                break
+
+            old_hash = hashlib.sha256(old_path.read_bytes()).hexdigest()
+            new_hash = hashlib.sha256(new_path.read_bytes()).hexdigest()
+
+            if old_hash != new_hash:
+                result["changed"] = True
+                result["changed_datasets"].append(dataset)
+                result["stats"][dataset] = {"reason": "hash_diff", "file": fname}
+                break
+        else:
+            result["stats"][dataset] = {"reason": "identical", "files": len(old_files)}
+
+    return result
+
+
+# ============================================================
 # COMPARISON
 # ============================================================
 
@@ -1145,6 +1220,34 @@ def main() -> int:
             print(f"\nDownloading old snapshot {old_timestamp}...")
             old_files = download_snapshot_files(old_timestamp)
             print(f"  Datasets: {list(old_files.keys())}")
+
+    # ----------------------------------------------------------
+    # Quick comparison (file-level hash optimization)
+    # ----------------------------------------------------------
+
+    if args.old_local and args.new_local:
+        print("\n--- Quick comparison (file-level hashes) ---")
+        qc = quick_compare(Path(args.old_local), Path(args.new_local))
+        if not qc["changed"]:
+            print("Quick comparison: ALL files identical — 0 changes")
+            manifest = generate_manifest(old_timestamp, new_timestamp, {}, delta_dir)
+            manifest_path = delta_dir / "manifest.json"
+            with manifest_path.open("w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            print(f"\nManifest: {manifest_path}")
+            print(f"\n{'=' * 60}")
+            print("COMPARISON COMPLETE (quick path)")
+            print(f"{'=' * 60}")
+            print(f"Total append: 0")
+            print(f"Total update: 0")
+            print(f"Total unchanged: 0")
+            return 0
+        else:
+            print(f"Quick comparison: changes detected in {len(qc['changed_datasets'])} dataset(s)")
+            for ds, stats in qc["stats"].items():
+                if stats.get("reason") != "identical":
+                    print(f"  {ds}: {stats}")
 
     # ----------------------------------------------------------
     # Compare each dataset

@@ -221,6 +221,7 @@ def upload_chunk(
     chunk_number,
     records,
     local_snapshot_dir,
+    local_only=False,
 ):
     folder = f"{timestamp}/{dataset_name}"
     filename = f"part_{chunk_number:04d}.ndjson"
@@ -244,6 +245,14 @@ def upload_chunk(
     local_path.write_bytes(content)
 
     size_mb = len(content) / (1024 * 1024)
+
+    if local_only:
+        print(
+            f"  Wrote {filename} locally "
+            f"({len(records)} records, "
+            f"{size_mb:.2f} MB)"
+        )
+        return None
 
     print(
         f"  Uploading {filename} "
@@ -280,6 +289,7 @@ def upload_dataset(
     data,
     timestamp,
     local_snapshot_dir,
+    local_only=False,
 ):
     dataset_key, records = extract_records(
         data,
@@ -386,6 +396,7 @@ def upload_dataset(
             chunk_number=chunk_number,
             records=chunk,
             local_snapshot_dir=local_snapshot_dir,
+            local_only=local_only,
         )
 
         uploaded_records += len(chunk)
@@ -561,6 +572,7 @@ def process_dataset(
     timestamp,
     local_snapshot_dir,
     combo,
+    local_only=False,
 ):
     data = fetch_dataset(
         session,
@@ -574,13 +586,15 @@ def process_dataset(
         data,
         timestamp,
         local_snapshot_dir,
+        local_only=local_only,
     )
 
-    upload_manifest(
-        dataset_name,
-        timestamp,
-        result
-    )
+    if not local_only:
+        upload_manifest(
+            dataset_name,
+            timestamp,
+            result
+        )
 
     return result
 
@@ -596,6 +610,7 @@ def fetch_member_type(
     combo,
     timestamp,
     local_snapshot_dir,
+    local_only=False,
 ):
     """Fetch all datasets for a member type (MP or MLA)."""
     print()
@@ -633,6 +648,7 @@ def fetch_member_type(
                 timestamp,
                 local_snapshot_dir,
                 combo,
+                local_only=local_only,
             )
 
             results[storage_name] = result
@@ -717,6 +733,7 @@ def fetch_member_type(
                         timestamp,
                         local_snapshot_dir,
                         combo,
+                        local_only=local_only,
                     )
 
                     results[dataset_name] = result
@@ -757,6 +774,14 @@ def fetch_member_type(
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="MPLADS Fetcher")
+    parser.add_argument("--local-only", action="store_true",
+                        help="Save locally only, skip Supabase Storage uploads")
+    args = parser.parse_args()
+
+    local_only = args.local_only
+
     timestamp = datetime.now(
         timezone.utc
     ).strftime(
@@ -764,13 +789,14 @@ def main():
     )
 
     print()
-    print("MPLADS FETCH + CHUNK UPLOAD")
+    print("MPLADS FETCH" + (" (LOCAL ONLY)" if local_only else " + CHUNK UPLOAD"))
     print("=" * 70)
     print(f"Timestamp: {timestamp}")
     print(f"MP Datasets: {len(MP_DATASETS)}")
     print(f"MLA Datasets: {len(MLA_DATASETS)}")
     print(f"Chunk size: {CHUNK_SIZE}")
     print(f"Retries after first pass: {MAX_RETRIES}")
+    print(f"Local only: {local_only}")
     print("=" * 70)
 
     local_snapshot_dir = Path(
@@ -805,6 +831,7 @@ def main():
             MP_COMBO,
             timestamp,
             local_snapshot_dir,
+            local_only=local_only,
         )
 
         all_results.update(mp_results)
@@ -823,6 +850,7 @@ def main():
             MLA_COMBO,
             timestamp,
             local_snapshot_dir,
+            local_only=local_only,
         )
 
         all_results.update(mla_results)
@@ -882,23 +910,37 @@ def main():
         print()
         print("Uploading completion marker...")
 
-        try:
-            upload_completion_marker(
-                timestamp,
-                all_results
-            )
-        except Exception as error:
-            print()
-            print(
-                f"✗ FAILED to upload "
-                f"completion marker: {error}"
-            )
-            print(
-                "Run treated as FAILED because "
-                "_COMPLETE.json could not be "
-                "uploaded."
-            )
-            raise SystemExit(1)
+        if local_only:
+            marker = {
+                "timestamp": timestamp,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "status": "complete",
+                "datasets": {
+                    name: {"records": r["records"], "chunks": r["chunks"]}
+                    for name, r in all_results.items()
+                },
+            }
+            marker_path = local_snapshot_dir / "_COMPLETE.json"
+            marker_path.write_text(json.dumps(marker, indent=2, ensure_ascii=False))
+            print(f"  ✓ Local completion marker written: {marker_path}")
+        else:
+            try:
+                upload_completion_marker(
+                    timestamp,
+                    all_results
+                )
+            except Exception as error:
+                print()
+                print(
+                    f"✗ FAILED to upload "
+                    f"completion marker: {error}"
+                )
+                print(
+                    "Run treated as FAILED because "
+                    "_COMPLETE.json could not be "
+                    "uploaded."
+                )
+                raise SystemExit(1)
 
         print()
         print("✓ ALL DATASETS SUCCESSFUL")

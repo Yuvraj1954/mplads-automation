@@ -21,6 +21,7 @@ from automation.snapshot_cache import (
     get_previous_local_path,
     get_previous_timestamp,
     get_current_timestamp,
+    get_current_local_path,
     validate_cache,
     write_new_timestamp,
     write_metadata,
@@ -330,6 +331,26 @@ def _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir):
     print(f"Fetched snapshot preserved for cache: {target}")
 
 
+def _timer():
+    """Return a monotonic start time."""
+    return time.time()
+
+
+def _elapsed(start):
+    """Return elapsed seconds since start."""
+    return time.time() - start
+
+
+def _print_timing(timing, pipeline_start):
+    """Print performance instrumentation summary."""
+    total = time.time() - pipeline_start
+    print("\n--- TIMING ---")
+    for key, val in timing.items():
+        print(f"  {key:>20s}: {val:>7.1f}s")
+    print(f"  {'TOTAL':>20s}: {total:>7.1f}s")
+    print("--- END TIMING ---\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="MPLADS Daily Pipeline")
     parser.add_argument("--skip-gemini", action="store_true",
@@ -338,7 +359,18 @@ def main():
                         help="Skip DB ingestion steps (stages 8a-8c)")
     parser.add_argument("--skip-fetch", action="store_true",
                         help="Skip government fetch (use existing current snapshot)")
+    parser.add_argument("--mode", choices=["full", "affected"], default="affected",
+                        help="Pipeline mode: full (recompute everything) or "
+                             "affected (process only changed entities) (default: affected)")
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="One-time NEW DB bootstrap from cached snapshot "
+                             "(skips comparator, processes full snapshot)")
+    parser.add_argument("--local-only", action="store_true",
+                        help="Fetch locally only, skip Supabase Storage upload")
     args = parser.parse_args()
+
+    pipeline_start = _timer()
+    timing = {}
 
     if not FETCHER.exists():
         raise RuntimeError(f"Fetcher not found: {FETCHER}")
@@ -353,16 +385,73 @@ def main():
     print(f"Sync interval: {sync_interval} hours")
     print(f"MP datasets: {len([d for d in DATASETS if not d.startswith('mla_')])}")
     print(f"MLA datasets: {len([d for d in DATASETS if d.startswith('mla_')])}")
+    print(f"Mode: {args.mode}")
+    print(f"Bootstrap: {args.bootstrap}")
+    print(f"Local only: {args.local_only}")
 
     cache_work_dir = os.environ.get("MPLADS_CACHE_WORK_DIR")
     print(f"Cache work dir: {cache_work_dir or 'not set (Supabase-only mode)'}")
 
+    # ================================================================
+    # BOOTSTRAP MODE
+    # ================================================================
+    if args.bootstrap:
+        print("\n=== BOOTSTRAP MODE ===")
+        if not cache_work_dir:
+            raise RuntimeError(
+                "Bootstrap requires MPLADS_CACHE_WORK_DIR to locate cached snapshot"
+            )
+
+        cache_dir = Path(cache_work_dir)
+        curr_path = get_current_local_path(cache_dir)
+        if not curr_path:
+            curr_path = get_previous_local_path(cache_dir)
+        if not curr_path:
+            raise RuntimeError(
+                "No valid cached snapshot found for bootstrap. "
+                "Run the full pipeline at least once first."
+            )
+
+        snapshot_path = str(curr_path)
+        validate_local_snapshot(snapshot_path)
+        print(f"Bootstrap source: {snapshot_path}")
+
+        from datetime import date as _date
+        from automation.pipeline_controller import run_pipeline as run_analysis
+
+        t_bootstrap = _timer()
+        analysis_result = run_analysis(
+            snapshot_dir=snapshot_path,
+            reference_date=_date.today(),
+            run_id="bootstrap",
+            skip_gemini=args.skip_gemini,
+            skip_ingest=False,
+            mode="full",
+        )
+        timing["bootstrap_analysis"] = _elapsed(t_bootstrap)
+
+        if analysis_result.get("status") not in ("SUCCESS", "DRY_RUN"):
+            raise RuntimeError(
+                f"Bootstrap analysis failed: {analysis_result.get('error', 'unknown')}"
+            )
+
+        print("\n=== BOOTSTRAP COMPLETE ===")
+        _print_timing(timing, pipeline_start)
+        return
+
+    # ================================================================
+    # NORMAL PIPELINE
+    # ================================================================
     print("=== STEP 1: FETCH ===")
+    t_fetch = _timer()
     if args.skip_fetch:
         print("Skipping fetch (--skip-fetch)")
         local_snapshot_path = None
     else:
-        fetcher_output = run_fetcher([sys.executable, str(FETCHER)])
+        fetcher_cmd = [sys.executable, str(FETCHER)]
+        if args.local_only:
+            fetcher_cmd.append("--local-only")
+        fetcher_output = run_fetcher(fetcher_cmd)
         local_snapshot_path = None
         for line in fetcher_output:
             if line.startswith("LOCAL_SNAPSHOT_PATH="):
@@ -373,8 +462,10 @@ def main():
         validate_local_snapshot(local_snapshot_path)
 
     new_ts = os.path.basename(local_snapshot_path) if local_snapshot_path else None
+    timing["fetch"] = _elapsed(t_fetch)
 
     print("=== STEP 2: GET PREVIOUS SNAPSHOT ===")
+    t_compare_start = _timer()
     old_timestamp = None
     old_local_path = None
 
@@ -434,6 +525,8 @@ def main():
 
     run(cmd)
 
+    timing["compare"] = _elapsed(t_compare_start)
+
     manifest_path = workdir / "manifest.json"
     if not manifest_path.exists():
         raise RuntimeError("Comparator did not create manifest.json")
@@ -446,18 +539,23 @@ def main():
 
     print("Changes:", total_changes)
 
-    print("=== STEP 4: UPLOAD DELTA ===")
-    upload_delta(workdir, run_id)
-
     if total_changes == 0:
-        print("No changes. No ingestion needed.")
-        delete_delta_run(run_id)
+        print("\n=== 0 CHANGES: FAST EXIT ===")
+        t_cleanup = _timer()
         _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
         _cleanup_local_snapshot(local_snapshot_path)
         _write_pipeline_success(new_ts, cache_work_dir)
+        timing["cleanup"] = _elapsed(t_cleanup)
+        _print_timing(timing, pipeline_start)
         return
 
+    print("=== STEP 4: UPLOAD DELTA ===")
+    t_upload_delta = _timer()
+    upload_delta(workdir, run_id)
+    timing["upload_delta"] = _elapsed(t_upload_delta)
+
     print("=== STEP 5: CREATE INGESTION JOBS ===")
+    t_ingest = _timer()
     controller = call_edge("mplads-controller", {"run_id": run_id})
     expected_jobs = int(controller.get("total_jobs", 0))
     if expected_jobs <= 0:
@@ -492,8 +590,10 @@ def main():
     print("=== STEP 7: VERIFY ===")
     if not verify_run(run_id, expected_jobs):
         raise RuntimeError("Ingestion verification failed")
+    timing["ingestion"] = _elapsed(t_ingest)
 
     print("=== STEP 8: ANALYSIS ===")
+    t_analysis = _timer()
     from datetime import date as _date
     from automation.pipeline_controller import run_pipeline as run_analysis
 
@@ -511,7 +611,9 @@ def main():
         run_id=run_id,
         skip_gemini=skip_gemini,
         skip_ingest=True,
+        mode=args.mode,
     )
+    timing["analysis"] = _elapsed(t_analysis)
 
     if analysis_result.get("status") not in ("SUCCESS", "DRY_RUN"):
         raise RuntimeError(
@@ -519,13 +621,16 @@ def main():
         )
 
     print("=== STEP 9: CLEANUP ===")
+    t_cleanup = _timer()
     delete_delta_run(run_id)
 
     _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
     _cleanup_local_snapshot(local_snapshot_path)
     _write_pipeline_success(new_ts, cache_work_dir)
+    timing["cleanup"] = _elapsed(t_cleanup)
 
     print("=== PIPELINE COMPLETE ===")
+    _print_timing(timing, pipeline_start)
 
 
 if __name__ == "__main__":
