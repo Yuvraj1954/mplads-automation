@@ -131,13 +131,46 @@ jobs:
           "
 
       # ===========================================================
+      # VALIDATE BOOTSTRAP CACHE: Check if current snapshot is usable
+      # ===========================================================
+      - name: Validate bootstrap cache
+        if: github.event.inputs.bootstrap == 'true'
+        id: bootstrap-validate
+        working-directory: ${{ github.workspace }}/repo
+        run: |
+          python3 -c "
+          import sys
+          sys.path.insert(0, '.')
+          from automation.snapshot_cache import validate_bootstrap_cache
+          from pathlib import Path
+
+          work_dir = Path('/tmp/mplads-work')
+          ok, err = validate_bootstrap_cache(work_dir)
+          if ok:
+              print('Bootstrap cache valid')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('bootstrap_cache_valid=true\n')
+          else:
+              print(f'Bootstrap cache invalid: {err}')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('bootstrap_cache_valid=false\n')
+          "
+
+      # ===========================================================
       # SET FALLBACK FLAG: True only if both retries failed
       # ===========================================================
       - name: Determine fallback strategy
         id: strategy
         run: |
           if [ "${{ github.event.inputs.bootstrap }}" == "true" ]; then
-            echo "Bootstrap mode — fallback strategy not applicable"
+            BOOTSTRAP_CACHE="${{ steps.bootstrap-validate.outputs.bootstrap_cache_valid }}"
+            if [ "$BOOTSTRAP_CACHE" == "true" ]; then
+              echo "Bootstrap cache valid — bootstrap path"
+              echo "bootstrap_mode=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Bootstrap cache invalid — falling back to full pipeline"
+              echo "bootstrap_mode=false" >> "$GITHUB_OUTPUT"
+            fi
             echo "use_supabase_fallback=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -155,7 +188,7 @@ jobs:
       # RUN PIPELINE
       # ===========================================================
       - name: Run complete MPLADS pipeline
-        if: ${{ github.event.inputs.bootstrap != 'true' }}
+        if: ${{ github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false' }}
         working-directory: ${{ github.workspace }}/repo
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -170,7 +203,7 @@ jobs:
         run: python automation/daily_pipeline.py
 
       - name: Run bootstrap (one-time NEW DB initialization)
-        if: ${{ github.event.inputs.bootstrap == 'true' }}
+        if: ${{ github.event.inputs.bootstrap == 'true' && steps.strategy.outputs.bootstrap_mode == 'true' }}
         working-directory: ${{ github.workspace }}/repo
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -186,7 +219,7 @@ jobs:
       # READ NEW TIMESTAMP: Pipeline wrote .new_timestamp on success
       # ===========================================================
       - name: Read new snapshot timestamp
-        if: success() && github.event.inputs.bootstrap != 'true'
+        if: success() && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
         id: new-ts
         run: |
           NEW_TS_FILE="/tmp/mplads-work/.new_timestamp"
@@ -203,7 +236,7 @@ jobs:
       # ROTATE: On success — move current → previous
       # ===========================================================
       - name: Rotate snapshots
-        if: success() && steps.new-ts.outputs.new_ts != '' && github.event.inputs.bootstrap != 'true'
+        if: success() && steps.new-ts.outputs.new_ts != '' && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
         working-directory: ${{ github.workspace }}/repo
         env:
           MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
@@ -256,7 +289,7 @@ jobs:
       # SAVE: New immutable cache key using snapshot timestamp
       # ===========================================================
       - name: Save snapshot cache
-        if: success() && steps.new-ts.outputs.new_ts != '' && github.event.inputs.bootstrap != 'true'
+        if: success() && steps.new-ts.outputs.new_ts != '' && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
         uses: actions/cache/save@v4
         with:
           path: /tmp/mplads-work
@@ -266,7 +299,7 @@ jobs:
       # CLEANUP: Best-effort old cache entries
       # ===========================================================
       - name: Cleanup old cache entries
-        if: success() && github.event.inputs.bootstrap != 'true'
+        if: success() && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
         continue-on-error: true
         run: |
           echo "Cache cleanup is best-effort — never blocks pipeline"
