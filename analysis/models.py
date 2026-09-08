@@ -152,6 +152,7 @@ class MemberMetrics:
     member_type: str
     member_name: Optional[str] = None
     state_id: Optional[int] = None
+    state_name: Optional[str] = None
     constituency_id: Optional[int] = None
     total_works: int = 0
     recommended_works: int = 0

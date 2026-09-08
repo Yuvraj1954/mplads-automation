@@ -38,11 +38,12 @@ sys.path.insert(0, str(ROOT))
 # ============================================================
 
 def _fake_member_metrics(member_id=1, member_type="MP", total_works=30,
-                         completed_works=20, state_id="S01", **overrides):
+                         completed_works=20, state_id="S01",
+                         state_name="Test State", **overrides):
     from analysis.models import MemberMetrics
     defaults = dict(
         member_id=member_id, member_type=member_type, state_id=state_id,
-        constituency_id=f"C{member_id}",
+        state_name=state_name, constituency_id=f"C{member_id}",
         total_works=total_works, recommended_works=total_works,
         sanctioned_works=total_works - 5, completed_works=completed_works,
         ongoing_works=5, pending_works=5,
@@ -1522,3 +1523,863 @@ class TestPipelineFlowCompleteness:
         src = inspect.getsource(stage_verify)
         assert "analytics_result" in src
         assert "work_refs_result" in src
+
+
+# ============================================================
+# TEST 21: OVERALL METRICS ZERO-OVERWRITE GUARD
+# ============================================================
+
+class TestOverallMetricsGuard:
+
+    def test_valid_recalculation_upserts_overall_metrics(self):
+        """Normal recalculation with real data upserts overall_metrics."""
+        from automation.pipeline_controller import stage_analytics_persist
+        from unittest.mock import patch, MagicMock
+
+        m = _fake_member_metrics(member_id=1, member_type="MP", total_works=30)
+        s = _fake_state_metrics()
+        pipeline = MagicMock()
+        pipeline.member_metrics = [m]
+        pipeline.state_metrics = [s]
+        pipeline.statistics = []
+        pipeline.mp_statistics = []
+        pipeline.mla_statistics = []
+        pipeline.trends = []
+        pipeline.mp_trends = []
+        pipeline.mla_trends = []
+        pipeline_result = {"pipeline": pipeline, "master_population_context": {}}
+        anomaly_result = {"member_anomalies": [], "state_anomalies": []}
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+
+        with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+            with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                result = stage_analytics_persist(pipeline_result, anomaly_result)
+
+        overall_call = [c for c in mock_upsert.call_args_list if c[0][2] == "overall_metrics"]
+        assert len(overall_call) == 1
+        assert result["overall"] == 3
+
+    def test_empty_input_skips_overall_metrics(self):
+        """Empty analysis input does NOT overwrite existing overall_metrics."""
+        from automation.pipeline_controller import stage_analytics_persist
+        from unittest.mock import patch, MagicMock
+
+        pipeline = MagicMock()
+        pipeline.member_metrics = []
+        pipeline.state_metrics = []
+        pipeline.statistics = []
+        pipeline.mp_statistics = []
+        pipeline.mla_statistics = []
+        pipeline.trends = []
+        pipeline.mp_trends = []
+        pipeline.mla_trends = []
+        pipeline_result = {"pipeline": pipeline, "master_population_context": {}}
+        anomaly_result = {"member_anomalies": [], "state_anomalies": []}
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+
+        with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+            with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                result = stage_analytics_persist(pipeline_result, anomaly_result)
+
+        overall_call = [c for c in mock_upsert.call_args_list if c[0][2] == "overall_metrics"]
+        assert len(overall_call) == 0
+
+    def test_zero_works_skips_overall_metrics(self):
+        """Member with zero total_works and zero sanctioned_amount skips overall_metrics."""
+        from automation.pipeline_controller import stage_analytics_persist
+        from unittest.mock import patch, MagicMock
+
+        m = _fake_member_metrics(member_id=1, member_type="MP",
+                                  total_works=0, sanctioned_amount=0,
+                                  expenditure_amount=0, recommended_amount=0,
+                                  zero_work_member=True, ranking_qualified=False)
+        s = _fake_state_metrics(total_works=0, sanctioned_amount=0,
+                                 expenditure_amount=0, recommended_amount=0)
+        pipeline = MagicMock()
+        pipeline.member_metrics = [m]
+        pipeline.state_metrics = [s]
+        pipeline.statistics = []
+        pipeline.mp_statistics = []
+        pipeline.mla_statistics = []
+        pipeline.trends = []
+        pipeline.mp_trends = []
+        pipeline.mla_trends = []
+        pipeline_result = {"pipeline": pipeline, "master_population_context": {}}
+        anomaly_result = {"member_anomalies": [], "state_anomalies": []}
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+
+        with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+            with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                stage_analytics_persist(pipeline_result, anomaly_result)
+
+        overall_call = [c for c in mock_upsert.call_args_list if c[0][2] == "overall_metrics"]
+        assert len(overall_call) == 0
+
+    def test_valid_nonzero_recalculation_upserts(self):
+        """Non-zero works with sanctioned_amount upserts overall_metrics."""
+        from automation.pipeline_controller import stage_analytics_persist
+        from unittest.mock import patch, MagicMock
+
+        m = _fake_member_metrics(member_id=1, member_type="MP",
+                                  total_works=50, sanctioned_amount=1000000,
+                                  expenditure_amount=500000)
+        s = _fake_state_metrics(total_works=200, sanctioned_amount=5000000)
+        pipeline = MagicMock()
+        pipeline.member_metrics = [m]
+        pipeline.state_metrics = [s]
+        pipeline.statistics = []
+        pipeline.mp_statistics = []
+        pipeline.mla_statistics = []
+        pipeline.trends = []
+        pipeline.mp_trends = []
+        pipeline.mla_trends = []
+        pipeline_result = {"pipeline": pipeline, "master_population_context": {}}
+        anomaly_result = {"member_anomalies": [], "state_anomalies": []}
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+
+        with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+            with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                result = stage_analytics_persist(pipeline_result, anomaly_result)
+
+        overall_call = [c for c in mock_upsert.call_args_list if c[0][2] == "overall_metrics"]
+        assert len(overall_call) == 1
+
+    def test_guard_uses_correct_semantics(self):
+        """Guard checks total_works > 0 OR sanctioned_amount > 0, not just non-empty."""
+        from automation.pipeline_controller import stage_analytics_persist
+        from unittest.mock import patch, MagicMock
+
+        m = _fake_member_metrics(member_id=1, member_type="MP",
+                                  total_works=10, sanctioned_amount=0,
+                                  expenditure_amount=0)
+        s = _fake_state_metrics(total_works=0, sanctioned_amount=0,
+                                 expenditure_amount=0)
+        pipeline = MagicMock()
+        pipeline.member_metrics = [m]
+        pipeline.state_metrics = [s]
+        pipeline.statistics = []
+        pipeline.mp_statistics = []
+        pipeline.mla_statistics = []
+        pipeline.trends = []
+        pipeline.mp_trends = []
+        pipeline.mla_trends = []
+        pipeline_result = {"pipeline": pipeline, "master_population_context": {}}
+        anomaly_result = {"member_anomalies": [], "state_anomalies": []}
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+
+        with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+            with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                stage_analytics_persist(pipeline_result, anomaly_result)
+
+        overall_call = [c for c in mock_upsert.call_args_list if c[0][2] == "overall_metrics"]
+        assert len(overall_call) == 1
+
+
+# ============================================================
+# TEST 22: EVIDENCE WORK REFS LIFECYCLE
+# ============================================================
+
+class TestEvidenceWorkRefsLifecycle:
+
+    def test_stage_8b_writes_refs(self):
+        """Stage 8b generates and writes evidence_work_refs."""
+        from automation.pipeline_controller import stage_evidence_work_refs
+        from unittest.mock import patch
+        from analysis.models import WorkAnalysis
+
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence": {}}]
+        works = [
+            WorkAnalysis(work_id=101, member_type="MP", member_id=1,
+                         status="Completed", flag_count=2, risk_level="HIGH",
+                         sanction_amount=100000, expenditure_amount=80000,
+                         sanction_delay_days=30, expenditure_percentage=80.0),
+        ]
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+
+        with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+            with patch("automation.pipeline_controller.sb_delete", return_value=200):
+                with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                    result = stage_evidence_work_refs(evidence, works)
+
+        assert result["written"] > 0
+        mock_upsert.assert_called()
+
+    def test_stage_10_does_not_delete_refs(self):
+        """Stage 10 (stage_persist) does NOT delete evidence_work_refs."""
+        from automation.pipeline_controller import stage_persist
+        import inspect
+        src = inspect.getsource(stage_persist)
+        import re
+        delete_calls = re.findall(r'sb_delete\([^)]+\)', src)
+        for call in delete_calls:
+            assert "evidence_work_refs" not in call
+
+    def test_rerun_does_not_create_duplicates(self):
+        """Re-running evidence_work_refs replaces (not appends) refs."""
+        from analysis.evidence_work_refs import build_evidence_work_refs
+        from analysis.models import WorkAnalysis
+
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence": {}}]
+        works = [
+            WorkAnalysis(work_id=101, member_type="MP", member_id=1,
+                         status="Completed", flag_count=2, risk_level="HIGH",
+                         sanction_amount=100000, expenditure_amount=80000,
+                         sanction_delay_days=30, expenditure_percentage=80.0),
+        ]
+        refs_run1 = build_evidence_work_refs(evidence, works)
+        refs_run2 = build_evidence_work_refs(evidence, works)
+        assert len(refs_run1) == len(refs_run2)
+        ids_run1 = {(r["work_id"], r["evidence_role"]) for r in refs_run1}
+        ids_run2 = {(r["work_id"], r["evidence_role"]) for r in refs_run2}
+        assert ids_run1 == ids_run2
+
+    def test_empty_evidence_produces_no_refs(self):
+        """Empty evidence list produces no work refs."""
+        from analysis.evidence_work_refs import build_evidence_work_refs
+        refs = build_evidence_work_refs([], [])
+        assert refs == []
+
+    def test_ref_has_required_fields(self):
+        """Each evidence_work_ref has all required fields."""
+        from analysis.evidence_work_refs import build_evidence_work_refs
+        from analysis.models import WorkAnalysis
+
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence": {}}]
+        works = [
+            WorkAnalysis(work_id=101, member_type="MP", member_id=1,
+                         status="Completed", flag_count=1, risk_level="HIGH",
+                         sanction_amount=100000, expenditure_amount=80000,
+                         sanction_delay_days=30, expenditure_percentage=80.0),
+        ]
+        refs = build_evidence_work_refs(evidence, works)
+        assert len(refs) > 0
+        for ref in refs:
+            assert "entity_type" in ref
+            assert "entity_id" in ref
+            assert "work_id" in ref
+            assert "member_type" in ref
+            assert "evidence_role" in ref
+            assert "reason" in ref
+            assert "created_at" in ref
+
+    def test_state_refs_included(self):
+        """State evidence produces state-level work refs."""
+        from analysis.evidence_work_refs import build_evidence_work_refs
+        from analysis.models import WorkAnalysis
+
+        evidence = [{"entity_type": "STATE", "entity_id": 1, "evidence": {}}]
+        works = [
+            WorkAnalysis(work_id=101, member_type="MP", member_id=1,
+                         status="Completed", flag_count=2, risk_level="HIGH",
+                         state_id=1, sanction_amount=500000),
+        ]
+        refs = build_evidence_work_refs(evidence, works)
+        assert len(refs) > 0
+        assert all(r["entity_type"] == "STATE" for r in refs)
+
+    def test_mla_refs_use_correct_member_type(self):
+        """MLA evidence refs use MLA member_type."""
+        from analysis.evidence_work_refs import build_evidence_work_refs
+        from analysis.models import WorkAnalysis
+
+        evidence = [{"entity_type": "MLA", "entity_id": 100001, "evidence": {}}]
+        works = [
+            WorkAnalysis(work_id=1100001, member_type="MLA", member_id=100001,
+                         status="In Progress", flag_count=1, risk_level="MEDIUM",
+                         sanction_amount=50000, sanction_delay_days=60),
+        ]
+        refs = build_evidence_work_refs(evidence, works)
+        assert len(refs) > 0
+        assert all(r["member_type"] == "MLA" for r in refs)
+
+
+# ============================================================
+# TEST 23: STATE NAME MAPPING
+# ============================================================
+
+class TestStateNameMapping:
+
+    def test_mp_state_name_from_works(self):
+        """MP member_metrics gets state_name from works data."""
+        from automation.pipeline_controller import stage_analyze
+        from unittest.mock import patch, MagicMock
+        import tempfile, os
+
+        snapshot_dir = tempfile.mkdtemp()
+        try:
+            works_dir = os.path.join(snapshot_dir, "works_recommended")
+            os.makedirs(works_dir)
+            work = {
+                "WORK_RECOMMENDATION_DTL_ID": "1001", "MP_NAME": "Test MP",
+                "MP_ID": "1", "CONSTITUENCY": "Test Constituency",
+                "STATE_NAME": "Maharashtra",
+                "RECOMMENDATION_DATE": "01-Jan-2025",
+                "RECOMMENDED_AMOUNT": "100000",
+                "ACTIVITY_NAME": "Road Construction",
+            }
+            with open(os.path.join(works_dir, "part_001.ndjson"), "w") as f:
+                f.write(json.dumps(work) + "\n")
+
+            for subdir in ["works_sanctioned", "works_completed", "works_expenditure",
+                           "mla_works_recommended", "mla_works_sanctioned",
+                           "mla_works_completed", "mla_works_expenditure"]:
+                os.makedirs(os.path.join(snapshot_dir, subdir))
+
+            for subdir in ["allocated_limit", "mla_allocated_limit"]:
+                d = os.path.join(snapshot_dir, subdir)
+                os.makedirs(d)
+                with open(os.path.join(d, "part_001.ndjson"), "w") as f:
+                    f.write(json.dumps({"MP_NAME": "Test MP", "STATE_NAME": "Maharashtra",
+                                        "CONSTITUENCY": "Test Constituency",
+                                        "HOUSE_NAME": "Lok Sabha", "TENURE": "2024-2029",
+                                        "ALLOCATED_AMT": "5000000"}) + "\n")
+
+            result = stage_analyze(snapshot_dir)
+            pipeline = result["pipeline"]
+            mp_members = [m for m in pipeline.member_metrics if m.member_type == "MP"]
+            assert len(mp_members) > 0
+            assert any(m.state_name == "Maharashtra" for m in mp_members)
+        finally:
+            import shutil
+            shutil.rmtree(snapshot_dir)
+
+    def test_state_name_populated_on_member_metrics(self):
+        """stage_analyze populates state_name on MemberMetrics objects."""
+        from automation.pipeline_controller import stage_analyze
+        from unittest.mock import patch, MagicMock
+        import tempfile, os
+
+        snapshot_dir = tempfile.mkdtemp()
+        try:
+            works_dir = os.path.join(snapshot_dir, "works_recommended")
+            os.makedirs(works_dir)
+            work = {
+                "WORK_RECOMMENDATION_DTL_ID": "2001", "MP_NAME": "State Test MP",
+                "MP_ID": "2", "CONSTITUENCY": "State Constituency",
+                "STATE_NAME": "Bihar",
+                "RECOMMENDATION_DATE": "15-Mar-2025",
+                "RECOMMENDED_AMOUNT": "200000",
+                "ACTIVITY_NAME": "Bridge Construction",
+            }
+            with open(os.path.join(works_dir, "part_001.ndjson"), "w") as f:
+                f.write(json.dumps(work) + "\n")
+
+            for subdir in ["works_sanctioned", "works_completed", "works_expenditure",
+                           "mla_works_recommended", "mla_works_sanctioned",
+                           "mla_works_completed", "mla_works_expenditure"]:
+                os.makedirs(os.path.join(snapshot_dir, subdir))
+
+            for subdir in ["allocated_limit", "mla_allocated_limit"]:
+                d = os.path.join(snapshot_dir, subdir)
+                os.makedirs(d)
+                with open(os.path.join(d, "part_001.ndjson"), "w") as f:
+                    f.write(json.dumps({"MP_NAME": "State Test MP", "STATE_NAME": "Bihar",
+                                        "CONSTITUENCY": "State Constituency",
+                                        "HOUSE_NAME": "Lok Sabha", "TENURE": "2024-2029",
+                                        "ALLOCATED_AMT": "3000000"}) + "\n")
+
+            result = stage_analyze(snapshot_dir)
+            pipeline = result["pipeline"]
+            members_with_state = [m for m in pipeline.member_metrics if m.state_name]
+            assert len(members_with_state) > 0
+        finally:
+            import shutil
+            shutil.rmtree(snapshot_dir)
+
+    def test_zero_work_member_gets_state_name(self):
+        """Zero-work member gets state_name from master population context."""
+        from analysis.db2_analytics_persistence import build_member_metrics
+        from unittest.mock import MagicMock
+
+        m = _fake_member_metrics(member_id=999, member_type="MP",
+                                  total_works=0, zero_work_member=True,
+                                  ranking_qualified=False)
+        m.state_name = "Maharashtra"
+        records = build_member_metrics([m])
+        assert records[0]["state_name"] == "Maharashtra"
+
+    def test_state_name_fallback_to_master_context(self):
+        """_member_to_record falls back to master_population_context for state_name."""
+        from analysis.db2_analytics_persistence import _member_to_record
+
+        m = _fake_member_metrics(member_id=1, member_type="MP")
+        m.state_name = None
+        master_ctx = {
+            ("MP", 1): {"state_name": "Tamil Nadu", "member_name": "Test"}
+        }
+        record = _member_to_record(m, {}, master_ctx)
+        assert record["state_name"] == "Tamil Nadu"
+
+    def test_member_state_name_preferred_over_master(self):
+        """MemberMetrics.state_name is preferred over master_population_context."""
+        from analysis.db2_analytics_persistence import _member_to_record
+
+        m = _fake_member_metrics(member_id=1, member_type="MP")
+        m.state_name = "Karnataka"
+        master_ctx = {
+            ("MP", 1): {"state_name": "Tamil Nadu", "member_name": "Test"}
+        }
+        record = _member_to_record(m, {}, master_ctx)
+        assert record["state_name"] == "Karnataka"
+
+
+# ============================================================
+# TEST 24: WORK ANALYSIS COVERAGE
+# ============================================================
+
+class TestWorkAnalysisCoverage:
+
+    def test_all_snapshot_works_get_analyzed(self):
+        """stage_analyze processes ALL works from the snapshot."""
+        from automation.pipeline_controller import stage_analyze
+        import tempfile, os
+
+        snapshot_dir = tempfile.mkdtemp()
+        try:
+            works_dir = os.path.join(snapshot_dir, "works_recommended")
+            os.makedirs(works_dir)
+            for i in range(5):
+                work = {
+                    "WORK_RECOMMENDATION_DTL_ID": str(3000 + i),
+                    "MP_NAME": f"Coverage MP {i}",
+                    "MP_ID": str(3 + i), "CONSTITUENCY": f"Constituency {i}",
+                    "STATE_ID": str(3 + i % 3), "STATE_NAME": f"State {i % 3}",
+                    "RECOMMENDATION_DATE": "01-Jan-2025",
+                    "RECOMMENDED_AMOUNT": str(100000 * (i + 1)),
+                    "ACTIVITY_NAME": f"Activity {i}",
+                }
+                with open(os.path.join(works_dir, f"part_{i:03d}.ndjson"), "w") as f:
+                    f.write(json.dumps(work) + "\n")
+
+            for subdir in ["works_sanctioned", "works_completed", "works_expenditure",
+                           "mla_works_recommended", "mla_works_sanctioned",
+                           "mla_works_completed", "mla_works_expenditure"]:
+                os.makedirs(os.path.join(snapshot_dir, subdir))
+
+            for subdir in ["allocated_limit", "mla_allocated_limit"]:
+                d = os.path.join(snapshot_dir, subdir)
+                os.makedirs(d)
+                with open(os.path.join(d, "part_001.ndjson"), "w") as f:
+                    f.write(json.dumps({"MP_NAME": "Coverage MP 0", "STATE_NAME": "State 0",
+                                        "CONSTITUENCY": "Constituency 0", "HOUSE_NAME": "Lok Sabha",
+                                        "TENURE": "2024-2029", "ALLOCATED_AMT": "5000000"}) + "\n")
+
+            result = stage_analyze(snapshot_dir)
+            assert len(result["work_analyses"]) == 5
+        finally:
+            import shutil
+            shutil.rmtree(snapshot_dir)
+
+    def test_work_analysis_has_all_required_fields(self):
+        """Each WorkAnalysis has all fields needed for Work Details."""
+        from analysis.work_analysis import compute_work_analyses
+        from datetime import date
+
+        works = [{
+            "work_id": 4001, "member_type": "MP", "member_id": 4,
+            "state_id": 4, "constituency_id": 401,
+            "recommendation_date": date(2025, 1, 15),
+            "sanction_date": date(2025, 3, 10),
+            "completion_date": date(2025, 8, 20),
+            "last_expenditure_date": date(2025, 7, 15),
+            "recommended_amount": 500000,
+            "sanction_amount": 450000,
+            "expenditure_amount": 380000,
+            "completion_amount": 350000,
+            "activity_name": "Road Construction",
+            "state_name": "Maharashtra",
+        }]
+        analyses = compute_work_analyses(works, date(2025, 12, 31))
+        assert len(analyses) == 1
+        wa = analyses[0]
+        assert wa.work_id == 4001
+        assert wa.member_type == "MP"
+        assert wa.status == "Completed"
+        assert wa.sanction_delay_days is not None
+        assert wa.execution_days is not None
+        assert wa.expenditure_percentage is not None
+        assert wa.risk_flags is not None
+        assert wa.risk_level is not None
+
+    def test_work_without_recommendation_still_analyzed(self):
+        """Work without recommendation_date still gets analyzed."""
+        from analysis.work_analysis import compute_work_analyses
+        from datetime import date
+
+        works = [{
+            "work_id": 5001, "member_type": "MP", "member_id": 5,
+            "state_id": 5, "constituency_id": 501,
+            "recommendation_date": None,
+            "sanction_date": None,
+            "completion_date": None,
+            "last_expenditure_date": None,
+            "recommended_amount": None,
+            "sanction_amount": None,
+            "expenditure_amount": None,
+            "completion_amount": None,
+            "activity_name": "Bridge Construction",
+            "state_name": "Bihar",
+        }]
+        analyses = compute_work_analyses(works, date(2025, 12, 31))
+        assert len(analyses) == 1
+        assert analyses[0].status == "Unknown"
+
+    def test_mla_works_analyzed_with_offset_id(self):
+        """MLA works with +1000000 offset are analyzed correctly."""
+        from analysis.work_analysis import compute_work_analyses
+        from datetime import date
+
+        works = [{
+            "work_id": 1100001, "member_type": "MLA", "member_id": 100001,
+            "state_id": 1, "constituency_id": 101,
+            "recommendation_date": date(2025, 2, 1),
+            "sanction_date": date(2025, 4, 15),
+            "completion_date": None,
+            "last_expenditure_date": date(2025, 6, 1),
+            "recommended_amount": 200000,
+            "sanction_amount": 180000,
+            "expenditure_amount": 120000,
+            "completion_amount": 0,
+            "activity_name": "School Building",
+            "state_name": "Uttar Pradesh",
+        }]
+        analyses = compute_work_analyses(works, date(2025, 12, 31))
+        assert len(analyses) == 1
+        assert analyses[0].work_id == 1100001
+        assert analyses[0].member_type == "MLA"
+
+    def test_work_analysis_deterministic(self):
+        """Same input produces identical WorkAnalysis output."""
+        from analysis.work_analysis import compute_work_analyses
+        from datetime import date
+
+        works = [{
+            "work_id": 6001, "member_type": "MP", "member_id": 6,
+            "state_id": 6, "constituency_id": 601,
+            "recommendation_date": date(2025, 1, 1),
+            "sanction_date": date(2025, 2, 1),
+            "completion_date": date(2025, 6, 1),
+            "last_expenditure_date": date(2025, 5, 1),
+            "recommended_amount": 300000,
+            "sanction_amount": 280000,
+            "expenditure_amount": 250000,
+            "completion_amount": 240000,
+            "activity_name": "Water Supply",
+            "state_name": "Gujarat",
+        }]
+        a1 = compute_work_analyses(works, date(2025, 12, 31))
+        a2 = compute_work_analyses(works, date(2025, 12, 31))
+        assert a1[0].status == a2[0].status
+        assert a1[0].sanction_delay_days == a2[0].sanction_delay_days
+        assert a1[0].risk_level == a2[0].risk_level
+
+
+# ============================================================
+# TEST 25: GEMINI REPROCESSING
+# ============================================================
+
+class TestGeminiReprocessing:
+
+    def test_filter_affected_new_entity(self):
+        """New entity with no existing analysis is affected."""
+        from analysis.gemini_processor import filter_affected
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence_hash": "h1"}]
+        affected = filter_affected(evidence, [])
+        assert len(affected) == 1
+
+    def test_filter_affected_unchanged_hash(self):
+        """Entity with matching evidence_hash is NOT affected."""
+        from analysis.gemini_processor import filter_affected
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence_hash": "h1"}]
+        existing = [{"entity_type": "MP", "entity_id": 1,
+                     "evidence_hash": "h1", "prompt_version": "gemini_analysis_v5"}]
+        affected = filter_affected(evidence, existing)
+        assert len(affected) == 0
+
+    def test_filter_affected_changed_hash(self):
+        """Entity with changed evidence_hash IS affected."""
+        from analysis.gemini_processor import filter_affected
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence_hash": "new_hash"}]
+        existing = [{"entity_type": "MP", "entity_id": 1,
+                     "evidence_hash": "old_hash", "prompt_version": "gemini_analysis_v5"}]
+        affected = filter_affected(evidence, existing)
+        assert len(affected) == 1
+
+    def test_filter_affected_changed_prompt_version(self):
+        """Changed prompt_version makes ALL entities affected."""
+        from analysis.gemini_processor import filter_affected
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence_hash": "h1"}]
+        existing = [{"entity_type": "MP", "entity_id": 1,
+                     "evidence_hash": "h1", "prompt_version": "gemini_analysis_v4"}]
+        affected = filter_affected(evidence, existing)
+        assert len(affected) == 1
+
+    def test_filter_affected_mixed(self):
+        """Mix of changed and unchanged entities filters correctly."""
+        from analysis.gemini_processor import filter_affected
+        evidence = [
+            {"entity_type": "MP", "entity_id": 1, "evidence_hash": "h1_changed"},
+            {"entity_type": "MP", "entity_id": 2, "evidence_hash": "h2_unchanged"},
+            {"entity_type": "MLA", "entity_id": 3, "evidence_hash": "h3_new"},
+        ]
+        existing = [
+            {"entity_type": "MP", "entity_id": 1,
+             "evidence_hash": "h1_old", "prompt_version": "gemini_analysis_v5"},
+            {"entity_type": "MP", "entity_id": 2,
+             "evidence_hash": "h2_unchanged", "prompt_version": "gemini_analysis_v5"},
+        ]
+        affected = filter_affected(evidence, existing)
+        assert len(affected) == 2
+        affected_ids = {(r["entity_type"], r["entity_id"]) for r in affected}
+        assert ("MP", 1) in affected_ids
+        assert ("MLA", 3) in affected_ids
+
+    def test_failed_gemini_does_not_persist(self):
+        """Failed Gemini generation does NOT create an ai_analysis row."""
+        from automation.pipeline_controller import stage_gemini
+        from unittest.mock import patch, MagicMock
+
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+        mock_cfg = MagicMock()
+        mock_cfg.gemini_keys = ["fake_key"]
+
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence_hash": "h1",
+                     "evidence_version": 2, "entity_name": "Test MP",
+                     "evidence": {"portfolio": {"total_works": 30}}}]
+
+        mock_processor = MagicMock()
+        mock_processor.process_batch.return_value = {
+            "results": [], "success_count": 0,
+            "failure_count": 1, "failures": [{"entity_type": "MP", "entity_id": 1}],
+        }
+
+        with patch("automation.pipeline_controller.get_config", return_value=mock_cfg):
+            with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+                with patch("automation.pipeline_controller.load_table", return_value=[]):
+                    with patch("analysis.gemini_processor.GeminiProcessor", return_value=mock_processor):
+                        with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                            result = stage_gemini(evidence, api_keys=["fake_key"])
+
+        mock_upsert.assert_not_called()
+        assert result["failed"] == 1
+
+    def test_gemini_no_duplicate_rows_on_rerun(self):
+        """Re-running Gemini with same evidence_hash does not create duplicates."""
+        from automation.pipeline_controller import stage_gemini
+        from unittest.mock import patch, MagicMock
+
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+        mock_cfg = MagicMock()
+        mock_cfg.gemini_keys = ["fake_key"]
+
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence_hash": "h1",
+                     "evidence_version": 2, "entity_name": "Test MP",
+                     "evidence": {"portfolio": {"total_works": 30}}}]
+
+        mock_processor = MagicMock()
+        mock_processor.process_batch.return_value = {
+            "results": [], "success_count": 0,
+            "failure_count": 0, "failures": [],
+        }
+
+        with patch("automation.pipeline_controller.get_config", return_value=mock_cfg):
+            with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+                with patch("automation.pipeline_controller.load_table", return_value=[
+                    {"entity_type": "MP", "entity_id": 1,
+                     "evidence_hash": "h1", "prompt_version": "gemini_analysis_v5"},
+                ]):
+                    with patch("analysis.gemini_processor.GeminiProcessor", return_value=mock_processor):
+                        with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                            result = stage_gemini(evidence, api_keys=["fake_key"])
+
+        mock_upsert.assert_not_called()
+        assert result["skipped"] == 1
+
+    def test_gemini_upsert_uses_conflict_cols(self):
+        """Gemini persist uses upsert with correct conflict columns."""
+        from automation.pipeline_controller import stage_gemini
+        from unittest.mock import patch, MagicMock
+
+        mock_db2 = ("https://test-db2.supabase.co", "test_key")
+        mock_cfg = MagicMock()
+        mock_cfg.gemini_keys = ["fake_key"]
+
+        evidence = [{"entity_type": "MP", "entity_id": 1, "evidence_hash": "h1",
+                     "evidence_version": 2, "entity_name": "Test MP",
+                     "evidence": {"portfolio": {"total_works": 30}}}]
+
+        mock_processor = MagicMock()
+        mock_result = MagicMock()
+        mock_result.entity_type = "MP"
+        mock_result.entity_id = 1
+        mock_result.evidence_hash = "h1"
+        mock_result.model = "gemini-3.1-flash-lite"
+        mock_result.prompt_version = "gemini_analysis_v5"
+        mock_result.generated_at = "2026-01-01T00:00:00+00:00"
+        mock_result.to_analysis_text.return_value = '{"summary":"test","highlights":[],"cautions":[]}'
+
+        def fake_process_batch(evidence_rows, on_success=None, on_failure=None):
+            if on_success:
+                on_success(mock_result)
+            return {"results": [mock_result], "success_count": 1,
+                    "failure_count": 0, "failures": []}
+
+        mock_processor.process_batch.side_effect = fake_process_batch
+
+        with patch("automation.pipeline_controller.get_config", return_value=mock_cfg):
+            with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
+                with patch("automation.pipeline_controller.load_table", return_value=[]):
+                    with patch("analysis.gemini_processor.GeminiProcessor", return_value=mock_processor):
+                        with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
+                            stage_gemini(evidence, api_keys=["fake_key"])
+
+        mock_upsert.assert_called_once()
+        assert mock_upsert.call_args[1]["conflict_cols"] == ["entity_type", "entity_id"]
+
+
+# ============================================================
+# TEST 26: DRY RUN GATE
+# ============================================================
+
+class TestDryRunGate:
+
+    def test_dry_run_skips_analytics_persist(self):
+        """dry_run=True skips stage_analytics_persist (no DB2 writes)."""
+        from automation.pipeline_controller import run_pipeline
+        from unittest.mock import patch, MagicMock
+
+        with patch("automation.pipeline_controller.load_config") as mock_cfg:
+            mock_cfg.return_value = MagicMock(db2_ready=False, gemini_keys=[],
+                                              db1_url="http://test", db1_key="k")
+            with patch("automation.pipeline_controller.stage_affected") as mock_affected:
+                mock_affected.return_value = {"affected_members": set(),
+                                               "affected_states": set(),
+                                               "member_count": 0, "state_count": 0}
+                with patch("automation.pipeline_controller.stage_analyze") as mock_analyze:
+                    mock_pipeline = MagicMock()
+                    mock_pipeline.member_metrics = []
+                    mock_pipeline.state_metrics = []
+                    mock_analyze.return_value = {"pipeline": mock_pipeline,
+                                                  "work_analyses": [],
+                                                  "master_population_context": {}}
+                    with patch("automation.pipeline_controller.stage_anomaly") as mock_anomaly:
+                        mock_anomaly.return_value = {"member_anomalies": [],
+                                                      "state_anomalies": []}
+                        with patch("automation.pipeline_controller.stage_analytics_persist") as mock_ap:
+                            result = run_pipeline(dry_run=True, skip_ingest=True)
+
+        mock_ap.assert_not_called()
+        assert result["status"] == "DRY_RUN"
+        assert result["stages"]["analytics_persist"]["skipped"] is True
+
+    def test_dry_run_skips_evidence_work_refs(self):
+        """dry_run=True skips stage_evidence_work_refs (no DB2 writes)."""
+        from automation.pipeline_controller import run_pipeline
+        from unittest.mock import patch, MagicMock
+
+        with patch("automation.pipeline_controller.load_config") as mock_cfg:
+            mock_cfg.return_value = MagicMock(db2_ready=False, gemini_keys=[],
+                                              db1_url="http://test", db1_key="k")
+            with patch("automation.pipeline_controller.stage_affected") as mock_affected:
+                mock_affected.return_value = {"affected_members": set(),
+                                               "affected_states": set(),
+                                               "member_count": 0, "state_count": 0}
+                with patch("automation.pipeline_controller.stage_analyze") as mock_analyze:
+                    mock_pipeline = MagicMock()
+                    mock_pipeline.member_metrics = []
+                    mock_pipeline.state_metrics = []
+                    mock_analyze.return_value = {"pipeline": mock_pipeline,
+                                                  "work_analyses": [],
+                                                  "master_population_context": {}}
+                    with patch("automation.pipeline_controller.stage_anomaly") as mock_anomaly:
+                        mock_anomaly.return_value = {"member_anomalies": [],
+                                                      "state_anomalies": []}
+                        with patch("automation.pipeline_controller.stage_evidence_work_refs") as mock_ewr:
+                            result = run_pipeline(dry_run=True, skip_ingest=True)
+
+        mock_ewr.assert_not_called()
+        assert result["stages"]["evidence_work_refs"]["skipped"] is True
+
+    def test_dry_run_skips_gemini(self):
+        """dry_run=True skips stage_gemini."""
+        from automation.pipeline_controller import run_pipeline
+        from unittest.mock import patch, MagicMock
+
+        with patch("automation.pipeline_controller.load_config") as mock_cfg:
+            mock_cfg.return_value = MagicMock(db2_ready=False, gemini_keys=[],
+                                              db1_url="http://test", db1_key="k")
+            with patch("automation.pipeline_controller.stage_affected") as mock_affected:
+                mock_affected.return_value = {"affected_members": set(),
+                                               "affected_states": set(),
+                                               "member_count": 0, "state_count": 0}
+                with patch("automation.pipeline_controller.stage_analyze") as mock_analyze:
+                    mock_pipeline = MagicMock()
+                    mock_pipeline.member_metrics = []
+                    mock_pipeline.state_metrics = []
+                    mock_analyze.return_value = {"pipeline": mock_pipeline,
+                                                  "work_analyses": [],
+                                                  "master_population_context": {}}
+                    with patch("automation.pipeline_controller.stage_anomaly") as mock_anomaly:
+                        mock_anomaly.return_value = {"member_anomalies": [],
+                                                      "state_anomalies": []}
+                        with patch("automation.pipeline_controller.stage_gemini") as mock_gemini:
+                            result = run_pipeline(dry_run=True, skip_ingest=True)
+
+        mock_gemini.assert_not_called()
+        assert result["stages"]["gemini"]["skipped"] is True
+
+    def test_dry_run_skips_persist(self):
+        """dry_run=True skips stage_persist (entity_evidence not written)."""
+        from automation.pipeline_controller import run_pipeline
+        from unittest.mock import patch, MagicMock
+
+        with patch("automation.pipeline_controller.load_config") as mock_cfg:
+            mock_cfg.return_value = MagicMock(db2_ready=False, gemini_keys=[],
+                                              db1_url="http://test", db1_key="k")
+            with patch("automation.pipeline_controller.stage_affected") as mock_affected:
+                mock_affected.return_value = {"affected_members": set(),
+                                               "affected_states": set(),
+                                               "member_count": 0, "state_count": 0}
+                with patch("automation.pipeline_controller.stage_analyze") as mock_analyze:
+                    mock_pipeline = MagicMock()
+                    mock_pipeline.member_metrics = []
+                    mock_pipeline.state_metrics = []
+                    mock_analyze.return_value = {"pipeline": mock_pipeline,
+                                                  "work_analyses": [],
+                                                  "master_population_context": {}}
+                    with patch("automation.pipeline_controller.stage_anomaly") as mock_anomaly:
+                        mock_anomaly.return_value = {"member_anomalies": [],
+                                                      "state_anomalies": []}
+                        with patch("automation.pipeline_controller.stage_persist") as mock_persist:
+                            result = run_pipeline(dry_run=True, skip_ingest=True)
+
+        mock_persist.assert_not_called()
+        assert result["stages"]["persist"]["skipped"] is True
+
+    def test_dry_run_still_runs_analysis(self):
+        """dry_run=True still runs analysis (deterministic, no DB writes)."""
+        from automation.pipeline_controller import run_pipeline
+        from unittest.mock import patch, MagicMock
+
+        with patch("automation.pipeline_controller.load_config") as mock_cfg:
+            mock_cfg.return_value = MagicMock(db2_ready=False, gemini_keys=[],
+                                              db1_url="http://test", db1_key="k")
+            with patch("automation.pipeline_controller.stage_affected") as mock_affected:
+                mock_affected.return_value = {"affected_members": set(),
+                                               "affected_states": set(),
+                                               "member_count": 0, "state_count": 0}
+                with patch("automation.pipeline_controller.stage_analyze") as mock_analyze:
+                    mock_pipeline = MagicMock()
+                    mock_pipeline.member_metrics = []
+                    mock_pipeline.state_metrics = []
+                    mock_analyze.return_value = {"pipeline": mock_pipeline,
+                                                  "work_analyses": [],
+                                                  "master_population_context": {}}
+                    with patch("automation.pipeline_controller.stage_anomaly") as mock_anomaly:
+                        mock_anomaly.return_value = {"member_anomalies": [],
+                                                      "state_anomalies": []}
+                        result = run_pipeline(dry_run=True, skip_ingest=True)
+
+        mock_analyze.assert_called_once()
+        mock_anomaly.assert_called_once()
+        assert result["status"] == "DRY_RUN"

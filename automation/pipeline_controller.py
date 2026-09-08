@@ -28,7 +28,6 @@ Design principles:
 """
 
 import json
-import hashlib
 import os
 import sys
 import time
@@ -943,6 +942,19 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
         }
         save_checkpoint(run_id, "anomaly", results["stages"]["anomaly"])
 
+        if dry_run:
+            print("\n=== DRY RUN: Skipping DB writes, evidence, and Gemini ===")
+            results["stages"]["analytics_persist"] = {"skipped": True, "reason": "dry_run"}
+            results["stages"]["evidence"] = {"skipped": True, "reason": "dry_run"}
+            results["stages"]["evidence_work_refs"] = {"skipped": True, "reason": "dry_run"}
+            results["stages"]["gemini"] = {"skipped": True, "reason": "dry_run"}
+            results["stages"]["persist"] = {"skipped": True, "reason": "dry_run"}
+            results["stages"]["verify"] = {"passed": True, "issues": []}
+            results["stages"]["cleanup"] = {"skipped": True, "reason": "dry_run"}
+            results["status"] = "DRY_RUN"
+            results["completed_at"] = _now_iso()
+            return results
+
         # Stage 7b: Persist analytics to DB2
         analytics_result = stage_analytics_persist(analysis_result, anomaly_result)
         results["stages"]["analytics_persist"] = analytics_result
@@ -961,16 +973,6 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
         )
         results["stages"]["evidence_work_refs"] = work_refs_result
         save_checkpoint(run_id, "evidence_work_refs", work_refs_result)
-
-        if dry_run:
-            print("\n=== DRY RUN: Skipping DB writes and Gemini ===")
-            results["stages"]["gemini"] = {"skipped": True, "reason": "dry_run"}
-            results["stages"]["persist"] = {"skipped": True, "reason": "dry_run"}
-            results["stages"]["verify"] = {"passed": True, "issues": []}
-            results["stages"]["cleanup"] = {"skipped": True, "reason": "dry_run"}
-            results["status"] = "DRY_RUN"
-            results["completed_at"] = _now_iso()
-            return results
 
         # Stage 9: Gemini
         if skip_gemini:
