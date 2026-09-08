@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 FETCHER = ROOT / "fetcher" / "fetcher.py"
 COMPARATOR = ROOT / "comparator" / "comparator_v2.py"
 
-sys.path.insert(0, str(ROOT / "automation"))
-from snapshot_cache import (
+sys.path.insert(0, str(ROOT))
+from automation.snapshot_cache import (
     get_previous_local_path,
     get_previous_timestamp,
     get_current_timestamp,

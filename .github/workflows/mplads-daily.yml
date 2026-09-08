@@ -9,8 +9,8 @@ on:
         default: '24'
 
   schedule:
-    # 00:00 UTC = 05:30 IST
-    - cron: "0 0 * * *"
+    # 18:30 UTC = 00:00 IST (midnight Indian Standard Time)
+    - cron: "30 18 * * *"
 
 concurrency:
   group: mplads-daily-pipeline
@@ -53,8 +53,8 @@ jobs:
         run: |
           python3 -c "
           import sys, json
-          sys.path.insert(0, 'automation')
-          from snapshot_cache import validate_cache, get_previous_timestamp, get_current_timestamp
+          sys.path.insert(0, '.')
+          from automation.snapshot_cache import validate_cache, get_previous_timestamp, get_current_timestamp
           from pathlib import Path
 
           work_dir = Path('/tmp/mplads-work')
@@ -101,8 +101,8 @@ jobs:
         run: |
           python3 -c "
           import sys
-          sys.path.insert(0, 'automation')
-          from snapshot_cache import validate_cache, get_previous_timestamp, get_current_timestamp
+          sys.path.insert(0, '.')
+          from automation.snapshot_cache import validate_cache, get_previous_timestamp, get_current_timestamp
           from pathlib import Path
 
           work_dir = Path('/tmp/mplads-work')
@@ -186,8 +186,8 @@ jobs:
         run: |
           python3 -c "
           import sys, shutil
-          sys.path.insert(0, 'automation')
-          from snapshot_cache import (
+          sys.path.insert(0, '.')
+          from automation.snapshot_cache import (
               get_previous_timestamp, get_current_timestamp,
               write_metadata
           )
