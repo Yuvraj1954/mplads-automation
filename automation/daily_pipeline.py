@@ -144,6 +144,31 @@ def list_complete_snapshots():
     return sorted(snapshots)
 
 
+def select_previous_snapshot(all_snapshots, current_ts):
+    """Select the correct previous snapshot from a list of complete snapshots.
+
+    Returns the newest valid snapshot whose timestamp is strictly less than
+    current_ts. Never returns the current snapshot as its own previous.
+
+    Args:
+        all_snapshots: sorted list of complete snapshot timestamps (ascending)
+        current_ts: the newly fetched snapshot timestamp to exclude
+
+    Returns:
+        (timestamp, error_message) — timestamp is the selection or None on failure
+    """
+    candidates = [s for s in all_snapshots if s < current_ts]
+    if not candidates:
+        return None, (
+            f"No valid snapshot older than current ({current_ts}). "
+            f"Only found: {all_snapshots}"
+        )
+    selected = candidates[-1]
+    print(f"Current snapshot: {current_ts}")
+    print(f"Supabase fallback previous: {selected}")
+    return selected, None
+
+
 def assert_snapshot_complete(timestamp):
     marker = sb.storage.from_(BUCKET).download(f"{timestamp}/_COMPLETE.json")
     data = json.loads(marker.decode("utf-8"))
@@ -500,9 +525,9 @@ def main():
     if not old_timestamp:
         print("Previous snapshot from Supabase Storage (fallback)")
         snapshots = list_complete_snapshots()
-        if snapshots:
-            old_timestamp = snapshots[-1]
-            print(f"Previous snapshot from Supabase: {old_timestamp}")
+        old_timestamp, sel_err = select_previous_snapshot(snapshots, new_ts)
+        if sel_err:
+            print(f"WARNING: {sel_err}")
 
     if not old_timestamp:
         print("No previous snapshot found. Bootstrap mode — nothing to compare.")
@@ -510,6 +535,14 @@ def main():
             _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
             _cleanup_local_snapshot(local_snapshot_path)
         return
+
+    if old_timestamp == new_ts:
+        raise RuntimeError(
+            f"CRITICAL: Previous snapshot ({old_timestamp}) is identical to "
+            f"current snapshot ({new_ts}). This means the pipeline would compare "
+            "a snapshot with itself, producing false 0-change results. "
+            "This should never happen — the fallback selector is broken."
+        )
 
     print("=== STEP 3: COMPARE ===")
     if not local_snapshot_path:
