@@ -7,6 +7,11 @@ on:
         description: 'Sync interval in hours (default: 24)'
         required: false
         default: '24'
+      bootstrap:
+        description: 'One-time NEW DB bootstrap from cached snapshot (default: false)'
+        required: false
+        type: boolean
+        default: false
 
   schedule:
     # 18:30 UTC = 00:00 IST (midnight Indian Standard Time)
@@ -145,6 +150,7 @@ jobs:
       # RUN PIPELINE
       # ===========================================================
       - name: Run complete MPLADS pipeline
+        if: ${{ github.event.inputs.bootstrap != 'true' }}
         working-directory: ${{ github.workspace }}/repo
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -158,11 +164,24 @@ jobs:
           USE_SUPABASE_FALLBACK: ${{ steps.strategy.outputs.use_supabase_fallback }}
         run: python automation/daily_pipeline.py
 
+      - name: Run bootstrap (one-time NEW DB initialization)
+        if: ${{ github.event.inputs.bootstrap == 'true' }}
+        working-directory: ${{ github.workspace }}/repo
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DB2_URL: ${{ secrets.DB2_URL }}
+          DB2_SERVICE_ROLE_KEY: ${{ secrets.DB2_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
+        run: python automation/daily_pipeline.py --bootstrap
+
       # ===========================================================
       # READ NEW TIMESTAMP: Pipeline wrote .new_timestamp on success
       # ===========================================================
       - name: Read new snapshot timestamp
-        if: success()
+        if: success() && github.event.inputs.bootstrap != 'true'
         id: new-ts
         run: |
           NEW_TS_FILE="/tmp/mplads-work/.new_timestamp"
@@ -179,7 +198,7 @@ jobs:
       # ROTATE: On success — move current → previous
       # ===========================================================
       - name: Rotate snapshots
-        if: success() && steps.new-ts.outputs.new_ts != ''
+        if: success() && steps.new-ts.outputs.new_ts != '' && github.event.inputs.bootstrap != 'true'
         working-directory: ${{ github.workspace }}/repo
         env:
           MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
@@ -232,7 +251,7 @@ jobs:
       # SAVE: New immutable cache key using snapshot timestamp
       # ===========================================================
       - name: Save snapshot cache
-        if: success() && steps.new-ts.outputs.new_ts != ''
+        if: success() && steps.new-ts.outputs.new_ts != '' && github.event.inputs.bootstrap != 'true'
         uses: actions/cache/save@v4
         with:
           path: /tmp/mplads-work
@@ -242,7 +261,7 @@ jobs:
       # CLEANUP: Best-effort old cache entries
       # ===========================================================
       - name: Cleanup old cache entries
-        if: success()
+        if: success() && github.event.inputs.bootstrap != 'true'
         continue-on-error: true
         run: |
           echo "Cache cleanup is best-effort — never blocks pipeline"
