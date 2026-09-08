@@ -133,12 +133,16 @@ def load_config(require_db2=True):
     # Validation
     if not cfg.db1_url or not cfg.db1_key:
         raise RuntimeError(
-            "Missing DB1 credentials. Set DB1_URL and DB1_SERVICE_ROLE_KEY in .env"
+            "Missing DB1 credentials. "
+            "Set DB1_URL and DB1_SERVICE_ROLE_KEY as environment variables "
+            "or in a .env file"
         )
 
     if require_db2 and not cfg.db2_ready:
         raise RuntimeError(
-            "Missing DB2 credentials. Set DB2_URL and DB2_SERVICE_ROLE_KEY in .env"
+            "Missing DB2 credentials. "
+            "Set DB2_URL and DB2_SERVICE_ROLE_KEY as environment variables "
+            "(e.g. GitHub Actions secrets) or in a .env file"
         )
 
     _config = cfg

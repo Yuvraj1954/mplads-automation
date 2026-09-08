@@ -207,6 +207,97 @@ class TestDBConfigSeparation:
         src = (ROOT / "automation" / "pipeline_controller.py").read_text()
         assert "get_db1()" in src or "get_db2()" in src
 
+    def test_github_actions_env_vars_work(self, monkeypatch):
+        """GitHub Actions step env vars (DB2_URL, DB2_SERVICE_ROLE_KEY) are correctly read."""
+        from automation import db_config
+        from unittest.mock import patch
+        monkeypatch.setenv("SUPABASE_URL", "https://db1-actions.supabase.co")
+        monkeypatch.setenv("SUPABASE_SECRET_KEY", "db1_actions_key")
+        monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "db1_actions_service")
+        monkeypatch.setenv("DB2_URL", "https://db2-actions.supabase.co")
+        monkeypatch.setenv("DB2_SERVICE_ROLE_KEY", "db2_actions_service_key")
+        monkeypatch.delenv("DB1_URL", raising=False)
+        monkeypatch.delenv("DB1_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.delenv("DB2_SECRET_KEY", raising=False)
+        monkeypatch.setattr(db_config, "_config", None)
+        with patch("dotenv.load_dotenv"):
+            cfg = db_config.load_config(require_db2=True)
+        assert cfg.db2_url == "https://db2-actions.supabase.co"
+        assert cfg.db2_key == "db2_actions_service_key"
+        assert cfg.db2_ready is True
+
+    def test_missing_db2_error_mentions_env_vars(self, monkeypatch):
+        """Error message for missing DB2 mentions environment variables, not just .env."""
+        from automation import db_config
+        from unittest.mock import patch
+        monkeypatch.setenv("DB1_URL", "https://db1.supabase.co")
+        monkeypatch.setenv("DB1_SERVICE_ROLE_KEY", "db1_key")
+        monkeypatch.delenv("DB2_URL", raising=False)
+        monkeypatch.delenv("DB2_SUPABASE_URL", raising=False)
+        monkeypatch.delenv("DB2_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.delenv("DB2_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.delenv("DB2_SECRET_KEY", raising=False)
+        monkeypatch.setattr(db_config, "_config", None)
+        with patch("dotenv.load_dotenv"):
+            with pytest.raises(RuntimeError, match="environment variables"):
+                db_config.load_config(require_db2=True)
+
+    def test_no_credentials_in_error_messages(self, monkeypatch):
+        """Error messages must not contain credential values."""
+        from automation import db_config
+        from unittest.mock import patch
+        monkeypatch.delenv("DB1_URL", raising=False)
+        monkeypatch.delenv("SUPABASE_URL", raising=False)
+        monkeypatch.delenv("DB1_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.delenv("DB1_SECRET_KEY", raising=False)
+        monkeypatch.delenv("SUPABASE_SECRET_KEY", raising=False)
+        monkeypatch.setattr(db_config, "_config", None)
+        with patch("dotenv.load_dotenv"):
+            try:
+                db_config.load_config(require_db2=False)
+            except RuntimeError as e:
+                msg = str(e)
+                assert "eyJ" not in msg
+                assert "sb_secret" not in msg
+                assert "supabase.co" not in msg
+
+    def test_dotenv_does_not_override_existing_env(self, monkeypatch):
+        """load_dotenv(override=False) does not overwrite GitHub Actions env vars."""
+        from automation import db_config
+        from unittest.mock import patch
+        monkeypatch.setenv("DB1_URL", "https://db1-env.supabase.co")
+        monkeypatch.setenv("DB1_SERVICE_ROLE_KEY", "env_key")
+        monkeypatch.setenv("DB2_URL", "https://db2-env.supabase.co")
+        monkeypatch.setenv("DB2_SERVICE_ROLE_KEY", "env_db2_key")
+        monkeypatch.setattr(db_config, "_config", None)
+        with patch("dotenv.load_dotenv"):
+            cfg = db_config.load_config(require_db2=True)
+        assert cfg.db2_url == "https://db2-env.supabase.co"
+        assert cfg.db2_key == "env_db2_key"
+
+    def test_db1_config_unaffected_by_db2_changes(self, monkeypatch):
+        """DB1 configuration remains working regardless of DB2 changes."""
+        from automation import db_config
+        from unittest.mock import patch
+        monkeypatch.setenv("SUPABASE_URL", "https://db1-new.supabase.co")
+        monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "db1_new_key")
+        monkeypatch.delenv("DB1_URL", raising=False)
+        monkeypatch.delenv("DB1_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.delenv("DB1_SECRET_KEY", raising=False)
+        monkeypatch.delenv("DB2_URL", raising=False)
+        monkeypatch.delenv("DB2_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.delenv("DB2_SECRET_KEY", raising=False)
+        monkeypatch.delenv("DB2_SUPABASE_URL", raising=False)
+        monkeypatch.delenv("DB2_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.setattr(db_config, "_config", None)
+        with patch("dotenv.load_dotenv"):
+            cfg = db_config.load_config(require_db2=False)
+        assert cfg.db1_url == "https://db1-new.supabase.co"
+        assert cfg.db1_key == "db1_new_key"
+        assert cfg.db1_ready is True
+        assert cfg.db2_ready is False
+
 
 # ============================================================
 # TEST 2: DB1 SOURCE READS
