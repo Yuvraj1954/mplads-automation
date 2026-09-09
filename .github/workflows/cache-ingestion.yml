@@ -31,6 +31,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r "${{ github.workspace }}/repo/requirements.txt"
 
+      - name: Extract timestamp
+        id: ts
+        run: echo "timestamp=$(basename '${{ inputs.snapshot_path }}')" >> "$GITHUB_OUTPUT"
+
       # ===========================================================
       # VALIDATE: Check source snapshot has valid _COMPLETE.json
       # ===========================================================
@@ -64,7 +68,6 @@ jobs:
           datasets = data.get('datasets', {})
           print(f'_COMPLETE.json valid: status=complete, datasets={len(datasets)}')
 
-          # Check part file counts match
           total_chunks = 0
           for ds_name, ds_info in datasets.items():
               expected = ds_info.get('chunks', 0)
@@ -87,8 +90,8 @@ jobs:
       - name: Stage snapshot for cache
         run: |
           SNAPSHOT_PATH="${{ inputs.snapshot_path }}"
+          TIMESTAMP="${{ steps.ts.outputs.timestamp }}"
           CACHE_DIR="/tmp/mplads-work"
-          TIMESTAMP=$(basename "$SNAPSHOT_PATH")
 
           echo "Staging snapshot: $TIMESTAMP"
           echo "Source: $SNAPSHOT_PATH"
@@ -97,7 +100,6 @@ jobs:
           mkdir -p "$CACHE_DIR/current"
           cp -r "$SNAPSHOT_PATH" "$CACHE_DIR/current/$TIMESTAMP"
 
-          # Write metadata
           echo "$TIMESTAMP" > "$CACHE_DIR/.new_timestamp"
           python3 -c "
           import json
@@ -107,7 +109,6 @@ jobs:
           print(f'Metadata written: {json.dumps(meta)}')
           "
 
-          # Verify _COMPLETE.json is in the staged copy
           if [ ! -f "$CACHE_DIR/current/$TIMESTAMP/_COMPLETE.json" ]; then
             echo "FATAL: _COMPLETE.json missing in staged copy"
             exit 1
@@ -117,31 +118,32 @@ jobs:
 
       # ===========================================================
       # SAVE: Upload to GitHub Actions cache
-        #
-        # Key: mplads-snapshot-state-<timestamp>
-        # Immutable — cannot overwrite existing entry with same key.
-        # If this key already exists, the save is a no-op (not an error).
-        # The restore uses prefix match, so it will find this entry.
+      #
+      # Key: mplads-snapshot-state-<timestamp>
+      # Immutable — cannot overwrite existing entry with same key.
+      # If this key already exists, the save is a no-op (not an error).
+      # The restore uses prefix match, so it will find this entry.
       # ===========================================================
       - name: Save to GitHub Actions cache
         uses: actions/cache/save@v4
         with:
           path: /tmp/mplads-work
-          key: mplads-snapshot-state-${{ inputs.snapshot_path | basename }}
+          key: mplads-snapshot-state-${{ steps.ts.outputs.timestamp }}
 
       # ===========================================================
       # VERIFY: Read back and confirm cache entry exists
       # ===========================================================
       - name: Verify cache was saved
         run: |
+          TIMESTAMP="${{ steps.ts.outputs.timestamp }}"
           echo "Cache save completed."
           echo ""
-          echo "Cache key: mplads-snapshot-state-${{ inputs.snapshot_path | basename }}"
+          echo "Cache key: mplads-snapshot-state-$TIMESTAMP"
           echo ""
           echo "To verify from a fresh workflow run:"
           echo "  1. Trigger the daily pipeline workflow"
           echo "  2. Check 'Restore snapshot cache (attempt 1)' step output"
-          echo "  3. It should show 'Cache valid: previous=..., current=${{ inputs.snapshot_path | basename }}'"
+          echo "  3. It should show 'Cache valid: previous=..., current=$TIMESTAMP'"
           echo ""
           echo "The daily pipeline will now find this cache entry via prefix match"
           echo "on 'mplads-snapshot-state-' and use it as the previous snapshot."
