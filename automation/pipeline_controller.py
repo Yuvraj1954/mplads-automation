@@ -879,18 +879,26 @@ def stage_evidence_work_refs(evidence_records, work_analyses):
     return {"written": written}
 
 
-def stage_gemini(evidence_records, api_keys=None):
-    """Stage 9: Process evidence through Gemini (affected-only).
+def stage_gemini(evidence_records, api_keys=None, models=None):
+    """Stage 9: Process evidence through Gemini (affected-only, parallel).
 
     Only processes entities whose evidence_hash has changed since
     last analysis. Uses idempotency via evidence_hash + prompt_version.
+    Processes evidence in parallel across multiple API keys and models
+    with bounded concurrency and per-lane rate limiting.
+
+    Args:
+        evidence_records: list of evidence record dicts
+        api_keys: list of API key strings (default: from config)
+        models: list of model names (default: ["gemini-3.1-flash-lite"])
 
     Returns:
         dict with processing stats
     """
-    from analysis.gemini_processor import GeminiProcessor, filter_affected
+    from analysis.gemini_scheduler import GeminiScheduler
+    from analysis.gemini_processor import filter_affected
 
-    print("\n=== STAGE 9: GEMINI ===")
+    print("\n=== STAGE 9: GEMINI (Parallel) ===")
 
     cfg = get_config()
     keys = api_keys or cfg.gemini_keys
@@ -915,7 +923,13 @@ def stage_gemini(evidence_records, api_keys=None):
         return {"processed": 0, "skipped": len(evidence_records),
                 "success": 0, "failed": 0}
 
-    processor = GeminiProcessor(api_keys=keys)
+    scheduler = GeminiScheduler(
+        api_keys=keys,
+        models=models,
+        rpm_per_lane=15,
+        max_workers=8,
+        max_attempts=3,
+    )
 
     def on_success(result):
         # Persist to DB2 via upsert (idempotent on entity_type + entity_id)
@@ -930,10 +944,11 @@ def stage_gemini(evidence_records, api_keys=None):
             "generated_at": result.generated_at,
         }], conflict_cols=["entity_type", "entity_id"])
 
-    batch_result = processor.process_batch(affected, on_success=on_success)
+    batch_result = scheduler.process(affected, on_success=on_success)
 
     print(f"  Successful: {batch_result['success_count']}")
     print(f"  Failed: {batch_result['failure_count']}")
+    print(f"  Retries: {batch_result.get('retries', 0)}")
 
     return {
         "processed": len(affected),

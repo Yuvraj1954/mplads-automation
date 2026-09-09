@@ -1114,7 +1114,7 @@ class TestUpsertIdempotency:
                      "evidence_version": 2, "entity_name": "Test MP",
                      "evidence": {"portfolio": {"total_works": 30}}}]
 
-        mock_processor = MagicMock()
+        mock_scheduler = MagicMock()
         mock_result = MagicMock()
         mock_result.entity_type = "MP"
         mock_result.entity_id = 1
@@ -1124,20 +1124,20 @@ class TestUpsertIdempotency:
         mock_result.generated_at = "2026-01-01T00:00:00+00:00"
         mock_result.to_analysis_text.return_value = '{"summary":"test","highlights":[],"cautions":[]}'
 
-        def fake_process_batch(evidence_rows, on_success=None, on_failure=None):
+        def fake_process(evidence_rows, on_success=None):
             if on_success:
                 on_success(mock_result)
             return {
                 "results": [mock_result], "success_count": 1,
-                "failure_count": 0, "failures": [],
+                "failure_count": 0, "failures": [], "retries": 0,
             }
 
-        mock_processor.process_batch.side_effect = fake_process_batch
+        mock_scheduler.process.side_effect = fake_process
 
         with patch("automation.pipeline_controller.get_config", return_value=mock_cfg):
             with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
                 with patch("automation.pipeline_controller.load_table", return_value=[]):
-                    with patch("analysis.gemini_processor.GeminiProcessor", return_value=mock_processor):
+                    with patch("analysis.gemini_scheduler.GeminiScheduler", return_value=mock_scheduler):
                         with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
                             stage_gemini(evidence, api_keys=["fake_key"])
 
@@ -1185,7 +1185,7 @@ class TestUpsertIdempotency:
         assert result["skipped"] == 1
 
     def test_ai_analysis_changed_evidence_triggers_reprocess(self):
-        """Changed evidence_hash triggers re-processing and upsert."""
+        """Changed evidence_hash triggers Gemini reprocessing."""
         from automation.pipeline_controller import stage_gemini
         from unittest.mock import patch, MagicMock
 
@@ -1197,7 +1197,7 @@ class TestUpsertIdempotency:
                      "evidence_version": 2, "entity_name": "Test MP",
                      "evidence": {"portfolio": {"total_works": 30}}}]
 
-        mock_processor = MagicMock()
+        mock_scheduler = MagicMock()
         mock_result = MagicMock()
         mock_result.entity_type = "MP"
         mock_result.entity_id = 1
@@ -1207,15 +1207,15 @@ class TestUpsertIdempotency:
         mock_result.generated_at = "2026-01-01T00:00:00+00:00"
         mock_result.to_analysis_text.return_value = '{"summary":"updated","highlights":[],"cautions":[]}'
 
-        def fake_process_batch(evidence_rows, on_success=None, on_failure=None):
+        def fake_process(evidence_rows, on_success=None):
             if on_success:
                 on_success(mock_result)
             return {
                 "results": [mock_result], "success_count": 1,
-                "failure_count": 0, "failures": [],
+                "failure_count": 0, "failures": [], "retries": 0,
             }
 
-        mock_processor.process_batch.side_effect = fake_process_batch
+        mock_scheduler.process.side_effect = fake_process
 
         with patch("automation.pipeline_controller.get_config", return_value=mock_cfg):
             with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
@@ -1223,7 +1223,7 @@ class TestUpsertIdempotency:
                     {"entity_type": "MP", "entity_id": 1,
                      "evidence_hash": "old_hash", "prompt_version": "gemini_analysis_v5"},
                 ]):
-                    with patch("analysis.gemini_processor.GeminiProcessor", return_value=mock_processor):
+                    with patch("analysis.gemini_scheduler.GeminiScheduler", return_value=mock_scheduler):
                         with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
                             result = stage_gemini(evidence, api_keys=["fake_key"])
 
@@ -2299,7 +2299,7 @@ class TestGeminiReprocessing:
                      "evidence_version": 2, "entity_name": "Test MP",
                      "evidence": {"portfolio": {"total_works": 30}}}]
 
-        mock_processor = MagicMock()
+        mock_scheduler = MagicMock()
         mock_result = MagicMock()
         mock_result.entity_type = "MP"
         mock_result.entity_id = 1
@@ -2309,18 +2309,18 @@ class TestGeminiReprocessing:
         mock_result.generated_at = "2026-01-01T00:00:00+00:00"
         mock_result.to_analysis_text.return_value = '{"summary":"test","highlights":[],"cautions":[]}'
 
-        def fake_process_batch(evidence_rows, on_success=None, on_failure=None):
+        def fake_process(evidence_rows, on_success=None):
             if on_success:
                 on_success(mock_result)
             return {"results": [mock_result], "success_count": 1,
-                    "failure_count": 0, "failures": []}
+                    "failure_count": 0, "failures": [], "retries": 0}
 
-        mock_processor.process_batch.side_effect = fake_process_batch
+        mock_scheduler.process.side_effect = fake_process
 
         with patch("automation.pipeline_controller.get_config", return_value=mock_cfg):
             with patch("automation.pipeline_controller.get_db2", return_value=mock_db2):
                 with patch("automation.pipeline_controller.load_table", return_value=[]):
-                    with patch("analysis.gemini_processor.GeminiProcessor", return_value=mock_processor):
+                    with patch("analysis.gemini_scheduler.GeminiScheduler", return_value=mock_scheduler):
                         with patch("automation.pipeline_controller.sb_upsert", return_value=200) as mock_upsert:
                             stage_gemini(evidence, api_keys=["fake_key"])
 
