@@ -37,6 +37,7 @@ jobs:
       # DOWNLOAD: Get the tarball from the GitHub release
       # ===========================================================
       - name: Download tarball from release
+        id: download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
