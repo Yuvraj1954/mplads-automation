@@ -99,7 +99,6 @@ EXPECTED_DATASETS = [
     "mla_calamity",
 ]
 
-
 def validate_local_snapshot(path):
     """Validate that the local snapshot directory has the expected structure."""
     p = Path(path)
@@ -125,6 +124,170 @@ def validate_local_snapshot(path):
     
     print(f"Local snapshot validated: {p}")
     print(f"Found datasets: {found_datasets}")
+
+
+def validate_complete_snapshot(path):
+    """Strict local snapshot validation before any remote write or promotion.
+
+    Checks all 12 datasets, _COMPLETE.json, manifests, NDJSON parseability,
+    chunk/file consistency, and record count consistency.
+    Raises RuntimeError on any validation failure.
+    """
+    p = Path(path)
+    errors = []
+
+    if not p.exists():
+        raise RuntimeError(f"Snapshot path does not exist: {p}")
+    if not p.is_dir():
+        raise RuntimeError(f"Snapshot path is not a directory: {p}")
+
+    # --- _COMPLETE.json validation ---
+    complete_file = p / "_COMPLETE.json"
+    if not complete_file.exists():
+        raise RuntimeError(f"Missing _COMPLETE.json in {p}")
+    try:
+        data = json.loads(complete_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid _COMPLETE.json: {exc}")
+    if data.get("status") != "complete":
+        raise RuntimeError(
+            f"_COMPLETE.json status is not 'complete': {data.get('status')}"
+        )
+    marker_datasets = data.get("datasets", {})
+
+    # --- Per-dataset validation ---
+    total_parts = 0
+    total_records = 0
+    for ds in EXPECTED_DATASETS:
+        ds_dir = p / ds
+        if not ds_dir.is_dir():
+            errors.append(f"Missing dataset directory: {ds}")
+            continue
+
+        part_files = sorted(ds_dir.glob("part_*.ndjson"))
+        if not part_files:
+            errors.append(f"No part_*.ndjson files in {ds}")
+            continue
+        total_parts += len(part_files)
+
+        # Validate each NDJSON file is parseable
+        for pf in part_files:
+            try:
+                with open(pf, "r", encoding="utf-8") as f:
+                    for i, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            errors.append(
+                                f"Invalid NDJSON at {ds}/{pf.name}:{i}: {exc}"
+                            )
+                            break
+            except Exception as exc:
+                errors.append(f"Cannot read {ds}/{pf.name}: {exc}")
+
+        # Validate manifest.json
+        manifest_file = ds_dir / "manifest.json"
+        if manifest_file.exists():
+            try:
+                mf = json.loads(manifest_file.read_text(encoding="utf-8"))
+                if "records" not in mf or "chunks" not in mf:
+                    errors.append(f"Manifest missing records/chunks in {ds}")
+                elif not isinstance(mf["records"], int) or not isinstance(
+                    mf["chunks"], int
+                ):
+                    errors.append(f"Manifest records/chunks not int in {ds}")
+                else:
+                    total_records += mf["records"]
+            except (json.JSONDecodeError, ValueError) as exc:
+                errors.append(f"Invalid manifest.json in {ds}: {exc}")
+
+    if errors:
+        raise RuntimeError(
+            f"Snapshot validation failed ({len(errors)} issues):\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    # --- Record count consistency check ---
+    marker_total_records = sum(
+        v.get("records", 0) for v in marker_datasets.values() if isinstance(v, dict)
+    )
+    if marker_datasets and total_records > 0 and marker_total_records > 0:
+        if total_records != marker_total_records:
+            errors.append(
+                f"Record count mismatch: manifests={total_records}, "
+                f"_COMPLETE.json={marker_total_records}"
+            )
+
+    # --- Part file count consistency check ---
+    marker_total_chunks = sum(
+        v.get("chunks", 0) for v in marker_datasets.values() if isinstance(v, dict)
+    )
+    if marker_datasets and marker_total_chunks > 0:
+        if total_parts != marker_total_chunks:
+            errors.append(
+                f"Part file count mismatch: actual={total_parts}, "
+                f"_COMPLETE.json={marker_total_chunks}"
+            )
+
+    if errors:
+        raise RuntimeError(
+            f"Snapshot validation failed ({len(errors)} issues):\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    print(f"Strict snapshot validation PASSED: {p}")
+    print(f"  Datasets: {len(EXPECTED_DATASETS)}, Parts: {total_parts}, "
+          f"Records: {total_records}")
+
+
+def validate_remote_snapshot(timestamp):
+    """Verify snapshot completeness in Supabase Storage via metadata/list only.
+
+    Downloads only _COMPLETE.json (small). Uses list() to verify files exist.
+    Avoids downloading content files.
+    """
+    storage = sb.storage.from_(BUCKET)
+
+    # 1. Verify _COMPLETE.json exists and is complete
+    try:
+        marker_bytes = storage.download(f"{timestamp}/_COMPLETE.json")
+        marker = json.loads(marker_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Remote snapshot {timestamp}: _COMPLETE.json missing or invalid: {exc}"
+        )
+    if marker.get("status") != "complete":
+        raise RuntimeError(
+            f"Remote snapshot {timestamp}: _COMPLETE.json status is "
+            f"'{marker.get('status')}', expected 'complete'"
+        )
+
+    remote_datasets = marker.get("datasets", {})
+
+    # 2. Verify files exist using list (metadata-only, no downloads)
+    for ds_name, ds_info in remote_datasets.items():
+        expected_chunks = ds_info.get("chunks", 0)
+        if expected_chunks <= 0:
+            continue
+        try:
+            rows = storage.list(f"{timestamp}/{ds_name}", {"limit": 1000, "offset": 0})
+            actual_parts = sum(
+                1 for r in (rows or [])
+                if r.get("name", "").startswith("part_")
+                and r.get("name", "").endswith(".ndjson")
+            )
+        except Exception:
+            actual_parts = 0
+        if actual_parts < expected_chunks:
+            raise RuntimeError(
+                f"Remote snapshot {timestamp}: {ds_name} has {actual_parts} "
+                f"parts, expected {expected_chunks}"
+            )
+
+    print(f"Remote snapshot validation PASSED: {timestamp}")
 
 
 def list_complete_snapshots():
@@ -499,6 +662,27 @@ def main():
     new_ts = os.path.basename(local_snapshot_path) if local_snapshot_path else None
     timing["fetch"] = _elapsed(t_fetch)
 
+    # Write snapshot timestamp early so workflow cleanup can find it on failure
+    if new_ts and cache_work_dir:
+        ts_file = Path(cache_work_dir) / ".current_snapshot_ts"
+        try:
+            ts_file.parent.mkdir(parents=True, exist_ok=True)
+            ts_file.write_text(new_ts, encoding="utf-8")
+        except Exception:
+            pass
+
+    # Strict local validation BEFORE any remote write trust
+    if local_snapshot_path:
+        validate_complete_snapshot(local_snapshot_path)
+
+    # Remote snapshot validation (verifies fetcher's Storage upload is complete)
+    if new_ts and not args.local_only:
+        try:
+            validate_remote_snapshot(new_ts)
+        except Exception as exc:
+            print(f"WARNING: Remote snapshot validation failed: {exc}")
+            print("Local snapshot is valid but remote upload may be incomplete.")
+
     print("=== STEP 2: GET PREVIOUS SNAPSHOT ===")
     t_compare_start = _timer()
     old_timestamp = None
@@ -507,7 +691,11 @@ def main():
     use_supabase_fallback = os.environ.get("USE_SUPABASE_FALLBACK", "false").lower() == "true"
 
     if use_supabase_fallback:
-        print("Supabase fallback requested by workflow — skipping cache")
+        print("EMERGENCY Supabase fallback requested (consecutive_failures >= 3)")
+        snapshots = list_complete_snapshots()
+        old_timestamp, sel_err = select_previous_snapshot(snapshots, new_ts)
+        if sel_err:
+            print(f"WARNING: {sel_err}")
     elif cache_work_dir:
         cache_dir = Path(cache_work_dir)
         ok, err = validate_cache(cache_dir)
@@ -523,11 +711,15 @@ def main():
             print(f"WARNING: Cache validation failed: {err}")
 
     if not old_timestamp:
-        print("Previous snapshot from Supabase Storage (fallback)")
-        snapshots = list_complete_snapshots()
-        old_timestamp, sel_err = select_previous_snapshot(snapshots, new_ts)
-        if sel_err:
-            print(f"WARNING: {sel_err}")
+        print("ERROR: No previous snapshot available from cache.")
+        if not use_supabase_fallback:
+            print("Supabase fallback is NOT enabled.")
+            print("Failing safely. The pipeline will retry on next scheduled run.")
+            raise RuntimeError(
+                "No valid previous snapshot from GitHub cache. "
+                "Supabase fallback is only available after 3 consecutive failures."
+            )
+        print("Supabase fallback failed too. No previous snapshot available.")
 
     if not old_timestamp:
         print("No previous snapshot found. Bootstrap mode — nothing to compare.")
@@ -691,7 +883,17 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+        print("Pipeline completed successfully.")
     except Exception as exc:
         print(f"PIPELINE FAILED: {exc}", file=sys.stderr)
         print("OLD SNAPSHOT HAS NOT BEEN DELETED", file=sys.stderr)
+        # Local cleanup only — remote cleanup handled by GitHub Actions workflow
+        if cache_work_dir:
+            ts_file = Path(cache_work_dir) / ".current_snapshot_ts"
+            if ts_file.exists():
+                try:
+                    snapshot_ts = ts_file.read_text(encoding="utf-8").strip()
+                    print(f"Failed snapshot timestamp: {snapshot_ts}")
+                except Exception:
+                    pass
         sys.exit(1)

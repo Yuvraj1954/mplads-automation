@@ -41,6 +41,32 @@ jobs:
         run: pip install -r "${{ github.workspace }}/repo/requirements.txt"
 
       # ===========================================================
+      # RESTORE FAILURE STATE: Persistent counter across runners
+      # Stored in GitHub Actions cache (separate from snapshot cache).
+      # First run: defaults to 0. Survives runner restarts.
+      # ===========================================================
+      - name: Restore failure state from cache
+        uses: actions/cache/restore@v4
+        id: failure-state-restore
+        with:
+          path: /tmp/mplads-failure-state
+          key: mplads-failure-state
+          restore-keys: mplads-failure-state
+
+      - name: Read failure state
+        id: failure-state
+        run: |
+          STATE_FILE="/tmp/mplads-failure-state/failure_state.json"
+          if [ -f "$STATE_FILE" ]; then
+            FAILURES=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('consecutive_failures', 0))")
+            echo "failures=$FAILURES" >> "$GITHUB_OUTPUT"
+            echo "Consecutive failures restored: $FAILURES"
+          else
+            echo "failures=0" >> "$GITHUB_OUTPUT"
+            echo "No failure state found — defaulting to 0"
+          fi
+
+      # ===========================================================
       # CACHE RESTORE: Attempt 1
       # ===========================================================
       - name: Restore snapshot cache (attempt 1)
@@ -205,7 +231,19 @@ jobs:
           "
 
       # ===========================================================
-      # SET FALLBACK FLAG: True only if both retries failed
+      # SET FALLBACK FLAG: Emergency after 3 consecutive failures
+      #
+      # State machine (consecutive_failures = completed runs that failed):
+      #   start 0 → FAIL → 1    (no fallback)
+      #   start 1 → FAIL → 2    (no fallback)
+      #   start 2 → FAIL → 3    (no fallback)
+      #   start 3 → EMERGENCY   (Supabase recovery attempt)
+      #     if succeeds → 0
+      #     if fails    → 4 (still eligible for emergency)
+      #   Any start >= 3 → EMERGENCY (until a success resets to 0)
+      #
+      # The counter reflects PREVIOUS run outcomes, read from
+      # persistent GitHub Actions cache restored at job start.
       # ===========================================================
       - name: Determine fallback strategy
         id: strategy
@@ -222,15 +260,26 @@ jobs:
             echo "use_supabase_fallback=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
           VALID_1="${{ steps.validate-1.outputs.cache_valid }}"
           VALID_2="${{ steps.validate-2.outputs.cache_valid }}"
           VALID_3="${{ steps.validate-3.outputs.cache_valid }}"
+          FAILURES="${{ steps.failure-state.outputs.failures }}"
+
           if [ "$VALID_1" == "true" ] || [ "$VALID_2" == "true" ] || [ "$VALID_3" == "true" ]; then
             echo "Cache available — normal path"
             echo "use_supabase_fallback=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Cache unavailable after 3 retries — Supabase fallback"
-            echo "use_supabase_fallback=true" >> "$GITHUB_OUTPUT"
+            echo "Cache unavailable after 3 retries."
+            echo "Failure count: $FAILURES"
+            if [ "$FAILURES" -ge 3 ] 2>/dev/null; then
+              echo "EMERGENCY: $FAILURES consecutive failures — enabling Supabase fallback"
+              echo "use_supabase_fallback=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Supabase fallback requires >= 3 consecutive failures."
+              echo "Failing safely — pipeline will retry on next scheduled run."
+              echo "use_supabase_fallback=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       # ===========================================================
@@ -265,6 +314,28 @@ jobs:
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
         run: python automation/daily_pipeline.py --bootstrap
+
+      # ===========================================================
+      # FAILED RUN CLEANUP: Delete failed snapshot from Supabase
+      # Runs only when the pipeline step fails.
+      # Idempotent: if Python already cleaned up, this safely finds
+      # nothing and continues. If Python cleanup failed, this retries.
+      # ===========================================================
+      - name: Cleanup failed snapshot from Supabase
+        if: failure() && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
+        working-directory: ${{ github.workspace }}/repo
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          SNAPSHOT_TS_FILE="/tmp/mplads-work/.current_snapshot_ts"
+          if [ -f "$SNAPSHOT_TS_FILE" ]; then
+            FAILED_TS=$(cat "$SNAPSHOT_TS_FILE")
+            echo "Cleaning up failed snapshot from Supabase: $FAILED_TS"
+            python automation/_cleanup_failed_snapshot.py "$FAILED_TS"
+          else
+            echo "No snapshot timestamp found — nothing to clean up"
+          fi
 
       # ===========================================================
       # READ NEW TIMESTAMP: Pipeline wrote .new_timestamp on success
@@ -337,7 +408,19 @@ jobs:
           "
 
       # ===========================================================
-      # SAVE: New immutable cache key using snapshot timestamp
+      # SAVE SNAPSHOT CACHE: New immutable cache key using timestamp
+      #
+      # Cache write integrity:
+      # - Candidate snapshot validated by validate_complete_snapshot()
+      #   BEFORE rotation (in pipeline STEP 2)
+      # - Immutable timestamped key: mplads-snapshot-state-<ts>
+      # - Never overwrites trusted previous cache (new key each run)
+      # - Failed run never reaches this step (only runs on success)
+      # - Restored cache always validated before use (3 attempts)
+      # - GitHub cache is immutable post-save; read-back verification
+      #   is impractical (save happens post-job). Compensation:
+      #   candidate fully validated before save, trusted previous
+      #   never modified.
       # ===========================================================
       - name: Save snapshot cache
         if: success() && steps.new-ts.outputs.new_ts != '' && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
@@ -355,3 +438,49 @@ jobs:
         run: |
           echo "Cache cleanup is best-effort — never blocks pipeline"
           echo "Old entries expire automatically per GitHub cache limits"
+
+      # ===========================================================
+      # UPDATE FAILURE STATE: Increment on failure, reset on success
+      #
+      # Runs ALWAYS (even on failure) to ensure the counter persists.
+      # Uses save-always: true on the cache save step below.
+      # ===========================================================
+      - name: Update failure state
+        if: always() && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
+        id: update-failure-state
+        run: |
+          mkdir -p /tmp/mplads-failure-state
+          PREV_FAILURES="${{ steps.failure-state.outputs.failures }}"
+          if [ -z "$PREV_FAILURES" ]; then PREV_FAILURES=0; fi
+
+          if [ "${{ job.status }}" == "success" ]; then
+            echo '{"consecutive_failures": 0, "last_updated": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
+              > /tmp/mplads-failure-state/failure_state.json
+            echo "Pipeline succeeded — counter reset to 0"
+            echo "new_failures=0" >> "$GITHUB_OUTPUT"
+          else
+            NEW_COUNT=$((PREV_FAILURES + 1))
+            echo '{"consecutive_failures": '$NEW_COUNT', "last_updated": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
+              > /tmp/mplads-failure-state/failure_state.json
+            echo "Pipeline failed — counter incremented: $PREV_FAILURES → $NEW_COUNT"
+            echo "new_failures=$NEW_COUNT" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ===========================================================
+      # SAVE FAILURE STATE: Persists across runners via cache
+      #
+      # save-always: true ensures the counter is saved even when
+      # the pipeline fails. This is critical: without it, the
+      # counter would be lost when the runner is destroyed.
+      #
+      # The key is fixed (mplads-failure-state) so each save
+      # overwrites the previous state. This is intentional —
+      # only the latest counter value matters.
+      # ===========================================================
+      - name: Save failure state to cache
+        if: always() && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/mplads-failure-state
+          key: mplads-failure-state
+          save-always: true
