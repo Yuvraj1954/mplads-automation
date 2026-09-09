@@ -31,9 +31,29 @@ jobs:
       - name: Install dependencies
         run: pip install -r "${{ github.workspace }}/repo/requirements.txt"
 
-      - name: Extract timestamp
+      - name: Extract timestamp from _COMPLETE.json
         id: ts
-        run: echo "timestamp=$(basename '${{ inputs.snapshot_path }}')" >> "$GITHUB_OUTPUT"
+        working-directory: ${{ github.workspace }}/repo
+        run: |
+          python3 -c "
+          import json, sys
+          from pathlib import Path
+
+          p = Path('${{ inputs.snapshot_path }}')
+          if not (p / '_COMPLETE.json').exists():
+              print('FATAL: _COMPLETE.json not found', file=sys.stderr)
+              sys.exit(1)
+
+          data = json.loads((p / '_COMPLETE.json').read_text())
+          ts = data.get('timestamp', '')
+          if not ts:
+              print('FATAL: timestamp field missing in _COMPLETE.json', file=sys.stderr)
+              sys.exit(1)
+
+          with open('$GITHUB_OUTPUT', 'a') as f:
+              f.write(f'timestamp={ts}\n')
+          print(f'Timestamp from _COMPLETE.json: {ts}')
+          "
 
       # ===========================================================
       # VALIDATE: Check source snapshot has valid _COMPLETE.json
