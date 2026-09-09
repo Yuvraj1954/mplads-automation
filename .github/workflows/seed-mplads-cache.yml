@@ -1,0 +1,208 @@
+name: Seed Snapshot Cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Git tag of the draft release containing the snapshot tarball'
+        required: true
+        type: string
+
+concurrency:
+  group: mplads-cache-seed
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r "${{ github.workspace }}/repo/requirements.txt"
+
+      # ===========================================================
+      # DOWNLOAD: Get the tarball from the GitHub release
+      # ===========================================================
+      - name: Download tarball from release
+        run: |
+          RELEASE_TAG="${{ inputs.release_tag }}"
+          echo "Downloading from release: $RELEASE_TAG"
+
+          # Download the tarball asset from the release
+          gh release download "$RELEASE_TAG" \
+            --pattern "*.tar.gz" \
+            --dir /tmp/seed-artifact \
+            --repo "${{ github.repository }}"
+
+          TARBALL=$(find /tmp/seed-artifact -name "*.tar.gz" | head -1)
+          if [ -z "$TARBALL" ]; then
+            echo "FATAL: No tar.gz found in release $RELEASE_TAG"
+            exit 1
+          fi
+          echo "Downloaded: $TARBALL"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      # ===========================================================
+      # EXTRACT: Unpack the tarball
+      # ===========================================================
+      - name: Extract snapshot
+        id: extract
+        run: |
+          TARBALL="${{ steps.download.outputs.tarball }}"
+          echo "Extracting: $TARBALL"
+          mkdir -p /tmp/seed-snapshot
+          tar xzf "$TARBALL" -C /tmp/seed-snapshot
+
+          SNAPSHOT_DIR=$(find /tmp/seed-snapshot -mindepth 1 -maxdepth 1 -type d | head -1)
+          if [ -z "$SNAPSHOT_DIR" ]; then
+            echo "FATAL: No snapshot directory found after extraction"
+            exit 1
+          fi
+          echo "Snapshot directory: $SNAPSHOT_DIR"
+          echo "snapshot_dir=$SNAPSHOT_DIR" >> "$GITHUB_OUTPUT"
+          ls "$SNAPSHOT_DIR"
+
+      # ===========================================================
+      # VALIDATE: Check _COMPLETE.json and snapshot structure
+      # ===========================================================
+      - name: Validate snapshot
+        id: validate
+        working-directory: ${{ github.workspace }}/repo
+        run: |
+          SNAPSHOT_DIR="${{ steps.extract.outputs.snapshot_dir }}"
+          python3 -c "
+          import sys, json
+          from pathlib import Path
+          sys.path.insert(0, '.')
+          from automation.snapshot_cache import validate_snapshot_structure
+
+          p = Path('$SNAPSHOT_DIR')
+          print(f'Validating: {p}')
+
+          complete = p / '_COMPLETE.json'
+          if not complete.exists():
+              print('FATAL: _COMPLETE.json missing')
+              sys.exit(1)
+
+          data = json.loads(complete.read_text(encoding='utf-8'))
+          if data.get('status') != 'complete':
+              print(f'FATAL: status is \"{data.get(\"status\")}\", expected \"complete\"')
+              sys.exit(1)
+
+          ts = data.get('timestamp', '')
+          print(f'Timestamp: {ts}')
+          print(f'Status: complete')
+          print(f'Datasets: {len(data.get(\"datasets\", {}))}')
+
+          ok, err = validate_snapshot_structure(p)
+          if not ok:
+              print(f'FATAL: Structure validation failed: {err}')
+              sys.exit(1)
+
+          print('Structure validation: PASS')
+
+          with open('$GITHUB_OUTPUT', 'a') as f:
+              f.write(f'timestamp={ts}\n')
+          "
+
+      # ===========================================================
+      # STAGE: Arrange in current/previous structure
+      #
+      # The daily pipeline requires BOTH previous/ and current/
+      # for affected comparison mode. We place the same snapshot
+      # in both slots. On the first normal run after seeding:
+      #   1. Pipeline fetches new snapshot
+      #   2. New snapshot goes to current/ (via _preserve_fetched_snapshot)
+      #   3. Rotation moves current/seeded → previous/seeded
+      #   4. Result: previous=seeded, current=new
+      # ===========================================================
+      - name: Stage cache structure
+        run: |
+          SNAPSHOT_DIR="${{ steps.extract.outputs.snapshot_dir }}"
+          TIMESTAMP="${{ steps.validate.outputs.timestamp }}"
+          CACHE_DIR="/tmp/mplads-work"
+
+          echo "Staging cache structure"
+          echo "Snapshot: $TIMESTAMP"
+
+          mkdir -p "$CACHE_DIR/previous"
+          mkdir -p "$CACHE_DIR/current"
+
+          cp -r "$SNAPSHOT_DIR" "$CACHE_DIR/previous/$TIMESTAMP"
+          cp -r "$SNAPSHOT_DIR" "$CACHE_DIR/current/$TIMESTAMP"
+
+          echo "$TIMESTAMP" > "$CACHE_DIR/.new_timestamp"
+          python3 -c "
+          import json
+          meta = {'previous_ts': '$TIMESTAMP', 'current_ts': '$TIMESTAMP'}
+          with open('$CACHE_DIR/.cache-metadata.json', 'w') as f:
+              json.dump(meta, f, indent=2)
+          print(f'Metadata: {json.dumps(meta)}')
+          "
+
+          for slot in previous current; do
+            if [ ! -f "$CACHE_DIR/$slot/$TIMESTAMP/_COMPLETE.json" ]; then
+              echo "FATAL: _COMPLETE.json missing in $slot/$TIMESTAMP"
+              exit 1
+            fi
+          done
+
+          echo "Cache structure staged:"
+          echo "  previous/$TIMESTAMP/ — _COMPLETE.json verified"
+          echo "  current/$TIMESTAMP/  — _COMPLETE.json verified"
+
+      # ===========================================================
+      # SAVE: Upload to GitHub Actions cache
+      # ===========================================================
+      - name: Save to GitHub Actions cache
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/mplads-work
+          key: mplads-snapshot-state-${{ steps.validate.outputs.timestamp }}
+
+      # ===========================================================
+      # CLEANUP: Delete the draft release
+      # ===========================================================
+      - name: Cleanup draft release
+        if: always()
+        continue-on-error: true
+        run: |
+          RELEASE_TAG="${{ inputs.release_tag }}"
+          echo "Cleaning up draft release: $RELEASE_TAG"
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag \
+            --repo "${{ github.repository }}" || true
+
+      # ===========================================================
+      # VERIFY: Print summary
+      # ===========================================================
+      - name: Verification summary
+        run: |
+          TIMESTAMP="${{ steps.validate.outputs.timestamp }}"
+          echo "========================================="
+          echo "  CACHE SEED COMPLETE"
+          echo "========================================="
+          echo ""
+          echo "Snapshot: $TIMESTAMP"
+          echo "_COMPLETE.json: VALID"
+          echo "Dataset validation: PASS"
+          echo "Cache staging: PASS"
+          echo "GitHub Actions cache save: SUCCESS"
+          echo "Cache key: mplads-snapshot-state-$TIMESTAMP"
+          echo ""
+          echo "Next daily pipeline run will:"
+          echo "  1. Restore cache via prefix mplads-snapshot-state-"
+          echo "  2. Find previous=$TIMESTAMP, current=$TIMESTAMP"
+          echo "  3. Fetch new snapshot -> current/<new_ts>"
+          echo "  4. Rotate: current/$TIMESTAMP -> previous/$TIMESTAMP"
+          echo "  5. Compare: previous=$TIMESTAMP vs current=<new_ts>"

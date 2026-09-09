@@ -90,9 +90,10 @@ jobs:
 
           work_dir = Path('/tmp/mplads-work')
           if not work_dir.exists():
-              print('cache_valid=false')
+              print('Cache not restored (transient failure — retry may help)')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=false\n')
+                  f.write('cache_restored=false\n')
               sys.exit(0)
 
           ok, err = validate_cache(work_dir)
@@ -102,21 +103,27 @@ jobs:
               print(f'Cache valid: previous={prev_ts}, current={curr_ts}')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=true\n')
+                  f.write('cache_restored=true\n')
           else:
-              print(f'Cache invalid: {err}')
+              print(f'Cache restored but INVALID (deterministic — retry is pointless): {err}')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=false\n')
+                  f.write('cache_restored=true\n')
           "
 
       # ===========================================================
-      # CACHE RESTORE: Attempt 2 (only if attempt 1 failed)
+      # CACHE RESTORE: Attempt 2 (only if attempt 1 transient-failed)
+      #
+      # Only retry if the cache was NOT restored (transient failure).
+      # If the cache was restored but validation failed (deterministic),
+      # retrying the same immutable cache is pointless.
       # ===========================================================
       - name: Clear invalid cache for retry
-        if: steps.validate-1.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-1.outputs.cache_restored != 'true' && github.event.inputs.bootstrap != 'true'
         run: rm -rf /tmp/mplads-work
 
       - name: Restore snapshot cache (attempt 2)
-        if: steps.validate-1.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-1.outputs.cache_restored != 'true' && github.event.inputs.bootstrap != 'true'
         uses: actions/cache/restore@v4
         id: cache-restore-2
         with:
@@ -126,7 +133,7 @@ jobs:
             mplads-snapshot-state-
 
       - name: Validate cache (attempt 2)
-        if: steps.validate-1.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-1.outputs.cache_restored != 'true' && github.event.inputs.bootstrap != 'true'
         id: validate-2
         working-directory: ${{ github.workspace }}/repo
         run: |
@@ -141,6 +148,7 @@ jobs:
               print('Cache still missing after retry')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=false\n')
+                  f.write('cache_restored=false\n')
               sys.exit(0)
 
           ok, err = validate_cache(work_dir)
@@ -150,21 +158,23 @@ jobs:
               print(f'Cache valid on retry: previous={prev_ts}, current={curr_ts}')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=true\n')
+                  f.write('cache_restored=true\n')
           else:
-              print(f'Cache still invalid after retry: {err}')
+              print(f'Cache restored but INVALID (deterministic): {err}')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=false\n')
+                  f.write('cache_restored=true\n')
           "
 
       # ===========================================================
-      # CACHE RESTORE: Attempt 3 (only if attempts 1-2 both failed)
+      # CACHE RESTORE: Attempt 3 (only if attempts 1-2 transient-failed)
       # ===========================================================
       - name: Clear invalid cache for retry 2
-        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-1.outputs.cache_restored != 'true' && steps.validate-2.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_restored != 'true' && github.event.inputs.bootstrap != 'true'
         run: rm -rf /tmp/mplads-work
 
       - name: Restore snapshot cache (attempt 3)
-        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-1.outputs.cache_restored != 'true' && steps.validate-2.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_restored != 'true' && github.event.inputs.bootstrap != 'true'
         uses: actions/cache/restore@v4
         id: cache-restore-3
         with:
@@ -174,7 +184,7 @@ jobs:
             mplads-snapshot-state-
 
       - name: Validate cache (attempt 3)
-        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-1.outputs.cache_restored != 'true' && steps.validate-2.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_restored != 'true' && github.event.inputs.bootstrap != 'true'
         id: validate-3
         working-directory: ${{ github.workspace }}/repo
         run: |
@@ -189,6 +199,7 @@ jobs:
               print('Cache still missing after retry 2')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=false\n')
+                  f.write('cache_restored=false\n')
               sys.exit(0)
 
           ok, err = validate_cache(work_dir)
@@ -198,10 +209,12 @@ jobs:
               print(f'Cache valid on retry 2: previous={prev_ts}, current={curr_ts}')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=true\n')
+                  f.write('cache_restored=true\n')
           else:
-              print(f'Cache still invalid after retry 2: {err}')
+              print(f'Cache restored but INVALID (deterministic): {err}')
               with open('$GITHUB_OUTPUT', 'a') as f:
                   f.write('cache_valid=false\n')
+                  f.write('cache_restored=true\n')
           "
 
       # ===========================================================
@@ -308,13 +321,24 @@ jobs:
           fi
 
           echo "FATAL: No valid previous trusted snapshot available."
-          echo "Cache validation failed after 3 attempts."
+          echo ""
+          # Determine failure type for diagnostics
+          R1="${{ steps.validate-1.outputs.cache_restored }}"
+          R2="${{ steps.validate-2.outputs.cache_restored }}"
+          R3="${{ steps.validate-3.outputs.cache_restored }}"
+          if [ "$R1" == "true" ] || [ "$R2" == "true" ] || [ "$R3" == "true" ]; then
+            echo "Cache was RESTORED but validation FAILED (deterministic — _COMPLETE.json missing/corrupt)."
+            echo "Retrying the same immutable cache would not help."
+          else
+            echo "Cache was NOT RESTORED (transient — network/infra failure)."
+          fi
+          echo ""
           echo "Bootstrap is disabled."
           echo "Pipeline cannot safely continue in affected mode."
           echo ""
           echo "To fix:"
-          echo "  1. Run the cache ingestion workflow to upload a valid snapshot, OR"
-          echo "  2. Trigger this workflow with bootstrap=true after cache is populated."
+          echo "  1. Run: python3 automation/seed_cache.py /path/to/snapshot_dir"
+          echo "  2. Or trigger this workflow with bootstrap=true after cache is populated."
           exit 1
 
       # ===========================================================
