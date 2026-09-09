@@ -699,6 +699,20 @@ def main():
         validate_local_snapshot(local_snapshot_path)
 
     new_ts = os.path.basename(local_snapshot_path) if local_snapshot_path else None
+
+    # Extract the clean timestamp from _COMPLETE.json for Supabase path.
+    # The directory basename has tempfile prefix/suffix (mplads_local_..._xyz)
+    # but the fetcher uploads to Supabase using the clean timestamp inside _COMPLETE.json.
+    if local_snapshot_path:
+        try:
+            complete_file = Path(local_snapshot_path) / "_COMPLETE.json"
+            if complete_file.exists():
+                marker_data = json.loads(complete_file.read_text(encoding="utf-8"))
+                clean_ts = marker_data.get("timestamp", "")
+                if clean_ts:
+                    new_ts = clean_ts
+        except Exception:
+            pass
     timing["fetch"] = _elapsed(t_fetch)
 
     # Write snapshot timestamp early so workflow cleanup can find it on failure
