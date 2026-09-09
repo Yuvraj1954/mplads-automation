@@ -34,9 +34,19 @@ REQUEST_TIMEOUT = 60
 
 class ErrorClass(Enum):
     """Classification of Gemini API errors."""
-    RETRYABLE = "retryable"          # 429, 5xx, timeout, transient
-    PERMANENT = "permanent"          # 404, 400, auth error
-    UNKNOWN = "unknown"
+    SUCCESS = "success"
+    RPM_RATE_LIMITED = "rpm_rate_limited"
+    RPD_EXHAUSTED = "rpd_exhausted"
+    TEMPORARY_RATE_LIMIT = "temporary_rate_limit"
+    AUTH_ERROR = "auth_error"
+    NOT_FOUND = "not_found"
+    INVALID_REQUEST = "invalid_request"
+    SERVER_ERROR = "server_error"
+    UNKNOWN_ERROR = "unknown_error"
+
+    # Legacy enum aliases for backward compatibility
+    RETRYABLE = "retryable"
+    PERMANENT = "permanent"
 
 
 class GeminiError(Exception):
@@ -52,11 +62,30 @@ class GeminiError(Exception):
 
     @property
     def retryable(self):
-        return self.error_class == ErrorClass.RETRYABLE
+        return self.error_class in (
+            ErrorClass.RETRYABLE,
+            ErrorClass.RPM_RATE_LIMITED,
+            ErrorClass.TEMPORARY_RATE_LIMIT,
+            ErrorClass.SERVER_ERROR,
+            ErrorClass.UNKNOWN_ERROR,
+        )
 
     @property
     def permanent(self):
-        return self.error_class == ErrorClass.PERMANENT
+        return self.error_class in (
+            ErrorClass.PERMANENT,
+            ErrorClass.AUTH_ERROR,
+            ErrorClass.NOT_FOUND,
+            ErrorClass.INVALID_REQUEST,
+        )
+
+    @property
+    def rpd_exhausted(self):
+        return self.error_class == ErrorClass.RPD_EXHAUSTED
+
+    @property
+    def rpm_limited(self):
+        return self.error_class in (ErrorClass.RPM_RATE_LIMITED, ErrorClass.TEMPORARY_RATE_LIMIT)
 
     def __repr__(self):
         return (
@@ -71,6 +100,9 @@ def classify_error(exc):
     Returns:
         GeminiError with classified error type and metadata.
     """
+    if isinstance(exc, GeminiError):
+        return exc
+
     status_code = None
     retry_after = None
     message = str(exc)
@@ -94,34 +126,43 @@ def classify_error(exc):
             except (ValueError, TypeError):
                 pass
 
-    # Classify by status code
-    if status_code == 429:
-        return GeminiError(ErrorClass.RETRYABLE, status_code, message, retry_after)
+    msg_lower = message.lower()
 
-    if status_code in (400, 401, 403):
-        return GeminiError(ErrorClass.PERMANENT, status_code, message)
+    # Distinguish RPD vs RPM for 429
+    if status_code == 429:
+        if any(x in msg_lower for x in ("daily", "per day", "rpd", "daily limit", "daily quota", "quota_exceeded", "resource_exhausted", "free_tier_quota")):
+            return GeminiError(ErrorClass.RPD_EXHAUSTED, status_code, message, retry_after)
+        return GeminiError(ErrorClass.RPM_RATE_LIMITED, status_code, message, retry_after)
+
+    if status_code in (401, 403):
+        return GeminiError(ErrorClass.AUTH_ERROR, status_code, message)
+
+    if status_code == 400:
+        return GeminiError(ErrorClass.INVALID_REQUEST, status_code, message)
 
     if status_code == 404:
-        return GeminiError(ErrorClass.PERMANENT, status_code, message)
+        return GeminiError(ErrorClass.NOT_FOUND, status_code, message)
 
     if status_code and 500 <= status_code < 600:
-        return GeminiError(ErrorClass.RETRYABLE, status_code, message)
+        return GeminiError(ErrorClass.SERVER_ERROR, status_code, message)
 
-    # Timeout / connection errors
-    msg_lower = message.lower()
+    # Text-based matching fallback
+    if any(x in msg_lower for x in ("daily", "per day", "rpd", "daily limit", "daily quota")):
+        return GeminiError(ErrorClass.RPD_EXHAUSTED, status_code, message, retry_after)
+
+    if any(x in msg_lower for x in ("429", "rate limit", "rpm", "too many requests")):
+        return GeminiError(ErrorClass.RPM_RATE_LIMITED, status_code, message, retry_after)
+
     if any(x in msg_lower for x in ("timeout", "timed out", "deadline", "connection refused", "connection reset")):
-        return GeminiError(ErrorClass.RETRYABLE, status_code, message)
-
-    if any(x in msg_lower for x in ("429", "rate limit", "quota", "resource exhausted")):
-        return GeminiError(ErrorClass.RETRYABLE, status_code, message)
+        return GeminiError(ErrorClass.TEMPORARY_RATE_LIMIT, status_code, message)
 
     if any(x in msg_lower for x in ("404", "not found")):
-        return GeminiError(ErrorClass.PERMANENT, status_code, message)
+        return GeminiError(ErrorClass.NOT_FOUND, status_code, message)
 
     if any(x in msg_lower for x in ("401", "403", "unauthorized", "forbidden", "api key")):
-        return GeminiError(ErrorClass.PERMANENT, status_code, message)
+        return GeminiError(ErrorClass.AUTH_ERROR, status_code, message)
 
-    return GeminiError(ErrorClass.UNKNOWN, status_code, message)
+    return GeminiError(ErrorClass.UNKNOWN_ERROR, status_code, message)
 
 
 class GeminiClient:
@@ -144,10 +185,10 @@ class GeminiClient:
             model: override model name (optional)
 
         Returns:
-            dict: parsed JSON response from Gemini
+            dict or list: parsed JSON response from Gemini
 
         Raises:
-            GeminiError: on any failure (classified as retryable or permanent)
+            GeminiError: on any failure (classified)
         """
         use_model = model or self.model
         url = API_URL.format(model=use_model) + f"?key={api_key}"
@@ -183,7 +224,7 @@ class GeminiClient:
         )
         if not text:
             raise GeminiError(
-                ErrorClass.RETRYABLE, message="Gemini returned no text"
+                ErrorClass.TEMPORARY_RATE_LIMIT, message="Gemini returned no text"
             )
 
         from analysis.gemini_processor import clean_json
@@ -191,5 +232,6 @@ class GeminiClient:
             return clean_json(text)
         except Exception as exc:
             raise GeminiError(
-                ErrorClass.RETRYABLE, message=f"Failed to parse response: {exc}"
+                ErrorClass.TEMPORARY_RATE_LIMIT, message=f"Failed to parse response: {exc}"
             )
+

@@ -269,7 +269,7 @@ def validate_output(obj, evidence_row):
 
     required_keys = {"summary", "highlights", "cautions"}
     actual_keys = set(obj.keys())
-    extra = actual_keys - required_keys
+    extra = actual_keys - required_keys - {"entity_id"}
     missing = required_keys - actual_keys
     if extra:
         errors.append(f"Forbidden top-level fields: {extra}")
@@ -321,6 +321,154 @@ def validate_output(obj, evidence_row):
     return errors
 
 
+def build_packed_prompt(evidence_rows):
+    """Build a Gemini prompt containing up to 5 independent evidence records.
+
+    Instructs Gemini to return a strict JSON array containing exactly one
+    structured result object for every supplied record, identified by entity_id.
+    """
+    records_payload = []
+    for row in evidence_rows:
+        records_payload.append({
+            "entity_type": row["entity_type"],
+            "entity_id": str(row["entity_id"]),
+            "entity_name": row.get("entity_name") or "",
+            "evidence_version": row.get("evidence_version"),
+            "evidence_hash": row.get("evidence_hash"),
+            "evidence": row.get("evidence", {}),
+        })
+
+    packed_instruction = (
+        SYSTEM_INSTRUCTION
+        + "\n\nCRITICAL MULTI-RECORD INSTRUCTIONS:\n"
+        + f"You are processing {len(evidence_rows)} independent evidence records simultaneously.\n"
+        + "You MUST return a strict JSON ARRAY containing exactly ONE result object for every supplied record.\n"
+        + "Do NOT wrap in any outer object. Return ONLY the JSON ARRAY.\n"
+        + "Each result object MUST contain the exact 'entity_id' of the corresponding record along with 'summary', 'highlights', and 'cautions'.\n\n"
+        + "EXAMPLE OUTPUT FORMAT:\n"
+        + "[\n"
+        + '  {"entity_id": "123", "summary": "...", "highlights": ["..."], "cautions": ["..."]},\n'
+        + '  {"entity_id": "456", "summary": "...", "highlights": ["..."], "cautions": ["..."]}\n'
+        + "]\n"
+    )
+
+    return (
+        packed_instruction
+        + f"\nEVIDENCE RECORDS ({len(evidence_rows)} items):\n"
+        + json.dumps(records_payload, ensure_ascii=False, indent=2)
+    )
+
+
+def check_token_safety(evidence_rows, max_chars=40000):
+    """Ensure packed batch fits within context limits.
+
+    If prompt length exceeds max_chars, recursively splits evidence_rows into smaller sub-batches.
+    """
+    if len(evidence_rows) <= 1:
+        return [evidence_rows]
+
+    prompt = build_packed_prompt(evidence_rows)
+    if len(prompt) <= max_chars:
+        return [evidence_rows]
+
+    # Split into smaller sub-batches
+    mid = len(evidence_rows) // 2
+    left = evidence_rows[:mid]
+    right = evidence_rows[mid:]
+
+    return check_token_safety(left, max_chars) + check_token_safety(right, max_chars)
+
+
+def validate_packed_output(obj_list, evidence_rows):
+    """Validate Gemini output JSON array against submitted evidence rows.
+
+    Matches results ONLY using entity_id (never array position).
+
+    Returns:
+        tuple: (valid_results, failed_entries)
+            valid_results: list of GeminiResult objects for valid items
+            failed_entries: list of dicts with entity_type, entity_id, evidence_id, reason for requeuing
+    """
+    valid_results = []
+    failed_entries = []
+
+    request_map = {str(row["entity_id"]): row for row in evidence_rows}
+    expected_ids = set(request_map.keys())
+
+    if not isinstance(obj_list, list):
+        for row in evidence_rows:
+            failed_entries.append({
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "evidence_id": row.get("evidence_id"),
+                "reason": "non_array_output",
+            })
+        return valid_results, failed_entries
+
+    seen_ids = set()
+    returned_ids = set()
+
+    for item in obj_list:
+        if not isinstance(item, dict):
+            continue
+        ent_id = str(item.get("entity_id", ""))
+        if not ent_id:
+            continue
+
+        if ent_id not in expected_ids:
+            # Unexpected entity_id (not in requested batch)
+            continue
+
+        if ent_id in seen_ids:
+            # Duplicate entity_id in response
+            row = request_map[ent_id]
+            failed_entries.append({
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "evidence_id": row.get("evidence_id"),
+                "reason": f"duplicate_entity_id_{ent_id}",
+            })
+            continue
+
+        seen_ids.add(ent_id)
+        returned_ids.add(ent_id)
+
+        row = request_map[ent_id]
+        validation_errors = validate_output(item, row)
+        if validation_errors:
+            failed_entries.append({
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "evidence_id": row.get("evidence_id"),
+                "reason": f"validation_failed: {'; '.join(validation_errors)}",
+            })
+        else:
+            res = GeminiResult(
+                entity_type=row["entity_type"],
+                entity_id=row["entity_id"],
+                summary=item["summary"],
+                highlights=item["highlights"],
+                cautions=item["cautions"],
+                evidence_hash=row.get("evidence_hash", ""),
+                model=row.get("model", MODEL_NAME),
+                prompt_version=row.get("prompt_version", PROMPT_VERSION),
+            )
+            valid_results.append(res)
+
+    # Missing entity_ids in response
+    missing_ids = expected_ids - returned_ids
+    for ent_id in missing_ids:
+        row = request_map[ent_id]
+        failed_entries.append({
+            "entity_type": row["entity_type"],
+            "entity_id": row["entity_id"],
+            "evidence_id": row.get("evidence_id"),
+            "reason": "missing_entity_id_in_response",
+        })
+
+    return valid_results, failed_entries
+
+
 def clean_json(text):
     """Extract JSON from Gemini response text."""
     text = text.strip()
@@ -332,9 +480,10 @@ def clean_json(text):
         if text.lower().startswith("json"):
             text = text[4:].strip()
     obj = json.loads(text)
-    if not isinstance(obj, dict):
-        raise ValueError("Output is not a JSON object")
+    if not isinstance(obj, (dict, list)):
+        raise ValueError("Output is not a JSON object or array")
     return obj
+
 
 
 def retryable(exc):

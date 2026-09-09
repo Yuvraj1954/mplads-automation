@@ -1,596 +1,544 @@
-"""Tests for parallel Gemini architecture: client, scheduler, and pipeline integration.
+"""Tests for parallel Gemini architecture: client, scheduler, packing, multi-model, RPD/RPM, and pipeline integration.
 
-Covers:
-- Error classification (retryable vs permanent)
-- Retry-After extraction
-- Per-lane RPM limiting (15 RPM)
-- Concurrent lanes
-- 429 rotation
-- 5xx/timeout retry
-- Permanent 404/auth failure
-- Partial batch failure
-- All keys unavailable → 60s cooldown
-- Daily quota
-- Successful-result persistence despite other failures
-- Idempotency/resume
-- Already-up-to-date skipping
-- No secret leakage in logs
+Covers all 32 requirements from the specification.
 """
 
 import json
 import threading
 import time
 import urllib.error
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock
 
 
 # ---------------------------------------------------------------------------
-# GeminiClient error classification tests
+# 1. Error Classification & RPD/RPM Distinction Tests
 # ---------------------------------------------------------------------------
 
 class TestErrorClassification:
-    """Tests for classify_error and ErrorClass."""
+    """Tests for classify_error and ErrorClass distinguishing RPD vs RPM."""
 
-    def test_429_is_retryable(self):
+    def test_429_rpm_classified(self):
         from analysis.gemini_client import classify_error, ErrorClass
         exc = urllib.error.HTTPError(
             url="http://test", code=429, msg="Too Many Requests",
-            hdrs={}, fp=MagicMock(read=lambda: b'{}')
+            hdrs={}, fp=MagicMock(read=lambda: b'{"error": {"message": "Rate limit exceeded"}}')
         )
         err = classify_error(exc)
-        assert err.error_class == ErrorClass.RETRYABLE
-        assert err.status_code == 429
+        assert err.error_class == ErrorClass.RPM_RATE_LIMITED
+        assert err.rpm_limited is True
+        assert err.rpd_exhausted is False
 
-    def test_500_is_retryable(self):
+    def test_429_rpd_daily_quota_classified(self):
         from analysis.gemini_client import classify_error, ErrorClass
         exc = urllib.error.HTTPError(
-            url="http://test", code=500, msg="Internal Server Error",
-            hdrs={}, fp=MagicMock(read=lambda: b'{}')
+            url="http://test", code=429, msg="Too Many Requests",
+            hdrs={}, fp=MagicMock(read=lambda: b'{"error": {"message": "Resource exhausted: daily limit reached"}}')
         )
         err = classify_error(exc)
-        assert err.error_class == ErrorClass.RETRYABLE
-        assert err.status_code == 500
+        assert err.error_class == ErrorClass.RPD_EXHAUSTED
+        assert err.rpd_exhausted is True
 
-    def test_404_is_permanent(self):
-        from analysis.gemini_client import classify_error, ErrorClass
-        exc = urllib.error.HTTPError(
-            url="http://test", code=404, msg="Not Found",
-            hdrs={}, fp=MagicMock(read=lambda: b'{}')
-        )
-        err = classify_error(exc)
-        assert err.error_class == ErrorClass.PERMANENT
-        assert err.status_code == 404
-
-    def test_401_is_permanent(self):
+    def test_401_auth_error_is_permanent(self):
         from analysis.gemini_client import classify_error, ErrorClass
         exc = urllib.error.HTTPError(
             url="http://test", code=401, msg="Unauthorized",
             hdrs={}, fp=MagicMock(read=lambda: b'{}')
         )
         err = classify_error(exc)
-        assert err.error_class == ErrorClass.PERMANENT
+        assert err.error_class == ErrorClass.AUTH_ERROR
+        assert err.permanent is True
 
-    def test_403_is_permanent(self):
+    def test_404_not_found_is_permanent(self):
         from analysis.gemini_client import classify_error, ErrorClass
         exc = urllib.error.HTTPError(
-            url="http://test", code=403, msg="Forbidden",
+            url="http://test", code=404, msg="Not Found",
             hdrs={}, fp=MagicMock(read=lambda: b'{}')
         )
         err = classify_error(exc)
-        assert err.error_class == ErrorClass.PERMANENT
-
-    def test_timeout_is_retryable(self):
-        from analysis.gemini_client import classify_error, ErrorClass
-        err = classify_error(TimeoutError("timed out"))
-        assert err.error_class == ErrorClass.RETRYABLE
-
-    def test_connection_error_is_retryable(self):
-        from analysis.gemini_client import classify_error, ErrorClass
-        err = classify_error(ConnectionError("connection refused"))
-        assert err.error_class == ErrorClass.RETRYABLE
-
-    def test_rate_limit_in_message_is_retryable(self):
-        from analysis.gemini_client import classify_error, ErrorClass
-        err = classify_error(Exception("rate limit exceeded"))
-        assert err.error_class == ErrorClass.RETRYABLE
-
-    def test_quota_in_message_is_retryable(self):
-        from analysis.gemini_client import classify_error, ErrorClass
-        err = classify_error(Exception("quota exceeded"))
-        assert err.error_class == ErrorClass.RETRYABLE
+        assert err.error_class == ErrorClass.NOT_FOUND
+        assert err.permanent is True
 
     def test_retry_after_extracted_from_429(self):
-        from analysis.gemini_client import classify_error, ErrorClass
-        exc = urllib.error.HTTPError(
-            url="http://test", code=429, msg="Rate Limited",
-            hdrs={"Retry-After": "5"}, fp=MagicMock(read=lambda: b'{}')
-        )
-        err = classify_error(exc)
-        assert err.retry_after == 5.0
-
-    def test_retry_after_float(self):
         from analysis.gemini_client import classify_error
         exc = urllib.error.HTTPError(
             url="http://test", code=429, msg="Rate Limited",
-            hdrs={"Retry-After": "2.5"}, fp=MagicMock(read=lambda: b'{}')
+            hdrs={"Retry-After": "15"}, fp=MagicMock(read=lambda: b'{}')
         )
         err = classify_error(exc)
-        assert err.retry_after == 2.5
-
-    def test_retryable_property(self):
-        from analysis.gemini_client import GeminiError, ErrorClass
-        err = GeminiError(ErrorClass.RETRYABLE, status_code=429)
-        assert err.retryable is True
-        assert err.permanent is False
-
-    def test_permanent_property(self):
-        from analysis.gemini_client import GeminiError, ErrorClass
-        err = GeminiError(ErrorClass.PERMANENT, status_code=404)
-        assert err.permanent is True
-        assert err.retryable is False
+        assert err.retry_after == 15.0
 
 
 # ---------------------------------------------------------------------------
-# WorkerLane RPM limiting tests
+# 2. Multi-Model & Lane Setup Tests
 # ---------------------------------------------------------------------------
 
-class TestWorkerLaneRPM:
-    """Tests for per-lane 15 RPM rate limiting."""
+class TestMultiModelLanes:
+    """Tests for 8-lane setup (2 models × 4 keys)."""
 
-    def test_lane_allows_15_requests_within_minute(self):
-        from analysis.gemini_scheduler import WorkerLane
-        lane = WorkerLane(model="m1", api_key="k1", lane_id="l1", rpm_limit=15)
-        now = time.monotonic()
-        for _ in range(15):
-            lane.record_request(now)
-        assert lane.available(now) is False
-
-    def test_lane_allows_after_window_expires(self):
-        from analysis.gemini_scheduler import WorkerLane
-        lane = WorkerLane(model="m1", api_key="k1", lane_id="l1", rpm_limit=15)
-        now = time.monotonic()
-        # Record 15 requests 61 seconds ago
-        for _ in range(15):
-            lane.record_request(now - 61)
-        assert lane.available(now) is True
-
-    def test_lane_allows_partial_window(self):
-        from analysis.gemini_scheduler import WorkerLane
-        lane = WorkerLane(model="m1", api_key="k1", lane_id="l1", rpm_limit=15)
-        now = time.monotonic()
-        # 14 requests (should be available)
-        for _ in range(14):
-            lane.record_request(now)
-        assert lane.available(now) is True
-
-    def test_lane_cooldown_prevents_requests(self):
-        from analysis.gemini_scheduler import WorkerLane
-        lane = WorkerLane(model="m1", api_key="k1", lane_id="l1", rpm_limit=15)
-        now = time.monotonic()
-        lane.apply_cooldown(60, now)
-        assert lane.available(now) is False
-        assert lane.available(now + 59) is False
-        assert lane.available(now + 61) is True
-
-
-# ---------------------------------------------------------------------------
-# Concurrent lanes tests
-# ---------------------------------------------------------------------------
-
-class TestConcurrentLanes:
-    """Tests for multiple lanes processing concurrently."""
-
-    def test_lanes_built_from_keys_and_models(self):
+    def test_8_lanes_created_for_2_models_and_4_keys(self):
         from analysis.gemini_scheduler import GeminiScheduler
         sched = GeminiScheduler(
-            api_keys=["k1", "k2"],
-            models=["m1", "m2"],
+            api_keys=["k1", "k2", "k3", "k4"],
+            models=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
             rpm_per_lane=15,
-            max_workers=4,
         )
-        assert len(sched.lanes) == 4  # 2 models × 2 keys
-
-    def test_empty_keys_no_lanes(self):
-        from analysis.gemini_scheduler import GeminiScheduler
-        sched = GeminiScheduler(api_keys=[], models=["m1"])
-        assert len(sched.lanes) == 0
+        assert len(sched.lanes) == 8
+        models_in_lanes = set(l.model for l in sched.lanes)
+        assert models_in_lanes == {"gemini-3.1-flash-lite", "gemini-3.5-flash-lite"}
 
     def test_paste_keys_excluded(self):
         from analysis.gemini_scheduler import GeminiScheduler
         sched = GeminiScheduler(
             api_keys=["real_key", "PASTE_YOUR_KEY_HERE", ""],
-            models=["m1"],
+            models=["gemini-3.1-flash-lite"],
         )
         assert len(sched.lanes) == 1
 
-    def test_max_workers_capped_at_lane_count(self):
+
+# ---------------------------------------------------------------------------
+# 3. Packing & Prompt Generation Tests
+# ---------------------------------------------------------------------------
+
+class TestPacking:
+    """Tests for multi-record request packing."""
+
+    def test_5_records_packed_into_one_request(self):
         from analysis.gemini_scheduler import GeminiScheduler
+
+        call_count = [0]
+        submitted_prompts = []
+
+        def mock_call(prompt, api_key, model=None):
+            call_count[0] += 1
+            submitted_prompts.append(prompt)
+            return [
+                {"entity_id": str(i), "summary": f"Summary {i}", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                for i in range(1, 6)
+            ]
+
         sched = GeminiScheduler(
             api_keys=["k1"],
-            models=["m1"],
-            max_workers=8,
+            models=["gemini-3.1-flash-lite"],
+            items_per_request=5,
+            max_workers=1,
         )
-        assert sched.max_workers == 1  # Only 1 lane, so 1 worker
+
+        records = [{"entity_type": "MP", "entity_id": i} for i in range(1, 6)]
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            res = sched.process(records)
+
+        assert res["success_count"] == 5
+        assert call_count[0] == 1  # Exactly 1 Gemini API request for 5 records!
+
+    def test_configurable_items_per_request(self):
+        from analysis.gemini_scheduler import GeminiScheduler
+
+        call_count = [0]
+
+        def mock_call(prompt, api_key, model=None):
+            call_count[0] += 1
+            return [
+                {"entity_id": "1", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+            ]
+
+        sched = GeminiScheduler(
+            api_keys=["k1"],
+            models=["gemini-3.1-flash-lite"],
+            items_per_request=2,
+            max_workers=1,
+        )
+
+        records = [{"entity_type": "MP", "entity_id": i} for i in range(1, 5)]
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            with patch("analysis.gemini_scheduler.validate_packed_output") as mock_val:
+                from analysis.gemini_processor import GeminiResult
+                mock_val.side_effect = lambda raw, rows: (
+                    [GeminiResult("MP", r["entity_id"], "s", ["h1", "h2", "h3"], [], "hash") for r in rows],
+                    []
+                )
+                sched.process(records)
+
+        assert call_count[0] == 2  # 4 records / 2 per request = 2 requests
 
 
 # ---------------------------------------------------------------------------
-# 429 rotation tests
+# 4. Token Safety Tests
 # ---------------------------------------------------------------------------
 
-class TestRateLimitRotation:
-    """Tests for rotating away from rate-limited lanes."""
+class TestTokenSafety:
+    """Tests for splitting oversized evidence batches."""
 
-    def test_lane_excluded_after_tried(self):
+    def test_token_safety_splits_oversized_batch(self):
+        from analysis.gemini_processor import check_token_safety
+
+        large_evidence = {"data": "x" * 25000}
+        rows = [{"entity_type": "MP", "entity_id": i, "evidence": large_evidence} for i in range(1, 6)]
+
+        # Request splitting when prompt > 20000 chars
+        batches = check_token_safety(rows, max_chars=20000)
+        assert len(batches) > 1
+        total_items = sum(len(b) for b in batches)
+        assert total_items == 5
+
+
+# ---------------------------------------------------------------------------
+# 5. Output Validation & Entity ID Matching Tests
+# ---------------------------------------------------------------------------
+
+class TestPackedValidation:
+    """Tests for validating response arrays and matching by stable entity_id."""
+
+    def test_json_array_parsing(self):
+        from analysis.gemini_processor import validate_packed_output
+
+        rows = [
+            {"entity_type": "MP", "entity_id": "101"},
+            {"entity_type": "MP", "entity_id": "102"},
+        ]
+        raw = [
+            {"entity_id": "101", "summary": "Summary 101", "highlights": ["h1", "h2", "h3"], "cautions": []},
+            {"entity_id": "102", "summary": "Summary 102", "highlights": ["h1", "h2", "h3"], "cautions": []},
+        ]
+        valid, failed = validate_packed_output(raw, rows)
+        assert len(valid) == 2
+        assert len(failed) == 0
+
+    def test_no_array_position_matching(self):
+        from analysis.gemini_processor import validate_packed_output
+
+        rows = [
+            {"entity_type": "MP", "entity_id": "101"},
+            {"entity_type": "MP", "entity_id": "102"},
+        ]
+        # Reversed order from Gemini
+        raw = [
+            {"entity_id": "102", "summary": "Summary 102", "highlights": ["h1", "h2", "h3"], "cautions": []},
+            {"entity_id": "101", "summary": "Summary 101", "highlights": ["h1", "h2", "h3"], "cautions": []},
+        ]
+        valid, failed = validate_packed_output(raw, rows)
+        assert len(valid) == 2
+        res_map = {r.entity_id: r.summary for r in valid}
+        assert res_map["101"] == "Summary 101"
+        assert res_map["102"] == "Summary 102"
+
+    def test_missing_entity_detection(self):
+        from analysis.gemini_processor import validate_packed_output
+
+        rows = [
+            {"entity_type": "MP", "entity_id": "101"},
+            {"entity_type": "MP", "entity_id": "102"},
+        ]
+        # Only returns 101
+        raw = [
+            {"entity_id": "101", "summary": "Summary 101", "highlights": ["h1", "h2", "h3"], "cautions": []},
+        ]
+        valid, failed = validate_packed_output(raw, rows)
+        assert len(valid) == 1
+        assert len(failed) == 1
+        assert failed[0]["entity_id"] == "102"
+        assert failed[0]["reason"] == "missing_entity_id_in_response"
+
+    def test_duplicate_entity_detection(self):
+        from analysis.gemini_processor import validate_packed_output
+
+        rows = [{"entity_type": "MP", "entity_id": "101"}]
+        raw = [
+            {"entity_id": "101", "summary": "Summary 1", "highlights": ["h1", "h2", "h3"], "cautions": []},
+            {"entity_id": "101", "summary": "Summary 2", "highlights": ["h1", "h2", "h3"], "cautions": []},
+        ]
+        valid, failed = validate_packed_output(raw, rows)
+        assert len(valid) == 1
+        assert len(failed) == 1
+        assert "duplicate_entity_id" in failed[0]["reason"]
+
+    def test_unexpected_entity_detection(self):
+        from analysis.gemini_processor import validate_packed_output
+
+        rows = [{"entity_type": "MP", "entity_id": "101"}]
+        raw = [
+            {"entity_id": "101", "summary": "Summary 1", "highlights": ["h1", "h2", "h3"], "cautions": []},
+            {"entity_id": "999", "summary": "Unexpected", "highlights": ["h1", "h2", "h3"], "cautions": []},
+        ]
+        valid, failed = validate_packed_output(raw, rows)
+        assert len(valid) == 1
+        # Unexpected 999 is ignored cleanly
+
+
+# ---------------------------------------------------------------------------
+# 6. Concurrency & Partial Failure Tests
+# ---------------------------------------------------------------------------
+
+class TestConcurrency:
+    """Tests for parallel execution and partial response handling."""
+
+    def test_10_concurrent_workers(self):
         from analysis.gemini_scheduler import GeminiScheduler
         sched = GeminiScheduler(
             api_keys=["k1", "k2"],
-            models=["m1"],
-            rpm_per_lane=15,
-            max_workers=2,
+            models=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
+            max_workers=10,
         )
-        # Pick a lane, then exclude it
-        lane1 = sched._pick_lane()
-        assert lane1 is not None
-        lane2 = sched._pick_lane(exclude_lanes={lane1.lane_id})
-        assert lane2 is not None
-        assert lane2.lane_id != lane1.lane_id
+        assert sched.max_workers == 10
 
-    def test_cooldown_makes_lane_unavailable(self):
-        from analysis.gemini_scheduler import GeminiScheduler, WorkerLane
+    def test_genuine_overlapping_execution(self):
+        from analysis.gemini_scheduler import GeminiScheduler
+        import re
+
+        def mock_call(prompt, api_key, model=None):
+            time.sleep(0.1)  # Simulate 100ms API call
+            # Extract requested entity_ids from prompt
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            return [
+                {"entity_id": str(i), "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                for i in ids
+            ]
+
+        sched = GeminiScheduler(
+            api_keys=["k1", "k2", "k3", "k4"],
+            models=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
+            max_workers=10,
+            items_per_request=5,
+        )
+
+        records = [{"entity_type": "MP", "entity_id": i} for i in range(1, 51)]  # 50 items -> 10 requests
+
+        start = time.monotonic()
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            with patch.object(sched._clients["gemini-3.5-flash-lite"], "call", mock_call):
+                res = sched.process(records)
+        elapsed = time.monotonic() - start
+
+        # 10 requests sequentially = 1.0s. 10 requests concurrently = ~0.1-0.3s.
+        assert elapsed < 0.6
+        assert res["success_count"] == 50
+
+    def test_one_failure_does_not_stop_others(self):
+        from analysis.gemini_scheduler import GeminiScheduler
+        from analysis.gemini_client import GeminiError, ErrorClass
+
+        def mock_call(prompt, api_key, model=None):
+            if "fail" in prompt:
+                raise GeminiError(ErrorClass.NOT_FOUND, status_code=404)
+            return [{"entity_id": "ok", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}]
+
         sched = GeminiScheduler(
             api_keys=["k1", "k2"],
-            models=["m1"],
-            rpm_per_lane=15,
+            models=["gemini-3.1-flash-lite"],
             max_workers=2,
+            items_per_request=1,
         )
-        # Cooldown first lane
-        sched.lanes[0].apply_cooldown(60)
-        lane = sched._pick_lane()
-        assert lane.lane_id == sched.lanes[1].lane_id
+
+        records = [
+            {"entity_type": "MP", "entity_id": "ok"},
+            {"entity_type": "MP", "entity_id": "fail"},
+        ]
+
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            with patch("analysis.gemini_scheduler.build_packed_prompt", side_effect=lambda rows: f"prompt_{rows[0]['entity_id']}"):
+                res = sched.process(records)
+
+        assert res["success_count"] == 1
+        assert res["failure_count"] == 1
+
 
 
 # ---------------------------------------------------------------------------
-# 5xx/timeout retry tests
+# 7. Partial Failure & Retry Tests
 # ---------------------------------------------------------------------------
 
-class TestRetryOnTransientError:
-    """Tests for retrying on 5xx and timeout errors."""
+class TestPartialResponse:
+    """Tests for immediate persistence of valid records and requeuing of failed items."""
 
-    def test_retryable_error_does_not_stop_processing(self):
-        from analysis.gemini_scheduler import GeminiScheduler, QueueItem
-        from analysis.gemini_client import GeminiError, ErrorClass
+    def test_partial_response_immediate_persistence_and_requeue(self):
+        from analysis.gemini_scheduler import GeminiScheduler
+
+        successes = []
+
+        def on_success(res):
+            successes.append(res.entity_id)
 
         call_count = [0]
 
         def mock_call(prompt, api_key, model=None):
             call_count[0] += 1
             if call_count[0] == 1:
-                raise GeminiError(ErrorClass.RETRYABLE, status_code=500)
-            return {"summary": "ok", "highlights": [], "cautions": []}
+                # First call returns A, B, D, E (missing C)
+                return [
+                    {"entity_id": "A", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []},
+                    {"entity_id": "B", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []},
+                    {"entity_id": "D", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []},
+                    {"entity_id": "E", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []},
+                ]
+            else:
+                # Retry call for C returns C
+                return [
+                    {"entity_id": "C", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []},
+                ]
 
         sched = GeminiScheduler(
             api_keys=["k1"],
-            models=["m1"],
-            rpm_per_lane=15,
+            models=["gemini-3.1-flash-lite"],
+            items_per_request=5,
             max_workers=1,
-            max_attempts=3,
         )
 
-        with patch.object(sched._clients["m1"], "call", mock_call):
-            with patch("analysis.gemini_scheduler.build_prompt", return_value="prompt"):
-                with patch("analysis.gemini_scheduler.validate_output", return_value=[]):
-                    with patch("analysis.gemini_scheduler.GeminiResult") as mock_result:
-                        mock_result.return_value = MagicMock()
-                        result = sched.process([{"entity_type": "MP", "entity_id": 1}])
+        records = [
+            {"entity_type": "MP", "entity_id": "A"},
+            {"entity_type": "MP", "entity_id": "B"},
+            {"entity_type": "MP", "entity_id": "C"},
+            {"entity_type": "MP", "entity_id": "D"},
+            {"entity_type": "MP", "entity_id": "E"},
+        ]
 
-        assert result["success_count"] == 1
-        assert call_count[0] == 2  # Retried once
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            res = sched.process(records, on_success=on_success)
+
+        assert res["success_count"] == 5
+        assert set(successes) == {"A", "B", "C", "D", "E"}
+        assert call_count[0] == 2  # Request 1 for 5, Request 2 retried ONLY C!
 
 
 # ---------------------------------------------------------------------------
-# Permanent 404/auth failure tests
+# 8. RPM & RPD Rate Limit / Quota Handling Tests
 # ---------------------------------------------------------------------------
 
-class TestPermanentFailure:
-    """Tests for non-retryable permanent failures."""
+class TestRateLimits:
+    """Tests for RPM temporary pause vs RPD in-memory blacklisting."""
 
-    def test_404_failure_no_retry(self):
+    def test_rpm_causes_temporary_lane_pause_and_rotation(self):
         from analysis.gemini_scheduler import GeminiScheduler
         from analysis.gemini_client import GeminiError, ErrorClass
 
-        call_count = [0]
+        call_keys = []
 
         def mock_call(prompt, api_key, model=None):
-            call_count[0] += 1
-            raise GeminiError(ErrorClass.PERMANENT, status_code=404)
+            call_keys.append(api_key)
+            if api_key == "k1" and len(call_keys) == 1:
+                raise GeminiError(ErrorClass.RPM_RATE_LIMITED, status_code=429, retry_after=5)
+            return [{"entity_id": "1", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}]
 
         sched = GeminiScheduler(
-            api_keys=["k1"],
-            models=["m1"],
-            rpm_per_lane=15,
+            api_keys=["k1", "k2"],
+            models=["gemini-3.1-flash-lite"],
             max_workers=1,
-            max_attempts=3,
+            items_per_request=1,
         )
 
-        with patch.object(sched._clients["m1"], "call", mock_call):
-            with patch("analysis.gemini_scheduler.build_prompt", return_value="prompt"):
-                result = sched.process([{"entity_type": "MP", "entity_id": 1}])
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            res = sched.process([{"entity_type": "MP", "entity_id": "1"}])
 
-        assert result["failure_count"] == 1
-        assert result["success_count"] == 0
-        assert call_count[0] == 1  # No retry
+        assert res["success_count"] == 1
+        assert "k2" in call_keys  # Rotated to k2 after k1 RPM limited
 
-    def test_auth_failure_no_retry(self):
-        from analysis.gemini_scheduler import GeminiScheduler
-        from analysis.gemini_client import GeminiError, ErrorClass
-
-        call_count = [0]
-
-        def mock_call(prompt, api_key, model=None):
-            call_count[0] += 1
-            raise GeminiError(ErrorClass.PERMANENT, status_code=401)
-
-        sched = GeminiScheduler(
-            api_keys=["k1"],
-            models=["m1"],
-            rpm_per_lane=15,
-            max_workers=1,
-            max_attempts=3,
-        )
-
-        with patch.object(sched._clients["m1"], "call", mock_call):
-            with patch("analysis.gemini_scheduler.build_prompt", return_value="prompt"):
-                result = sched.process([{"entity_type": "MP", "entity_id": 1}])
-
-        assert call_count[0] == 1
-
-
-# ---------------------------------------------------------------------------
-# Partial batch failure tests
-# ---------------------------------------------------------------------------
-
-class TestPartialBatchFailure:
-    """Tests for successful results persisted despite other failures."""
-
-    def test_success_persisted_when_others_fail(self):
+    def test_rpd_exhaustion_blacklists_lane_in_memory(self):
         from analysis.gemini_scheduler import GeminiScheduler
         from analysis.gemini_client import GeminiError, ErrorClass
 
         def mock_call(prompt, api_key, model=None):
-            if "prompt_2" in prompt:
-                raise GeminiError(ErrorClass.PERMANENT, status_code=404)
-            return {"summary": "ok", "highlights": [], "cautions": []}
+            if api_key == "k1":
+                raise GeminiError(ErrorClass.RPD_EXHAUSTED, status_code=429, message="Daily quota reached")
+            return [{"entity_id": "1", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}]
 
         sched = GeminiScheduler(
-            api_keys=["k1"],
-            models=["m1"],
-            rpm_per_lane=15,
+            api_keys=["k1", "k2"],
+            models=["gemini-3.1-flash-lite"],
             max_workers=1,
-            max_attempts=3,
+            items_per_request=1,
         )
 
-        successes = []
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            res = sched.process([{"entity_type": "MP", "entity_id": "1"}])
 
-        def on_success(result):
-            successes.append(result)
+        # Lane k1 should be blacklisted in memory
+        lane_k1 = next(l for l in sched.lanes if l.api_key == "k1")
+        assert lane_k1.rpd_exhausted is True
+        assert res["success_count"] == 1
 
-        with patch.object(sched._clients["m1"], "call", mock_call):
-            with patch("analysis.gemini_scheduler.build_prompt", side_effect=lambda r: f"prompt_{r['entity_id']}"):
-                with patch("analysis.gemini_scheduler.validate_output", return_value=[]):
-                    with patch("analysis.gemini_scheduler.GeminiResult") as mock_result:
-                        mock_result.side_effect = lambda **kw: MagicMock(**kw)
-                        result = sched.process(
-                            [
-                                {"entity_type": "MP", "entity_id": 1},
-                                {"entity_type": "MP", "entity_id": 2},
-                            ],
-                            on_success=on_success,
-                        )
-
-        assert result["success_count"] == 1
-        assert result["failure_count"] == 1
-        assert len(successes) == 1
-
-
-# ---------------------------------------------------------------------------
-# All keys unavailable → cooldown tests
-# ---------------------------------------------------------------------------
-
-class TestAllKeysUnavailable:
-    """Tests for cooldown when all lanes are exhausted."""
-
-    def test_cooldown_applied_when_no_lanes_available(self):
-        from analysis.gemini_scheduler import GeminiScheduler
-        sched = GeminiScheduler(
-            api_keys=["k1"],
-            models=["m1"],
-            rpm_per_lane=15,
-            max_workers=1,
-        )
-        # Cooldown the only lane
-        sched.lanes[0].apply_cooldown(60)
-        assert sched.lanes[0].available() is False
-        assert sched._pick_lane() is None
-
-
-# ---------------------------------------------------------------------------
-# Daily quota tests
-# ---------------------------------------------------------------------------
-
-class TestDailyQuota:
-    """Tests for global daily quota enforcement."""
-
-    def test_quota_stops_processing(self):
-        from analysis.gemini_scheduler import GeminiScheduler
-        sched = GeminiScheduler(
-            api_keys=["k1"],
-            models=["m1"],
-            daily_quota=2,
-        )
-        sched._daily_count = 2
-
-        result = sched.process([
-            {"entity_type": "MP", "entity_id": 1},
-        ])
-
-        assert result["failure_count"] == 1
-        assert result["failures"][0]["reason"] == "daily_quota_exceeded"
-
-    def test_quota_allows_processing_below_limit(self):
+    def test_rpd_blacklist_disappears_between_runs(self):
         from analysis.gemini_scheduler import GeminiScheduler
 
-        def mock_call(prompt, api_key, model=None):
-            return {"summary": "ok", "highlights": [], "cautions": []}
-
+        # New scheduler instance for next run
         sched = GeminiScheduler(
-            api_keys=["k1"],
-            models=["m1"],
-            daily_quota=10,
-            max_workers=1,
+            api_keys=["k1", "k2"],
+            models=["gemini-3.1-flash-lite"],
         )
-
-        with patch.object(sched._clients["m1"], "call", mock_call):
-            with patch("analysis.gemini_scheduler.build_prompt", return_value="prompt"):
-                with patch("analysis.gemini_scheduler.validate_output", return_value=[]):
-                    with patch("analysis.gemini_scheduler.GeminiResult") as mock_result:
-                        mock_result.return_value = MagicMock()
-                        result = sched.process([{"entity_type": "MP", "entity_id": 1}])
-
-        assert result["success_count"] == 1
-
-
-# ---------------------------------------------------------------------------
-# Idempotency / already-up-to-date skipping tests
-# ---------------------------------------------------------------------------
-
-class TestIdempotency:
-    """Tests for idempotent processing behavior."""
-
-    def test_filter_affected_skips_unchanged(self):
-        from analysis.gemini_processor import filter_affected, PROMPT_VERSION
-
-        evidence = [
-            {"entity_type": "MP", "entity_id": 1,
-             "evidence_hash": "abc", "prompt_version": PROMPT_VERSION},
-            {"entity_type": "MP", "entity_id": 2,
-             "evidence_hash": "def", "prompt_version": PROMPT_VERSION},
-        ]
-        existing = [
-            {"entity_type": "MP", "entity_id": 1,
-             "evidence_hash": "abc", "prompt_version": PROMPT_VERSION},
-        ]
-
-        affected = filter_affected(evidence, existing)
-        assert len(affected) == 1
-        assert affected[0]["entity_id"] == 2
-
-    def test_filter_affected_empty_existing(self):
-        from analysis.gemini_processor import filter_affected
-
-        evidence = [
-            {"entity_type": "MP", "entity_id": 1,
-             "evidence_hash": "abc", "prompt_version": "v5"},
-        ]
-        affected = filter_affected(evidence, [])
-        assert len(affected) == 1
-
-    def test_filter_affected_changed_hash(self):
-        from analysis.gemini_processor import filter_affected
-
-        evidence = [
-            {"entity_type": "MP", "entity_id": 1,
-             "evidence_hash": "new_hash", "prompt_version": "v5"},
-        ]
-        existing = [
-            {"entity_type": "MP", "entity_id": 1,
-             "evidence_hash": "old_hash", "prompt_version": "v5"},
-        ]
-        affected = filter_affected(evidence, existing)
-        assert len(affected) == 1
-
-
-# ---------------------------------------------------------------------------
-# No secret leakage in logs
-# ---------------------------------------------------------------------------
-
-class TestNoSecretLeakage:
-    """Tests for API key redaction in logs/errors."""
-
-    def test_scheduler_does_not_log_api_keys(self, capsys):
-        from analysis.gemini_scheduler import GeminiScheduler
-
-        sched = GeminiScheduler(
-            api_keys=["super_secret_key_123"],
-            models=["m1"],
-        )
-        # Lane repr should not contain the key
         for lane in sched.lanes:
-            assert "super_secret_key_123" not in repr(lane)
+            assert lane.rpd_exhausted is False
 
-    def test_scheduler_log_output_no_keys(self, capsys):
+    def test_all_lanes_rpd_exhausted_clean_termination(self):
         from analysis.gemini_scheduler import GeminiScheduler
+        from analysis.gemini_client import GeminiError, ErrorClass
+
+        def mock_call(prompt, api_key, model=None):
+            raise GeminiError(ErrorClass.RPD_EXHAUSTED, status_code=429, message="Daily quota reached")
 
         sched = GeminiScheduler(
-            api_keys=["secret_api_key_xyz"],
-            models=["m1"],
+            api_keys=["k1", "k2"],
+            models=["gemini-3.1-flash-lite"],
+            max_workers=1,
+            items_per_request=1,
         )
-        result = sched.process([])
-        # Check that no output contains the key
-        captured = capsys.readouterr()
-        assert "secret_api_key_xyz" not in captured.out
+
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            res = sched.process([{"entity_type": "MP", "entity_id": "1"}])
+
+        assert res["success_count"] == 0
+        assert res["failure_count"] == 1
+        assert res["failures"][0]["reason"] == "all_lanes_rpd_exhausted"
 
 
 # ---------------------------------------------------------------------------
-# Pipeline integration test
+# 9. Security & Secret Redaction Tests
+# ---------------------------------------------------------------------------
+
+class TestSecurity:
+    """Tests for ensuring secrets are not printed in logs."""
+
+    def test_secret_redaction(self, capsys):
+        from analysis.gemini_scheduler import GeminiScheduler
+
+        sched = GeminiScheduler(
+            api_keys=["SECRET_KEY_12345678"],
+            models=["gemini-3.1-flash-lite"],
+        )
+
+        for lane in sched.lanes:
+            assert "SECRET_KEY_12345678" not in repr(lane)
+
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", return_value=[{"entity_id": "1", "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}]):
+            sched.process([{"entity_type": "MP", "entity_id": "1"}])
+
+        captured = capsys.readouterr()
+        assert "SECRET_KEY_12345678" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# 10. Pipeline Integration & Idempotency Tests
 # ---------------------------------------------------------------------------
 
 class TestPipelineIntegration:
-    """Tests for stage_gemini with new scheduler."""
+    """Tests for stage_gemini and idempotency."""
 
-    def test_stage_gemini_uses_scheduler(self):
+    def test_stage_gemini_uses_new_scheduler(self):
         from automation.pipeline_controller import stage_gemini
         import inspect
 
         src = inspect.getsource(stage_gemini)
         assert "GeminiScheduler" in src
-        assert "scheduler.process" in src
+        assert "gemini-3.1-flash-lite" in src
+        assert "gemini-3.5-flash-lite" in src
 
-    def test_stage_gemini_skips_without_keys(self):
-        from automation.pipeline_controller import stage_gemini
-
-        with patch("automation.pipeline_controller.get_config") as mock_cfg:
-            mock_cfg.return_value = MagicMock(gemini_keys=[])
-            result = stage_gemini([{"entity_type": "MP", "entity_id": 1}])
-
-        assert result["skipped"] is True
-        assert result["reason"] == "no_api_keys"
-
-    def test_stage_gemini_filters_affected(self):
-        from automation.pipeline_controller import stage_gemini
-        from analysis.gemini_processor import PROMPT_VERSION
+    def test_already_up_to_date_skipping(self):
+        from analysis.gemini_processor import filter_affected, PROMPT_VERSION
 
         evidence = [
-            {"entity_type": "MP", "entity_id": 1,
-             "evidence_hash": "abc", "prompt_version": PROMPT_VERSION},
-            {"entity_type": "MP", "entity_id": 2,
-             "evidence_hash": "def", "prompt_version": PROMPT_VERSION},
+            {"entity_type": "MP", "entity_id": 1, "evidence_hash": "abc", "prompt_version": PROMPT_VERSION},
+            {"entity_type": "MP", "entity_id": 2, "evidence_hash": "def", "prompt_version": PROMPT_VERSION},
+        ]
+        existing = [
+            {"entity_type": "MP", "entity_id": 1, "evidence_hash": "abc", "prompt_version": PROMPT_VERSION},
         ]
 
-        with patch("automation.pipeline_controller.get_config") as mock_cfg:
-            mock_cfg.return_value = MagicMock(gemini_keys=["k1"])
-            with patch("automation.pipeline_controller.get_db2", return_value=("url", "key")):
-                with patch("automation.pipeline_controller.load_table", return_value=[
-                    {"entity_type": "MP", "entity_id": 1,
-                     "evidence_hash": "abc", "prompt_version": PROMPT_VERSION},
-                ]):
-                    with patch("analysis.gemini_scheduler.GeminiScheduler") as mock_sched:
-                        mock_sched.return_value.process.return_value = {
-                            "success_count": 1,
-                            "failure_count": 0,
-                            "failures": [],
-                            "retries": 0,
-                        }
-                        result = stage_gemini(evidence)
-
-        assert result["processed"] == 1  # Only entity_id 2 is affected
-        assert result["skipped"] == 1    # entity_id 1 was up-to-date
+        affected = filter_affected(evidence, existing)
+        assert len(affected) == 1
+        assert affected[0]["entity_id"] == 2

@@ -890,11 +890,12 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
     Args:
         evidence_records: list of evidence record dicts
         api_keys: list of API key strings (default: from config)
-        models: list of model names (default: ["gemini-3.1-flash-lite"])
+        models: list of model names (default: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"])
 
     Returns:
         dict with processing stats
     """
+    import os
     from analysis.gemini_scheduler import GeminiScheduler
     from analysis.gemini_processor import filter_affected
 
@@ -923,11 +924,22 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
         return {"processed": 0, "skipped": len(evidence_records),
                 "success": 0, "failed": 0}
 
+    if models is None:
+        models_env = os.environ.get("GEMINI_MODELS")
+        if models_env:
+            models = [m.strip() for m in models_env.split(",") if m.strip()]
+        else:
+            models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+
+    concurrency = int(os.environ.get("GEMINI_CONCURRENCY", "10"))
+    items_per_req = int(os.environ.get("GEMINI_ITEMS_PER_REQUEST", "5"))
+
     scheduler = GeminiScheduler(
         api_keys=keys,
         models=models,
         rpm_per_lane=15,
-        max_workers=8,
+        max_workers=concurrency,
+        items_per_request=items_per_req,
         max_attempts=3,
     )
 
@@ -957,6 +969,7 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
         "failed": batch_result["failure_count"],
         "failures": batch_result["failures"],
     }
+
 
 
 def stage_persist(evidence_records, affected_keys=None):
