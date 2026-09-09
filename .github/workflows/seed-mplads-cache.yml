@@ -37,6 +37,8 @@ jobs:
       # DOWNLOAD: Get the tarball from the GitHub release
       # ===========================================================
       - name: Download tarball from release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           RELEASE_TAG="${{ inputs.release_tag }}"
           echo "Downloading from release: $RELEASE_TAG"
@@ -179,6 +181,8 @@ jobs:
       - name: Cleanup draft release
         if: always()
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           RELEASE_TAG="${{ inputs.release_tag }}"
           echo "Cleaning up draft release: $RELEASE_TAG"
