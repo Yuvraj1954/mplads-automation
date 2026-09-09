@@ -256,7 +256,7 @@ class TestAffectedIdentityMapping:
                 {"WORK_RECOMMENDATION_DTL_ID": "12345"},
                 {"WORK_RECOMMENDATION_DTL_ID": "12346"},
             ]
-            with open(ds_dir / "part_0001.ndjson", "w") as f:
+            with open(ds_dir / "append_part_0001.ndjson", "w") as f:
                 for r in records:
                     f.write(json.dumps(r) + "\n")
 
@@ -275,7 +275,7 @@ class TestAffectedIdentityMapping:
             ds_dir = delta_dir / "works_recommended"
             ds_dir.mkdir(parents=True)
 
-            with open(ds_dir / "part_0001.ndjson", "w") as f:
+            with open(ds_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "99999"}) + "\n")
 
             result = stage_affected(str(delta_dir), "test_run")
@@ -292,7 +292,7 @@ class TestAffectedIdentityMapping:
             ds_dir = delta_dir / "mla_works_recommended"
             ds_dir.mkdir(parents=True)
 
-            with open(ds_dir / "part_0001.ndjson", "w") as f:
+            with open(ds_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "88888"}) + "\n")
 
             result = stage_affected(str(delta_dir), "test_run")
@@ -309,7 +309,7 @@ class TestAffectedIdentityMapping:
             ds_dir = delta_dir / "works_recommended"
             ds_dir.mkdir(parents=True)
 
-            with open(ds_dir / "part_0001.ndjson", "w") as f:
+            with open(ds_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({
                     "WORK_RECOMMENDATION_DTL_ID": "55555",
                     "source_work_id": "Construction of Road",
@@ -329,7 +329,7 @@ class TestAffectedIdentityMapping:
             ds_dir = delta_dir / "works_recommended"
             ds_dir.mkdir(parents=True)
 
-            with open(ds_dir / "part_0001.ndjson", "w") as f:
+            with open(ds_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "111"}) + "\n")
 
             result = stage_affected(str(delta_dir), "test_run")
@@ -346,7 +346,7 @@ class TestAffectedIdentityMapping:
             ds_dir = delta_dir / "works_recommended"
             ds_dir.mkdir(parents=True)
 
-            with open(ds_dir / "part_0001.ndjson", "w") as f:
+            with open(ds_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "222"}) + "\n")
 
             result = stage_affected(str(delta_dir), "test_run")
@@ -363,12 +363,12 @@ class TestAffectedIdentityMapping:
 
             mp_dir = delta_dir / "works_recommended"
             mp_dir.mkdir(parents=True)
-            with open(mp_dir / "part_0001.ndjson", "w") as f:
+            with open(mp_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "100"}) + "\n")
 
             mla_dir = delta_dir / "mla_works_sanctioned"
             mla_dir.mkdir(parents=True)
-            with open(mla_dir / "part_0001.ndjson", "w") as f:
+            with open(mla_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "200"}) + "\n")
 
             result = stage_affected(str(delta_dir), "test_run")
@@ -386,13 +386,13 @@ class TestAffectedIdentityMapping:
 
             mp_dir = delta_dir / "works_completed"
             mp_dir.mkdir(parents=True)
-            with open(mp_dir / "part_0001.ndjson", "w") as f:
+            with open(mp_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "111"}) + "\n")
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "222"}) + "\n")
 
             mla_dir = delta_dir / "mla_works_completed"
             mla_dir.mkdir(parents=True)
-            with open(mla_dir / "part_0001.ndjson", "w") as f:
+            with open(mla_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "333"}) + "\n")
 
             result = stage_affected(str(delta_dir), "test_run")
@@ -411,7 +411,7 @@ class TestAffectedIdentityMapping:
             ds_dir = delta_dir / "works_recommended"
             ds_dir.mkdir(parents=True)
 
-            with open(ds_dir / "part_0001.ndjson", "w") as f:
+            with open(ds_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": "999999"}) + "\n")
 
             result = stage_affected(str(delta_dir), "test_run")
@@ -1053,7 +1053,7 @@ class TestFullModeRegression:
             delta_dir = Path(tmpdir) / "delta"
             ds_delta = delta_dir / "works_recommended"
             ds_delta.mkdir(parents=True)
-            with open(ds_delta / "part_0001.ndjson", "w") as f:
+            with open(ds_delta / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({
                     "WORK_RECOMMENDATION_DTL_ID": "12345",
                     "state_id": "S1",
@@ -1333,7 +1333,7 @@ class TestEdgeCases:
             ds_dir.mkdir(parents=True)
 
             # DTL ID as integer (government API might return int)
-            with open(ds_dir / "part_0001.ndjson", "w") as f:
+            with open(ds_dir / "append_part_0001.ndjson", "w") as f:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": 12345}) + "\n")
 
             with patch("automation.pipeline_controller.load_config"):
@@ -1655,3 +1655,140 @@ class TestWorkAnalysisPersist:
             # dry_run returns before DB write stages; work_analysis_persist is marked skipped
             assert result["status"] == "DRY_RUN"
             assert result["stages"]["work_analysis_persist"] == {"skipped": True, "reason": "dry_run"}
+
+
+# ============================================================
+# STAGE AFFECTED GLOB FIX TESTS
+# ============================================================
+
+class TestStageAffectedGlobFix:
+    """Verify stage_affected() reads comparator delta files correctly.
+
+    The comparator writes append_part_*.ndjson and update_part_*.ndjson,
+    NOT part_*.ndjson. The glob must match these filenames.
+    """
+
+    def _make_delta_dir(self, tmp, datasets):
+        """Create a delta directory with comparator-style filenames."""
+        delta = Path(tmp) / "delta_test"
+        delta.mkdir()
+        for ds_name, records in datasets.items():
+            ds_dir = delta / ds_name
+            ds_dir.mkdir()
+            for i, (op, recs) in enumerate(records, 1):
+                fname = f"{op}_part_{i:04d}.ndjson"
+                lines = [json.dumps(r) for r in recs]
+                (ds_dir / fname).write_text("\n".join(lines) + "\n")
+        return delta
+
+    def test_append_files_are_read(self):
+        from automation.pipeline_controller import stage_affected
+        with tempfile.TemporaryDirectory() as tmp:
+            delta = self._make_delta_dir(tmp, {
+                "works_recommended": [
+                    ("append", [
+                        {"WORK_RECOMMENDATION_DTL_ID": 1001},
+                        {"WORK_RECOMMENDATION_DTL_ID": 1002},
+                    ]),
+                ],
+            })
+            result = stage_affected(str(delta), "test_run")
+            assert result["work_count"] == 2
+            assert 1001 in result["affected_work_ids"]
+            assert 1002 in result["affected_work_ids"]
+
+    def test_update_files_are_read(self):
+        from automation.pipeline_controller import stage_affected
+        with tempfile.TemporaryDirectory() as tmp:
+            delta = self._make_delta_dir(tmp, {
+                "works_recommended": [
+                    ("update", [
+                        {"WORK_RECOMMENDATION_DTL_ID": 2001},
+                        {"WORK_RECOMMENDATION_DTL_ID": 2002},
+                    ]),
+                ],
+            })
+            result = stage_affected(str(delta), "test_run")
+            assert result["work_count"] == 2
+            assert 2001 in result["affected_work_ids"]
+            assert 2002 in result["affected_work_ids"]
+
+    def test_mixed_append_and_update(self):
+        from automation.pipeline_controller import stage_affected
+        with tempfile.TemporaryDirectory() as tmp:
+            delta = self._make_delta_dir(tmp, {
+                "works_recommended": [
+                    ("append", [{"WORK_RECOMMENDATION_DTL_ID": 1001}]),
+                    ("update", [{"WORK_RECOMMENDATION_DTL_ID": 2001}]),
+                ],
+                "mla_works_recommended": [
+                    ("append", [{"WORK_RECOMMENDATION_DTL_ID": 3001}]),
+                    ("update", [{"WORK_RECOMMENDATION_DTL_ID": 4001}]),
+                ],
+            })
+            result = stage_affected(str(delta), "test_run")
+            assert result["work_count"] == 4
+            # MP works: no offset
+            assert 1001 in result["affected_work_ids"]
+            assert 2001 in result["affected_work_ids"]
+            # MLA works: +1_000_000 offset
+            assert 1_000_000 + 3001 in result["affected_work_ids"]
+            assert 1_000_000 + 4001 in result["affected_work_ids"]
+
+    def test_empty_delta_dir(self):
+        from automation.pipeline_controller import stage_affected
+        with tempfile.TemporaryDirectory() as tmp:
+            delta = Path(tmp) / "delta_empty"
+            delta.mkdir()
+            result = stage_affected(str(delta), "test_run")
+            assert result["work_count"] == 0
+
+    def test_missing_delta_dir(self):
+        from automation.pipeline_controller import stage_affected
+        result = stage_affected("/nonexistent/path", "test_run")
+        assert result["work_count"] == 0
+
+    def test_multiple_chunks(self):
+        from automation.pipeline_controller import stage_affected
+        with tempfile.TemporaryDirectory() as tmp:
+            dtls = [{"WORK_RECOMMENDATION_DTL_ID": i} for i in range(1, 2002)]
+            delta = self._make_delta_dir(tmp, {
+                "works_recommended": [
+                    ("append", dtls[:1000]),
+                    ("append", dtls[1000:]),
+                ],
+            })
+            result = stage_affected(str(delta), "test_run")
+            assert result["work_count"] == 2001
+
+    def test_non_work_datasets_ignored(self):
+        """Delta files without WORK_RECOMMENDATION_DTL_ID should not contribute."""
+        from automation.pipeline_controller import stage_affected
+        with tempfile.TemporaryDirectory() as tmp:
+            delta = self._make_delta_dir(tmp, {
+                "allocated_limit": [
+                    ("append", [{"MP_NAME": "Test MP", "STATE_NAME": "Test"}]),
+                ],
+            })
+            result = stage_affected(str(delta), "test_run")
+            assert result["work_count"] == 0
+
+    def test_glob_pattern_matches_comparator_output(self):
+        """Directly verify the glob pattern matches actual comparator filenames."""
+        from automation.pipeline_controller import stage_affected
+        with tempfile.TemporaryDirectory() as tmp:
+            delta = Path(tmp) / "delta_direct"
+            delta.mkdir()
+            ds = delta / "works_recommended"
+            ds.mkdir()
+            # Write files with exact comparator naming
+            (ds / "append_part_0001.ndjson").write_text(
+                json.dumps({"WORK_RECOMMENDATION_DTL_ID": 9999}) + "\n"
+            )
+            (ds / "update_part_0001.ndjson").write_text(
+                json.dumps({"WORK_RECOMMENDATION_DTL_ID": 8888}) + "\n"
+            )
+            result = stage_affected(str(delta), "test_run")
+            assert result["work_count"] == 2
+            assert 9999 in result["affected_work_ids"]
+            assert 8888 in result["affected_work_ids"]

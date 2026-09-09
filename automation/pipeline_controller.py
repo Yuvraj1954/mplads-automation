@@ -260,7 +260,7 @@ def stage_affected(delta_dir=None, run_id=None):
             if not dataset_dir.is_dir():
                 continue
             is_mla = dataset_dir.name.startswith("mla_")
-            for part_file in dataset_dir.glob("part_*.ndjson"):
+            for part_file in dataset_dir.glob("*_part_*.ndjson"):
                 with open(part_file) as f:
                     for line in f:
                         line = line.strip()
