@@ -203,7 +203,7 @@ def call_edge(function_name, payload):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as response:
+    with urllib.request.urlopen(req, timeout=300) as response:
         return json.loads(response.read().decode())
 
 
@@ -607,9 +607,11 @@ def main():
     print("Expected jobs:", expected_jobs)
 
     print("=== STEP 6: RUN WORKER ===")
-    worker_max_minutes = 30
+    worker_max_minutes = 80
     worker_start = time.time()
     worker_interval = 60
+    per_job_timeout_seconds = 5 * 60  # 5 minutes per job
+    max_retries = 3
 
     while True:
         elapsed = time.time() - worker_start
@@ -618,7 +620,17 @@ def main():
                 f"Worker loop timed out after {worker_max_minutes} minutes"
             )
 
-        result = call_edge("mplads-worker", {"run_id": run_id})
+        job_start = time.time()
+        try:
+            result = call_edge("mplads-worker", {"run_id": run_id})
+        except Exception as exc:
+            job_elapsed = time.time() - job_start
+            print(f"Worker call failed after {job_elapsed:.1f}s: {exc}")
+            if job_elapsed >= per_job_timeout_seconds:
+                print(f"Per-job timeout ({per_job_timeout_seconds}s) exceeded")
+            time.sleep(worker_interval)
+            continue
+
         print("Worker:", result)
         if result.get("success") and (
             result.get("message") == "All ingestion jobs completed."

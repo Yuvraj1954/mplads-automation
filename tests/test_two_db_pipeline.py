@@ -891,7 +891,7 @@ class TestPipelineIntegration:
         from automation.pipeline_controller import STAGES
         expected = [
             "fetch", "compare", "delta", "ingest", "affected",
-            "analyze", "anomaly", "analytics_persist",
+            "analyze", "work_analysis_persist", "anomaly", "analytics_persist",
             "evidence", "evidence_work_refs", "gemini",
             "persist", "verify", "cleanup",
         ]

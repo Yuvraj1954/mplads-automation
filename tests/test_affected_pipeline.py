@@ -1435,3 +1435,223 @@ class TestTimingIntegration:
 
             assert "timing" in result
             assert isinstance(result["timing"], dict)
+
+
+# ============================================================
+# WORK ANALYSIS PERSISTENCE TESTS
+# ============================================================
+
+class TestWorkAnalysisPersist:
+    """Tests for stage_work_analysis_persist (DB1 persistence)."""
+
+    def test_persist_converts_work_analysis_to_record(self):
+        """WorkAnalysis dataclass converts to DB1 record dict."""
+        from analysis.models import WorkAnalysis
+        from automation.pipeline_controller import stage_work_analysis_persist
+
+        wa = WorkAnalysis(
+            work_id=100,
+            member_type="MP",
+            member_id=50,
+            status="Completed",
+            normalized_activity="road",
+            state_id=1,
+            constituency_id=10,
+            recommended_amount=500000.0,
+            sanction_amount=400000.0,
+            expenditure_amount=350000.0,
+            risk_flags=["HIGH_COST"],
+            flag_count=1,
+            risk_level="HIGH",
+        )
+
+        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+             patch("automation.pipeline_controller.sb_delete", return_value=200), \
+             patch("supabase.create_client") as mock_create:
+            mock_client = MagicMock()
+            mock_create.return_value = mock_client
+
+            result = stage_work_analysis_persist([wa], affected_work_ids={100})
+
+        assert result["mp_written"] == 1
+        assert result["mla_written"] == 0
+        assert result["total"] == 1
+        mock_client.table.assert_any_call("work_analysis")
+
+    def test_persist_empty_analyses(self):
+        """Empty analysis list writes nothing."""
+        from automation.pipeline_controller import stage_work_analysis_persist
+
+        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
+            result = stage_work_analysis_persist([], affected_work_ids=set())
+        assert result["total"] == 0
+
+    def test_persist_separates_mp_and_mla(self):
+        """MP and MLA analyses go to different tables."""
+        from analysis.models import WorkAnalysis
+        from automation.pipeline_controller import stage_work_analysis_persist
+
+        mp_wa = WorkAnalysis(
+            work_id=100, member_type="MP", member_id=50,
+            status="Recommended", risk_level="NORMAL",
+        )
+        mla_wa = WorkAnalysis(
+            work_id=1_000_100, member_type="MLA", member_id=200,
+            status="Sanctioned", risk_level="LOW",
+        )
+
+        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+             patch("automation.pipeline_controller.sb_delete", return_value=200), \
+             patch("supabase.create_client") as mock_create:
+            mock_client = MagicMock()
+            mock_create.return_value = mock_client
+
+            result = stage_work_analysis_persist(
+                [mp_wa, mla_wa], affected_work_ids={100, 1_000_100}
+            )
+
+        assert result["mp_written"] == 1
+        assert result["mla_written"] == 1
+        assert result["total"] == 2
+
+    def test_persist_only_affected_works(self):
+        """Only affected works are persisted, not all."""
+        from analysis.models import WorkAnalysis
+        from automation.pipeline_controller import stage_work_analysis_persist
+
+        wa1 = WorkAnalysis(
+            work_id=100, member_type="MP", member_id=50,
+            status="Completed", risk_level="NORMAL",
+        )
+        wa2 = WorkAnalysis(
+            work_id=200, member_type="MP", member_id=60,
+            status="Completed", risk_level="LOW",
+        )
+
+        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+             patch("automation.pipeline_controller.sb_delete", return_value=200), \
+             patch("supabase.create_client") as mock_create:
+            mock_client = MagicMock()
+            mock_create.return_value = mock_client
+
+            # Only work_id=100 is affected
+            result = stage_work_analysis_persist(
+                [wa1, wa2], affected_work_ids={100}
+            )
+
+        assert result["mp_written"] == 1  # Only wa1
+        assert result["total"] == 1
+
+    def test_persist_full_mode_persists_all(self):
+        """Full mode (affected_work_ids=None) persists all analyses."""
+        from analysis.models import WorkAnalysis
+        from automation.pipeline_controller import stage_work_analysis_persist
+
+        analyses = [
+            WorkAnalysis(work_id=i, member_type="MP", member_id=i,
+                         status="Completed", risk_level="NORMAL")
+            for i in range(10)
+        ]
+
+        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+             patch("automation.pipeline_controller.sb_delete", return_value=200), \
+             patch("supabase.create_client") as mock_create:
+            mock_client = MagicMock()
+            mock_create.return_value = mock_client
+
+            result = stage_work_analysis_persist(analyses)
+
+        assert result["mp_written"] == 10
+        assert result["total"] == 10
+
+    def test_persist_includes_risk_flags(self):
+        """Persisted record includes risk_flags as list."""
+        from analysis.models import WorkAnalysis
+        from automation.pipeline_controller import stage_work_analysis_persist
+
+        wa = WorkAnalysis(
+            work_id=100, member_type="MP", member_id=50,
+            status="Completed", risk_level="HIGH",
+            risk_flags=["HIGH_COST", "LONG_DURATION"],
+            flag_count=2,
+        )
+
+        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+             patch("automation.pipeline_controller.sb_delete", return_value=200), \
+             patch("supabase.create_client") as mock_create:
+            mock_client = MagicMock()
+            mock_create.return_value = mock_client
+
+            # Capture the inserted record
+            inserted_records = []
+            def capture_insert(table):
+                mock_table = MagicMock()
+                def do_insert(records):
+                    if isinstance(records, list):
+                        inserted_records.extend(records)
+                    else:
+                        inserted_records.append(records)
+                    return MagicMock()
+                mock_table.insert = do_insert
+                return mock_table
+            mock_client.table.side_effect = capture_insert
+
+            result = stage_work_analysis_persist([wa], affected_work_ids={100})
+
+        assert len(inserted_records) == 1
+        rec = inserted_records[0]
+        assert rec["risk_flags"] == ["HIGH_COST", "LONG_DURATION"]
+        assert rec["flag_count"] == 2
+        assert rec["risk_level"] == "HIGH"
+
+    def test_persist_dry_run_skips_db_writes(self):
+        """When dry_run=True, pipeline_controller returns early before DB writes."""
+        from automation.pipeline_controller import run_pipeline
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_dir = Path(tmpdir) / "snapshot"
+            snapshot_dir.mkdir()
+
+            for ds in ["allocated_limit", "works_recommended", "works_sanctioned",
+                       "works_completed", "expenditure", "calamity"]:
+                ds_dir = snapshot_dir / ds
+                ds_dir.mkdir()
+                if ds == "allocated_limit":
+                    records = [
+                        json.dumps({
+                            "mp_id": 100, "mp_name": "Test MP",
+                            "state_id": "S1", "state_name": "State 1",
+                            "constituency_id": "C1",
+                            "allocated_amt": 5000000.0,
+                            "recommendation_date": "2024-01-15",
+                        })
+                    ]
+                    (ds_dir / "part_0001.ndjson").write_text("\n".join(records) + "\n")
+                else:
+                    (ds_dir / "part_0001.ndjson").write_text("")
+
+            complete = snapshot_dir / "_COMPLETE.json"
+            complete.write_text(json.dumps({
+                "timestamp": "2024-06-01T00-00-00Z",
+                "status": "complete",
+            }))
+
+            with patch("automation.pipeline_controller.load_config") as mock_cfg:
+                mock_cfg.return_value = MagicMock(
+                    db1_url="http://fake", db1_key="fake-key",
+                    db2_url="http://fake2", db2_key="fake-key2",
+                    db2_ready=False, gemini_keys=[]
+                )
+                result = run_pipeline(
+                    snapshot_dir=str(snapshot_dir),
+                    reference_date=date(2024, 6, 1),
+                    run_id="test_dry_run_persist",
+                    skip_gemini=True,
+                    skip_ingest=True,
+                    dry_run=True,
+                    mode="full",
+                )
+
+            # dry_run returns before DB write stages; work_analysis_persist is marked skipped
+            assert result["status"] == "DRY_RUN"
+            assert result["stages"]["work_analysis_persist"] == {"skipped": True, "reason": "dry_run"}

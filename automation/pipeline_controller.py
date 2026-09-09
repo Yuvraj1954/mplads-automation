@@ -51,7 +51,7 @@ from automation.db_config import load_config, get_config, get_db1, get_db2, SSL_
 PIPELINE_VERSION = "pipeline_v2"
 STAGES = [
     "fetch", "compare", "delta", "ingest", "affected",
-    "analyze", "anomaly", "analytics_persist",
+    "analyze", "work_analysis_persist", "anomaly", "analytics_persist",
     "evidence", "evidence_work_refs", "gemini",
     "persist", "verify", "cleanup",
 ]
@@ -501,6 +501,142 @@ def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
         "affected_state_metrics": affected_state_metrics,
         "is_affected_mode": True,
     }
+
+
+def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
+    """Stage 6b: Persist work analysis to DB1.work_analysis / DB1.mla_work_analysis.
+
+    For affected mode: only replaces analysis for affected works.
+    Uses delete-then-insert (not upsert) because DB1 work_analysis tables
+    lack a unique index on work_id.
+
+    Args:
+        work_analyses: list of WorkAnalysis objects from stage_analyze
+        affected_work_ids: set of snapshot work_ids that are affected.
+                          If None, persists all (full mode).
+
+    Returns:
+        dict with write stats
+    """
+    print("\n=== STAGE 6b: WORK ANALYSIS PERSIST ===")
+
+    db1_url, db1_key = get_db1()
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    # Separate MP and MLA
+    mp_analyses = [wa for wa in work_analyses if wa.member_type == "MP"]
+    mla_analyses = [wa for wa in work_analyses if wa.member_type == "MLA"]
+
+    if affected_work_ids is not None:
+        mp_analyses = [wa for wa in mp_analyses if wa.work_id in affected_work_ids]
+        mla_analyses = [wa for wa in mla_analyses if wa.work_id in affected_work_ids]
+
+    print(f"  MP analyses to persist: {len(mp_analyses)}")
+    print(f"  MLA analyses to persist: {len(mla_analyses)}")
+
+    def _work_analysis_to_record(wa):
+        """Convert WorkAnalysis dataclass to DB1 record dict."""
+        return {
+            "work_id": wa.work_id,
+            "member_id": wa.member_id,
+            "member_type": wa.member_type,
+            "constituency_id": wa.constituency_id,
+            "state_id": wa.state_id,
+            "state_name": getattr(wa, "state_name", ""),
+            "work_category": getattr(wa, "work_category", ""),
+            "activity_name": getattr(wa, "activity_name", ""),
+            "normalized_activity": wa.normalized_activity,
+            "work_description": getattr(wa, "work_description", ""),
+            "status": wa.status,
+            "recommended_amount": wa.recommended_amount,
+            "sanction_amount": wa.sanction_amount,
+            "expenditure_amount": wa.expenditure_amount,
+            "completion_amount": wa.completion_amount,
+            "recommendation_date": str(wa.recommendation_date) if wa.recommendation_date else None,
+            "sanction_date": str(wa.sanction_date) if wa.sanction_date else None,
+            "first_expenditure_date": str(getattr(wa, "first_expenditure_date", None)) if getattr(wa, "first_expenditure_date", None) else None,
+            "last_expenditure_date": str(wa.last_expenditure_date) if wa.last_expenditure_date else None,
+            "completion_date": str(wa.completion_date) if wa.completion_date else None,
+            "sanction_delay_days": wa.sanction_delay_days,
+            "project_age_days": wa.project_age_days,
+            "execution_days": wa.execution_days,
+            "pending_days": wa.pending_days,
+            "expenditure_percentage": wa.expenditure_percentage,
+            "completion_percentage": wa.completion_percentage,
+            "benchmark_peer_group": wa.benchmark_peer_group,
+            "benchmark_quality": wa.benchmark_quality,
+            "benchmark_sample_size": wa.benchmark_sample_size,
+            "cost_p25": wa.cost_p25,
+            "cost_p50": wa.cost_p50,
+            "cost_p75": wa.cost_p75,
+            "cost_p90": wa.cost_p90,
+            "cost_p95": wa.cost_p95,
+            "duration_p25": wa.duration_p25,
+            "duration_p50": wa.duration_p50,
+            "duration_p75": wa.duration_p75,
+            "duration_p90": wa.duration_p90,
+            "duration_p95": wa.duration_p95,
+            "cost_percentile": wa.cost_percentile,
+            "duration_percentile": wa.duration_percentile,
+            "cost_status": wa.cost_status,
+            "duration_status": wa.duration_status,
+            "cost_deviation_from_median_percentage": wa.cost_deviation_from_median_percentage,
+            "duration_deviation_from_median_percentage": wa.duration_deviation_from_median_percentage,
+            "risk_flags": wa.risk_flags if isinstance(wa.risk_flags, list) else [],
+            "flag_count": wa.flag_count,
+            "risk_level": wa.risk_level,
+            "last_calculated": now_str,
+        }
+
+    def _persist_batch(table_name, analyses, label):
+        """Delete affected records then insert fresh ones."""
+        if not analyses:
+            print(f"  {label}: no analyses to persist")
+            return 0
+
+        records = [_work_analysis_to_record(wa) for wa in analyses]
+        work_ids = [r["work_id"] for r in records]
+
+        # Step 1: Delete affected records (by work_id ranges for efficiency)
+        if affected_work_ids is not None:
+            deleted = 0
+            for wid in work_ids:
+                try:
+                    sb_delete(db1_url, db1_key, table_name,
+                              {"work_id": f"eq.{wid}"})
+                    deleted += 1
+                except Exception:
+                    pass
+            print(f"  {label}: deleted {deleted} affected records")
+
+        # Step 2: Insert fresh records in batches
+        batch_size = 500
+        inserted = 0
+        from supabase import create_client
+        client = create_client(db1_url, db1_key)
+        for start in range(0, len(records), batch_size):
+            batch = records[start:start + batch_size]
+            try:
+                client.table(table_name).insert(batch).execute()
+                inserted += len(batch)
+            except Exception as e:
+                print(f"  WARNING: batch insert failed for {label}: {e}")
+                for row in batch:
+                    try:
+                        client.table(table_name).insert(row).execute()
+                        inserted += 1
+                    except Exception as e2:
+                        print(f"  WARNING: individual insert failed: {e2}")
+
+        print(f"  {label}: inserted {inserted} records")
+        return inserted
+
+    mp_written = _persist_batch("work_analysis", mp_analyses, "MP work_analysis")
+    mla_written = _persist_batch("mla_work_analysis", mla_analyses, "MLA mla_work_analysis")
+
+    total = mp_written + mla_written
+    print(f"  Total work analysis persisted: {total}")
+    return {"mp_written": mp_written, "mla_written": mla_written, "total": total}
 
 
 def stage_anomaly(pipeline_result, reference_date=None):
@@ -1367,6 +1503,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             timing["analyze"] = _elapsed(t6)
 
             # Stage 7: Entity Anomaly (use full pipeline for reference statistics)
+            # Runs even in dry_run — it's deterministic with no DB writes.
             t7 = _timer()
             anomaly_result = stage_anomaly(analysis_result, reference_date)
             results["stages"]["anomaly"] = {
@@ -1378,6 +1515,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
 
             if dry_run:
                 print("\n=== DRY RUN: Skipping DB writes, evidence, and Gemini ===")
+                results["stages"]["work_analysis_persist"] = {"skipped": True, "reason": "dry_run"}
                 results["stages"]["analytics_persist"] = {"skipped": True, "reason": "dry_run"}
                 results["stages"]["evidence"] = {"skipped": True, "reason": "dry_run"}
                 results["stages"]["evidence_work_refs"] = {"skipped": True, "reason": "dry_run"}
@@ -1389,6 +1527,26 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 results["completed_at"] = _now_iso()
                 results["timing"] = timing
                 return results
+
+            # Stage 6b: Persist affected work analysis to DB1
+            t6b = _timer()
+            work_analysis_result = stage_work_analysis_persist(
+                analysis_result["work_analyses"],
+                affected_work_ids=affected_result.get("affected_work_ids") if affected_result else None,
+            )
+            results["stages"]["work_analysis_persist"] = work_analysis_result
+            save_checkpoint(run_id, "work_analysis_persist", work_analysis_result)
+            timing["work_analysis_persist"] = _elapsed(t6b)
+
+            # Stage 7b: Persist analytics (affected members/states only)
+            t7 = _timer()
+            anomaly_result = stage_anomaly(analysis_result, reference_date)
+            results["stages"]["anomaly"] = {
+                "member_anomalies": len(anomaly_result["member_anomalies"]),
+                "state_anomalies": len(anomaly_result["state_anomalies"]),
+            }
+            save_checkpoint(run_id, "anomaly", results["stages"]["anomaly"])
+            timing["anomaly"] = _elapsed(t7)
 
             # Stage 7b: Persist analytics (affected members/states only)
             t7b = _timer()
@@ -1484,6 +1642,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             timing["analyze"] = _elapsed(t6)
 
             # Stage 7: Entity Anomaly
+            # Runs even in dry_run — it's deterministic with no DB writes.
             t7 = _timer()
             anomaly_result = stage_anomaly(analysis_result, reference_date)
             results["stages"]["anomaly"] = {
@@ -1495,6 +1654,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
 
             if dry_run:
                 print("\n=== DRY RUN: Skipping DB writes, evidence, and Gemini ===")
+                results["stages"]["work_analysis_persist"] = {"skipped": True, "reason": "dry_run"}
                 results["stages"]["analytics_persist"] = {"skipped": True, "reason": "dry_run"}
                 results["stages"]["evidence"] = {"skipped": True, "reason": "dry_run"}
                 results["stages"]["evidence_work_refs"] = {"skipped": True, "reason": "dry_run"}
@@ -1506,6 +1666,15 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 results["completed_at"] = _now_iso()
                 results["timing"] = timing
                 return results
+
+            # Stage 6b: Persist all work analysis to DB1 (full mode)
+            t6b = _timer()
+            work_analysis_result = stage_work_analysis_persist(
+                analysis_result["work_analyses"],
+            )
+            results["stages"]["work_analysis_persist"] = work_analysis_result
+            save_checkpoint(run_id, "work_analysis_persist", work_analysis_result)
+            timing["work_analysis_persist"] = _elapsed(t6b)
 
             # Stage 7b: Persist analytics to DB2
             t7b = _timer()

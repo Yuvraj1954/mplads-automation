@@ -14,8 +14,8 @@ on:
         default: false
 
   schedule:
-    # 18:30 UTC = 00:00 IST (midnight Indian Standard Time)
-    - cron: "30 18 * * *"
+    # 16:30 UTC = 22:00 IST (10 PM Indian Standard Time)
+    - cron: "30 16 * * *"
 
 concurrency:
   group: mplads-daily-pipeline
@@ -131,6 +131,54 @@ jobs:
           "
 
       # ===========================================================
+      # CACHE RESTORE: Attempt 3 (only if attempts 1-2 both failed)
+      # ===========================================================
+      - name: Clear invalid cache for retry 2
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        run: rm -rf /tmp/mplads-work
+
+      - name: Restore snapshot cache (attempt 3)
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        uses: actions/cache/restore@v4
+        id: cache-restore-3
+        with:
+          path: /tmp/mplads-work
+          key: mplads-snapshot-state-${{ github.run_id }}
+          restore-keys: |
+            mplads-snapshot-state-
+
+      - name: Validate cache (attempt 3)
+        if: steps.validate-1.outputs.cache_valid != 'true' && steps.validate-2.outputs.cache_valid != 'true' && github.event.inputs.bootstrap != 'true'
+        id: validate-3
+        working-directory: ${{ github.workspace }}/repo
+        run: |
+          python3 -c "
+          import sys
+          sys.path.insert(0, '.')
+          from automation.snapshot_cache import validate_cache, get_previous_timestamp, get_current_timestamp
+          from pathlib import Path
+
+          work_dir = Path('/tmp/mplads-work')
+          if not work_dir.exists():
+              print('Cache still missing after retry 2')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=false\n')
+              sys.exit(0)
+
+          ok, err = validate_cache(work_dir)
+          if ok:
+              prev_ts = get_previous_timestamp(work_dir)
+              curr_ts = get_current_timestamp(work_dir)
+              print(f'Cache valid on retry 2: previous={prev_ts}, current={curr_ts}')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=true\n')
+          else:
+              print(f'Cache still invalid after retry 2: {err}')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('cache_valid=false\n')
+          "
+
+      # ===========================================================
       # VALIDATE BOOTSTRAP CACHE: Check if current snapshot is usable
       # ===========================================================
       - name: Validate bootstrap cache
@@ -176,11 +224,12 @@ jobs:
           fi
           VALID_1="${{ steps.validate-1.outputs.cache_valid }}"
           VALID_2="${{ steps.validate-2.outputs.cache_valid }}"
-          if [ "$VALID_1" == "true" ] || [ "$VALID_2" == "true" ]; then
+          VALID_3="${{ steps.validate-3.outputs.cache_valid }}"
+          if [ "$VALID_1" == "true" ] || [ "$VALID_2" == "true" ] || [ "$VALID_3" == "true" ]; then
             echo "Cache available — normal path"
             echo "use_supabase_fallback=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Cache unavailable after retries — Supabase fallback"
+            echo "Cache unavailable after 3 retries — Supabase fallback"
             echo "use_supabase_fallback=true" >> "$GITHUB_OUTPUT"
           fi
 

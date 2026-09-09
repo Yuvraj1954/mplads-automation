@@ -26,6 +26,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -259,8 +261,95 @@ def stage_upload(snapshot_path, run_id):
 # STAGE 5: FULL DB1 INGESTION VIA EDGE FUNCTIONS
 # ============================================================
 
+# Per-job timeout: 5 minutes.  Transport-level retry only.
+# If a single edge function call takes longer, we recover the stuck
+# job and move on.  This does NOT terminate the overall bootstrap.
+PER_JOB_TIMEOUT_SECONDS = 5 * 60
+
+# Maximum retry passes after the first pass.  Each retry only
+# re-processes jobs that failed or timed out (never completed).
+MAX_RETRY_PASSES = 3
+
+# Poll interval between worker calls.
+WORKER_POLL_INTERVAL = 15
+
+# HTTP request timeout for individual edge function calls.
+HTTP_TIMEOUT = 120
+
+
+def _recover_stuck_jobs(sb, run_id, per_job_timeout):
+    """Reset jobs stuck in 'processing' past the per-job timeout.
+
+    The edge function has no per-job timeout.  If the client's HTTP
+    request times out while the edge function is still running, the
+    job stays stuck in 'processing' forever.  This resets those jobs
+    back to 'pending' so the next worker call can claim them.
+
+    Safety: only resets jobs whose started_at is older than
+    per_job_timeout seconds AND whose attempts are below the retry
+    limit.  Jobs that genuinely completed on the server side will be
+    marked 'completed' by the edge function's own completion path.
+    """
+    result = (
+        sb.table("ingestion_jobs")
+        .select("job_id, started_at, attempts")
+        .eq("run_id", run_id)
+        .eq("status", "processing")
+        .execute()
+    )
+    stuck = result.data or []
+    recovered = 0
+    now = time.time()
+
+    for job in stuck:
+        started = job.get("started_at")
+        attempts = int(job.get("attempts", 0) or 0)
+        if not started or attempts >= MAX_RETRY_PASSES:
+            continue
+        try:
+            started_ts = datetime.fromisoformat(
+                started.replace("Z", "+00:00")
+            ).timestamp()
+        except (ValueError, TypeError):
+            continue
+        if now - started_ts > per_job_timeout:
+            sb.table("ingestion_jobs").update({
+                "status": "pending",
+                "error_message": f"Timed out after {per_job_timeout}s (attempt {attempts})",
+            }).eq("job_id", job["job_id"]).execute()
+            recovered += 1
+
+    return recovered
+
+
+def _query_job_counts(sb, run_id):
+    """Return {status: count} for the given run_id."""
+    counts = {}
+    for status in ["completed", "pending", "processing", "failed"]:
+        r = (
+            sb.table("ingestion_jobs")
+            .select("job_id", count="exact")
+            .eq("run_id", run_id)
+            .eq("status", status)
+            .execute()
+        )
+        counts[status] = r.count or 0
+    return counts
+
+
 def stage_ingest(run_id):
-    """Run full DB1 ingestion via edge functions."""
+    """Run full DB1 ingestion via edge functions.
+
+    NO global time ceiling.  Local bootstrap waits until all jobs
+    finish, regardless of elapsed time.
+
+    Retry model:
+        - Per-job: 5 minutes.  If a worker call takes longer than
+          this, we recover the stuck job and move on.
+        - After first pass: retry failed/timed-out jobs up to
+          MAX_RETRY_PASSES times with the same per-job limit.
+        - Final gate: ALL jobs must be completed.  No silent skips.
+    """
     print("\n" + "=" * 70)
     print("STAGE 5: FULL DB1 INGESTION")
     print("=" * 70)
@@ -272,11 +361,12 @@ def stage_ingest(run_id):
         "apikey": SERVICE_KEY,
     }
 
-    import urllib.request
     import ssl
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+
+    sb = create_client(SUPABASE_URL, SERVICE_KEY)
 
     # Create ingestion jobs
     print("  Creating ingestion jobs...")
@@ -293,43 +383,129 @@ def stage_ingest(run_id):
         raise RuntimeError(f"Controller created 0 jobs (response: {controller})")
     print(f"  Expected jobs: {expected_jobs}")
 
-    # Run worker loop
-    print("  Running worker...")
-    worker_max_minutes = 60
-    worker_start = time.time()
-    worker_interval = 60
+    pipeline_start = time.time()
 
-    while True:
-        elapsed = time.time() - worker_start
-        if elapsed > worker_max_minutes * 60:
-            raise RuntimeError(f"Worker timed out after {worker_max_minutes} minutes")
+    # ── FIRST PASS ────────────────────────────────────────────
+    print("  --- First pass ---")
+    _run_worker_loop(
+        run_id, url, headers, ctx, sb,
+        expected_jobs, pipeline_start,
+    )
 
-        body = json.dumps({"run_id": run_id}).encode()
-        req = urllib.request.Request(
-            f"{url}/mplads-worker",
-            data=body, headers=headers, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
-            result = json.loads(resp.read().decode())
-
-        print(f"  Worker: {result}")
-        if result.get("success") and (
-            result.get("message") == "All ingestion jobs completed."
-            or result.get("progress", {}).get("remaining", 1) == 0
-        ):
+    # ── RETRY PASSES ──────────────────────────────────────────
+    for retry_num in range(1, MAX_RETRY_PASSES + 1):
+        counts = _query_job_counts(sb, run_id)
+        non_completed = counts["pending"] + counts["processing"] + counts["failed"]
+        if non_completed == 0:
             break
 
-        remaining = worker_max_minutes - (elapsed / 60)
-        print(f"  Worker remaining budget: {remaining:.1f} minutes")
-        time.sleep(worker_interval)
+        elapsed_min = (time.time() - pipeline_start) / 60
 
-    # Verify
-    print("  Verifying ingestion...")
-    from automation.daily_pipeline import verify_run
-    if not verify_run(run_id, expected_jobs):
-        raise RuntimeError("DB1 ingestion verification failed")
+        print(f"  --- Retry pass {retry_num}/{MAX_RETRY_PASSES} "
+              f"({non_completed} jobs to retry, {elapsed_min:.1f}m elapsed) ---")
 
-    print(f"  ✓ DB1 ingestion complete: {expected_jobs} jobs")
+        # Recover any stuck processing jobs before retrying
+        recovered = _recover_stuck_jobs(sb, run_id, PER_JOB_TIMEOUT_SECONDS)
+        if recovered:
+            print(f"  Recovered {recovered} stuck jobs")
+
+        _run_worker_loop(
+            run_id, url, headers, ctx, sb,
+            expected_jobs, pipeline_start,
+        )
+
+    # ── FINAL GATE ────────────────────────────────────────────
+    print("  --- Final verification ---")
+    counts = _query_job_counts(sb, run_id)
+    total = sum(counts.values())
+    elapsed_min = (time.time() - pipeline_start) / 60
+
+    print(f"  Counts after {elapsed_min:.1f}m: {counts}")
+
+    if total != expected_jobs:
+        raise RuntimeError(
+            f"Final gate FAILED: total jobs {total} != expected {expected_jobs}"
+        )
+    if counts["completed"] != expected_jobs:
+        raise RuntimeError(
+            f"Final gate FAILED: {counts['completed']}/{expected_jobs} completed "
+            f"(pending={counts['pending']}, processing={counts['processing']}, "
+            f"failed={counts['failed']})"
+        )
+    if counts["pending"] > 0 or counts["processing"] > 0 or counts["failed"] > 0:
+        raise RuntimeError(
+            f"Final gate FAILED: incomplete ingestion — {counts}"
+        )
+
+    print(f"  ✓ DB1 ingestion complete: {expected_jobs}/{expected_jobs} jobs "
+          f"in {elapsed_min:.1f}m")
+
+
+def _run_worker_loop(run_id, url, headers, ctx, sb, expected_jobs, pipeline_start):
+    """Worker loop with per-job timeout and stuck recovery.
+
+    NO global time ceiling.  Each iteration calls the mplads-worker
+    edge function which claims and processes ONE pending job.  If the
+    call takes longer than PER_JOB_TIMEOUT_SECONDS, we recover the
+    stuck job on the next iteration.
+    """
+    worker_start = time.time()
+
+    while True:
+        # Recover stuck processing jobs
+        recovered = _recover_stuck_jobs(sb, run_id, PER_JOB_TIMEOUT_SECONDS)
+        if recovered:
+            print(f"  Recovered {recovered} stuck jobs")
+
+        # Check remaining work
+        counts = _query_job_counts(sb, run_id)
+        remaining = counts["pending"] + counts["processing"] + counts["failed"]
+        completed = counts["completed"]
+
+        if remaining == 0:
+            print(f"  All {completed}/{expected_jobs} jobs completed")
+            break
+
+        global_elapsed = time.time() - pipeline_start
+        elapsed_min = global_elapsed / 60
+        print(
+            f"  Progress: {completed}/{expected_jobs} completed, "
+            f"{remaining} remaining, "
+            f"{elapsed_min:.1f}m elapsed"
+        )
+
+        # Call worker with per-job timeout
+        job_start = time.time()
+        try:
+            body = json.dumps({"run_id": run_id}).encode()
+            req = urllib.request.Request(
+                f"{url}/mplads-worker",
+                data=body, headers=headers, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
+                result = json.loads(resp.read().decode())
+
+            job_elapsed = time.time() - job_start
+            print(f"  Worker call: {job_elapsed:.1f}s — {result}")
+
+            # If worker says all done, break
+            if result.get("success") and (
+                result.get("message") == "All ingestion jobs completed."
+                or result.get("progress", {}).get("remaining", 1) == 0
+            ):
+                break
+
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+            job_elapsed = time.time() - job_start
+            print(f"  Worker call failed after {job_elapsed:.1f}s: {exc}")
+
+            # If the HTTP call itself timed out, the edge function may
+            # still be running.  Recover stuck jobs on next iteration.
+            if job_elapsed >= PER_JOB_TIMEOUT_SECONDS:
+                print(f"  Per-job timeout ({PER_JOB_TIMEOUT_SECONDS}s) exceeded — "
+                      f"will recover stuck jobs next iteration")
+
+        time.sleep(WORKER_POLL_INTERVAL)
 
 
 # ============================================================
