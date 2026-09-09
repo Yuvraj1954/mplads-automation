@@ -404,12 +404,18 @@ def test_time_sensitive():
     works_by_id = {
         1: {"work_id": 1, "status": "In Progress",
             "sanction_date": date(2024, 1, 1),
+            "completion_date": None,
+            "recommendation_date": date(2023, 6, 1),
             "last_expenditure_date": None},
         2: {"work_id": 2, "status": "Completed",
             "sanction_date": date(2024, 1, 1),
+            "completion_date": date(2024, 6, 1),
+            "recommendation_date": date(2023, 6, 1),
             "last_expenditure_date": None},
         3: {"work_id": 3, "status": "Recommended",
             "sanction_date": None,
+            "completion_date": None,
+            "recommendation_date": date(2024, 10, 1),
             "last_expenditure_date": None},
     }
 

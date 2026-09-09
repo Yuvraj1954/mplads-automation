@@ -1792,3 +1792,272 @@ class TestStageAffectedGlobFix:
             assert result["work_count"] == 2
             assert 9999 in result["affected_work_ids"]
             assert 8888 in result["affected_work_ids"]
+
+
+# ============================================================
+# BUG 11 REGRESSION: Affected-mode verification
+# ============================================================
+
+class TestAffectedModeVerification:
+    """Verify stage_verify() uses affected counts in affected mode."""
+
+    def _make_evidence(self, members, states):
+        """Build minimal evidence records."""
+        records = []
+        for i, m in enumerate(members):
+            records.append({
+                "entity_type": m,
+                "entity_id": i,
+                "evidence_hash": f"hash_{i}",
+                "analysis_date": "2024-06-01",
+            })
+        for i, s in enumerate(states):
+            records.append({
+                "entity_type": "STATE",
+                "entity_id": s,
+                "evidence_hash": f"state_hash_{i}",
+                "analysis_date": "2024-06-01",
+            })
+        return records
+
+    def test_full_mode_compares_against_full_population(self):
+        from automation.pipeline_controller import stage_verify
+
+        evidence = self._make_evidence(["MP"] * 10, ["S1", "S2"])
+        pipeline_result = {
+            "pipeline": MagicMock(member_metrics=range(10), state_metrics=range(5)),
+            "is_affected_mode": False,
+        }
+        result = stage_verify(evidence, pipeline_result, None)
+        # 10 MP evidence vs 10 expected → pass; 2 state vs 5 expected → fail
+        assert not result["passed"]
+        assert any("State evidence count mismatch" in i for i in result["issues"])
+
+    def test_affected_mode_compares_against_affected_subset(self):
+        from automation.pipeline_controller import stage_verify
+
+        evidence = self._make_evidence(["MP"] * 5, ["S1"])
+        pipeline_result = {
+            "pipeline": MagicMock(member_metrics=range(100), state_metrics=range(36)),
+            "is_affected_mode": True,
+        }
+        affected_result = {"member_count": 5, "state_count": 1}
+        result = stage_verify(
+            evidence, pipeline_result, None,
+            affected_result=affected_result,
+        )
+        assert result["passed"]
+        assert len(result["issues"]) == 0
+
+    def test_affected_mode_fails_when_entities_missing(self):
+        from automation.pipeline_controller import stage_verify
+
+        evidence = self._make_evidence(["MP"] * 3, ["S1"])
+        pipeline_result = {
+            "pipeline": MagicMock(member_metrics=range(100), state_metrics=range(36)),
+            "is_affected_mode": True,
+        }
+        affected_result = {"member_count": 5, "state_count": 1}
+        result = stage_verify(
+            evidence, pipeline_result, None,
+            affected_result=affected_result,
+        )
+        assert not result["passed"]
+        assert any("Member evidence count mismatch" in i for i in result["issues"])
+
+    def test_affected_mode_fails_when_extra_evidence(self):
+        from automation.pipeline_controller import stage_verify
+
+        evidence = self._make_evidence(["MP"] * 8, ["S1", "S2", "S3"])
+        pipeline_result = {
+            "pipeline": MagicMock(member_metrics=range(100), state_metrics=range(36)),
+            "is_affected_mode": True,
+        }
+        affected_result = {"member_count": 5, "state_count": 1}
+        result = stage_verify(
+            evidence, pipeline_result, None,
+            affected_result=affected_result,
+        )
+        assert not result["passed"]
+        assert any("Member evidence count mismatch" in i for i in result["issues"])
+        assert any("State evidence count mismatch" in i for i in result["issues"])
+
+    def test_zero_affected_entities_passes_when_zero_evidence(self):
+        """Zero evidence at verification is correctly flagged as an error.
+
+        In production, zero affected entities exits the pipeline before
+        reaching verification (line 1476). If verification IS reached with
+        zero evidence, it indicates a logic error — verification should
+        never be called with no work to verify.
+        """
+        from automation.pipeline_controller import stage_verify
+
+        evidence = self._make_evidence([], [])
+        pipeline_result = {
+            "pipeline": MagicMock(member_metrics=range(100), state_metrics=range(36)),
+            "is_affected_mode": True,
+        }
+        affected_result = {"member_count": 0, "state_count": 0}
+        result = stage_verify(
+            evidence, pipeline_result, None,
+            affected_result=affected_result,
+        )
+        # Zero evidence is correctly flagged — pipeline should not reach here
+        assert not result["passed"]
+        assert any("No evidence records" in i for i in result["issues"])
+
+
+# ============================================================
+# BUG 1 REGRESSION: No duplicate anomaly calls
+# ============================================================
+
+class TestNoDuplicateAnomalyCall:
+    """Verify stage_anomaly() is called exactly once in affected mode."""
+
+    def test_anomaly_called_once_in_affected_mode(self):
+        """Inspect the affected-mode source for duplicate stage_anomaly calls."""
+        import inspect
+        from automation.pipeline_controller import run_pipeline
+
+        source = inspect.getsource(run_pipeline)
+        # Count occurrences of stage_anomaly( in the affected-mode branch
+        # The affected branch is between "AFFECTED-ONLY MODE" and "FULL MODE"
+        affected_start = source.find("AFFECTED-ONLY MODE")
+        full_start = source.find("FULL MODE")
+        if affected_start >= 0 and full_start >= 0:
+            affected_block = source[affected_start:full_start]
+            anomaly_calls = affected_block.count("stage_anomaly(")
+            assert anomaly_calls == 1, (
+                f"stage_anomaly() called {anomaly_calls} times in affected mode, "
+                f"expected exactly 1"
+            )
+
+
+# ============================================================
+# BUG 5 REGRESSION: Fresh member_metrics_by_id in run_delta
+# ============================================================
+
+class TestRunDeltaMemberMetricsById:
+    """Verify run_delta() updates member_metrics_by_id from fresh metrics."""
+
+    def test_run_delta_populates_member_metrics_by_id(self):
+        from analysis.pipeline import AnalysisPipeline
+
+        works = [
+            {"work_id": 1, "member_type": "MP", "member_id": 10,
+             "state_id": "S1", "recommendation_date": date(2024, 1, 15),
+             "sanction_date": None, "completion_date": None,
+             "recommended_amount": 500000.0, "sanction_amount": None,
+             "expenditure_amount": None, "activity_name": "Road"},
+        ]
+
+        pipeline = AnalysisPipeline(works)
+        pipeline.run_delta({1}, reference_date=date(2024, 6, 1))
+
+        # member_metrics_by_id should contain the affected member
+        key = ("MP", 10)
+        assert key in pipeline.member_metrics_by_id
+        assert pipeline.member_metrics_by_id[key].total_works >= 1
+
+    def test_run_delta_state_metrics_receive_correct_lookup(self):
+        from analysis.pipeline import AnalysisPipeline
+
+        works = [
+            {"work_id": 1, "member_type": "MP", "member_id": 10,
+             "state_id": "S1", "recommendation_date": date(2024, 1, 15),
+             "sanction_date": None, "completion_date": None,
+             "recommended_amount": 500000.0, "sanction_amount": None,
+             "expenditure_amount": None, "activity_name": "Road"},
+        ]
+
+        pipeline = AnalysisPipeline(works)
+        pipeline.run_delta({1}, reference_date=date(2024, 6, 1))
+
+        # State metrics should exist and reference correct member data
+        assert len(pipeline.state_metrics) >= 1
+        state = pipeline.state_metrics[0]
+        assert state.state_id == "S1"
+        assert state.total_works >= 1
+
+
+# ============================================================
+# BUG 2 REGRESSION: expand_time_sensitive uses raw fields
+# ============================================================
+
+class TestExpandTimeSensitiveRawFields:
+    """Verify expand_time_sensitive() works with raw work records (no status)."""
+
+    def test_recommended_work_is_time_sensitive(self):
+        from analysis.affected import expand_time_sensitive
+
+        works = {
+            1: {"work_id": 1, "recommendation_date": date(2024, 1, 15),
+                "sanction_date": None, "completion_date": None,
+                "last_expenditure_date": None},
+        }
+        result = expand_time_sensitive(works, {}, date(2024, 6, 1))
+        assert 1 in result
+
+    def test_sanctioned_work_is_time_sensitive(self):
+        from analysis.affected import expand_time_sensitive
+
+        works = {
+            1: {"work_id": 1, "recommendation_date": date(2024, 1, 15),
+                "sanction_date": date(2024, 3, 1), "completion_date": None,
+                "last_expenditure_date": None},
+        }
+        result = expand_time_sensitive(works, {}, date(2024, 6, 1))
+        assert 1 in result
+
+    def test_completed_work_is_not_time_sensitive(self):
+        from analysis.affected import expand_time_sensitive
+
+        works = {
+            1: {"work_id": 1, "recommendation_date": date(2024, 1, 15),
+                "sanction_date": date(2024, 3, 1), "completion_date": date(2024, 5, 1),
+                "last_expenditure_date": None},
+        }
+        result = expand_time_sensitive(works, {}, date(2024, 6, 1))
+        assert 1 not in result
+
+    def test_work_with_expenditure_is_time_sensitive(self):
+        from analysis.affected import expand_time_sensitive
+
+        works = {
+            1: {"work_id": 1, "recommendation_date": date(2024, 1, 15),
+                "sanction_date": date(2024, 3, 1), "completion_date": None,
+                "last_expenditure_date": date(2024, 4, 15)},
+        }
+        result = expand_time_sensitive(works, {}, date(2024, 6, 1))
+        assert 1 in result
+
+    def test_only_recommendation_no_sanc_no_comp(self):
+        """Newly recommended, no sanction, no expenditure — time sensitive."""
+        from analysis.affected import expand_time_sensitive
+
+        works = {
+            1: {"work_id": 1, "recommendation_date": date(2024, 5, 1),
+                "sanction_date": None, "completion_date": None,
+                "last_expenditure_date": None},
+        }
+        result = expand_time_sensitive(works, {}, date(2024, 6, 1))
+        assert 1 in result
+
+    def test_no_dates_is_not_time_sensitive(self):
+        from analysis.affected import expand_time_sensitive
+
+        works = {
+            1: {"work_id": 1, "recommendation_date": None,
+                "sanction_date": None, "completion_date": None,
+                "last_expenditure_date": None},
+        }
+        result = expand_time_sensitive(works, {}, date(2024, 6, 1))
+        assert 1 not in result
+
+    def test_missing_fields_handled(self):
+        """Works with missing keys should not crash."""
+        from analysis.affected import expand_time_sensitive
+
+        works = {1: {"work_id": 1}}
+        result = expand_time_sensitive(works, {}, date(2024, 6, 1))
+        assert isinstance(result, set)

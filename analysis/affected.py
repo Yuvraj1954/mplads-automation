@@ -41,17 +41,31 @@ def expand_affected_works(delta_work_ids, works_by_id,
 
 
 def expand_time_sensitive(works_by_id, existing_analyses, reference_date):
+    """Identify works whose status may change soon or need fresh analysis.
+
+    Uses canonical date fields from raw work records (which lack a 'status'
+    field). The logic mirrors classify_status() in analysis/status.py:
+      - IN_PROGRESS: has sanction_date but no completion_date
+      - RECOMMENDED: has recommendation_date but no sanction/completion
+      - COMPLETED: has completion_date (still time-sensitive if recent)
+    """
     time_sensitive = set()
 
     for wid, w in works_by_id.items():
-        status = w.get("status")
-        if status in ("In Progress", "Recommended"):
+        sanction_date = w.get("sanction_date")
+        completion_date = w.get("completion_date")
+        recommendation_date = w.get("recommendation_date")
+
+        # In Progress: sanctioned but not completed
+        if sanction_date is not None and completion_date is None:
             time_sensitive.add(wid)
 
+        # Recommended: only recommended, no sanction yet
+        if recommendation_date is not None and sanction_date is None and completion_date is None:
+            time_sensitive.add(wid)
+
+        # Any work with recent expenditure activity
         if w.get("last_expenditure_date") is not None:
-            time_sensitive.add(wid)
-
-        if w.get("sanction_date") is not None and status != "Completed":
             time_sensitive.add(wid)
 
     return time_sensitive

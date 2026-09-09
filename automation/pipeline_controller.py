@@ -1241,7 +1241,8 @@ def stage_persist_affected(evidence_records, affected_keys):
 
 def stage_verify(evidence_records, pipeline_result, anomaly_result,
                  gemini_result=None, persist_result=None,
-                 analytics_result=None, work_refs_result=None):
+                 analytics_result=None, work_refs_result=None,
+                 affected_result=None):
     """Stage 11: Verify pipeline outputs before cleanup.
 
     Checks:
@@ -1251,6 +1252,9 @@ def stage_verify(evidence_records, pipeline_result, anomaly_result,
     4. Deterministic invariants hold
     5. DB2 writes successful (if applicable)
     6. No source deletion occurred
+
+    In affected mode, expected counts come from the affected subset,
+    not the full population.
 
     Returns:
         dict with verification results
@@ -1273,18 +1277,29 @@ def stage_verify(evidence_records, pipeline_result, anomaly_result,
     state_count = len([r for r in evidence_records if r["entity_type"] == "STATE"])
 
     pipeline = pipeline_result.get("pipeline")
-    if pipeline:
+    is_affected = pipeline_result.get("is_affected_mode", False)
+
+    # In affected mode, compare against affected subset; in full mode, full population
+    if is_affected and affected_result:
+        expected_members = affected_result.get("member_count", 0)
+        expected_states = affected_result.get("state_count", 0)
+    elif pipeline:
         expected_members = len(pipeline.member_metrics)
         expected_states = len(pipeline.state_metrics)
+    else:
+        expected_members = 0
+        expected_states = 0
+
+    if pipeline:
         if member_count != expected_members:
             issues.append(
                 f"Member evidence count mismatch: {member_count} evidence vs "
-                f"{expected_members} metrics"
+                f"{expected_members} expected"
             )
         if state_count != expected_states:
             issues.append(
                 f"State evidence count mismatch: {state_count} evidence vs "
-                f"{expected_states} metrics"
+                f"{expected_states} expected"
             )
 
     # Check anomaly counts
@@ -1539,16 +1554,6 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             timing["work_analysis_persist"] = _elapsed(t6b)
 
             # Stage 7b: Persist analytics (affected members/states only)
-            t7 = _timer()
-            anomaly_result = stage_anomaly(analysis_result, reference_date)
-            results["stages"]["anomaly"] = {
-                "member_anomalies": len(anomaly_result["member_anomalies"]),
-                "state_anomalies": len(anomaly_result["state_anomalies"]),
-            }
-            save_checkpoint(run_id, "anomaly", results["stages"]["anomaly"])
-            timing["anomaly"] = _elapsed(t7)
-
-            # Stage 7b: Persist analytics (affected members/states only)
             t7b = _timer()
             analytics_result = stage_analytics_persist_affected(
                 analysis_result, anomaly_result, affected_result
@@ -1609,6 +1614,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 gemini_result, persist_result,
                 analytics_result=analytics_result,
                 work_refs_result=work_refs_result,
+                affected_result=affected_result,
             )
             results["stages"]["verify"] = verify_result
             save_checkpoint(run_id, "verify", verify_result)

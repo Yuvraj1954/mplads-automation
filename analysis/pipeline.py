@@ -125,6 +125,11 @@ class AnalysisPipeline:
             self.work_analyses
         )
 
+        self.member_metrics_by_id = {
+            (m.member_type, m.member_id): m
+            for m in self.member_metrics
+        }
+
         self.state_metrics = compute_state_metrics(
             self.work_analyses, self.member_metrics_by_id
         )
