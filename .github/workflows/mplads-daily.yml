@@ -283,6 +283,41 @@ jobs:
           fi
 
       # ===========================================================
+      # GATE: Fail workflow if no valid previous snapshot available
+      #
+      # This runs BEFORE the pipeline. If all 3 cache validations
+      # failed and Supabase fallback is not enabled, there is no
+      # valid previous snapshot. The pipeline CANNOT safely continue
+      # in affected comparison mode.
+      #
+      # Without this gate, the pipeline would start, fail in STEP 2,
+      # and the workflow would still show SUCCESS because the final
+      # `if: always()` steps succeed.
+      # ===========================================================
+      - name: Gate — verify previous snapshot available
+        if: github.event.inputs.bootstrap != 'true' && steps.strategy.outputs.use_supabase_fallback != 'true'
+        working-directory: ${{ github.workspace }}/repo
+        run: |
+          VALID_1="${{ steps.validate-1.outputs.cache_valid }}"
+          VALID_2="${{ steps.validate-2.outputs.cache_valid }}"
+          VALID_3="${{ steps.validate-3.outputs.cache_valid }}"
+
+          if [ "$VALID_1" == "true" ] || [ "$VALID_2" == "true" ] || [ "$VALID_3" == "true" ]; then
+            echo "Cache available — proceeding"
+            exit 0
+          fi
+
+          echo "FATAL: No valid previous trusted snapshot available."
+          echo "Cache validation failed after 3 attempts."
+          echo "Bootstrap is disabled."
+          echo "Pipeline cannot safely continue in affected mode."
+          echo ""
+          echo "To fix:"
+          echo "  1. Run the cache ingestion workflow to upload a valid snapshot, OR"
+          echo "  2. Trigger this workflow with bootstrap=true after cache is populated."
+          exit 1
+
+      # ===========================================================
       # RUN PIPELINE
       # ===========================================================
       - name: Run complete MPLADS pipeline
