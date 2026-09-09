@@ -50,8 +50,8 @@ jobs:
         id: failure-state-restore
         with:
           path: /tmp/mplads-failure-state
-          key: mplads-failure-state
-          restore-keys: mplads-failure-state
+          key: mplads-failure-state-${{ github.run_id }}
+          restore-keys: mplads-failure-state-
 
       - name: Read failure state
         id: failure-state
@@ -504,18 +504,19 @@ jobs:
       # ===========================================================
       # SAVE FAILURE STATE: Persists across runners via cache
       #
-      # save-always: true ensures the counter is saved even when
-      # the pipeline fails. This is critical: without it, the
-      # counter would be lost when the runner is destroyed.
+      # Uses per-run key (mplads-failure-state-<run_id>) to avoid
+      # race conditions when concurrent runs try to save.
+      # Restore uses prefix match to find the latest entry.
       #
-      # The key is fixed (mplads-failure-state) so each save
-      # overwrites the previous state. This is intentional —
-      # only the latest counter value matters.
+      # NOTE: save-always is NOT supported by actions/cache/save@v4.
+      # This step runs inside an if: always() block so it executes
+      # even when the pipeline fails. The cache save itself only
+      # succeeds on the first attempt per key (GitHub semantics),
+      # but since each run has a unique key, this always works.
       # ===========================================================
       - name: Save failure state to cache
         if: always() && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
         uses: actions/cache/save@v4
         with:
           path: /tmp/mplads-failure-state
-          key: mplads-failure-state
-          save-always: true
+          key: mplads-failure-state-${{ github.run_id }}
