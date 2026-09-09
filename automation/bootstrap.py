@@ -201,7 +201,10 @@ def stage_validate(snapshot_path):
 # ============================================================
 
 def stage_cache(snapshot_path, cache_work_dir):
-    """Write the fresh snapshot to the GitHub rolling cache."""
+    """Write the fresh snapshot to the GitHub rolling cache.
+
+    Verifies _COMPLETE.json is present in source and target.
+    """
     print("\n" + "=" * 70)
     print("STAGE 3: WRITE TO GITHUB ROLLING CACHE")
     print("=" * 70)
@@ -210,11 +213,27 @@ def stage_cache(snapshot_path, cache_work_dir):
         print("No cache work dir specified — skipping cache write")
         return
 
-    work_dir = Path(cache_work_dir)
-    ensure_cache_dirs(work_dir)
-
     snapshot_dir = Path(snapshot_path)
     timestamp = snapshot_dir.name
+
+    # CRITICAL: Verify _COMPLETE.json in source
+    complete_file = snapshot_dir / "_COMPLETE.json"
+    if not complete_file.exists():
+        raise RuntimeError(
+            f"CRITICAL: _COMPLETE.json missing in {snapshot_dir}. "
+            f"Cannot write to cache without it."
+        )
+    import json as _json
+    marker = _json.loads(complete_file.read_text(encoding="utf-8"))
+    if marker.get("status") != "complete":
+        raise RuntimeError(
+            f"CRITICAL: _COMPLETE.json status is '{marker.get('status')}', "
+            f"expected 'complete' in {snapshot_dir}"
+        )
+    print(f"  _COMPLETE.json verified in source: {timestamp}")
+
+    work_dir = Path(cache_work_dir)
+    ensure_cache_dirs(work_dir)
 
     target = work_dir / "current" / timestamp
     if target.exists():
@@ -222,6 +241,15 @@ def stage_cache(snapshot_path, cache_work_dir):
     else:
         shutil.copytree(str(snapshot_dir), str(target))
         print(f"Copied snapshot to cache: {target}")
+
+    # CRITICAL: Verify _COMPLETE.json in target after copy
+    target_complete = target / "_COMPLETE.json"
+    if not target_complete.exists():
+        raise RuntimeError(
+            f"CRITICAL: _COMPLETE.json missing in cache target {target}. "
+            f"Copy may have failed."
+        )
+    print(f"  _COMPLETE.json verified in cache target: {target}")
 
     write_new_timestamp(timestamp, work_dir)
     write_metadata("none", timestamp, work_dir)

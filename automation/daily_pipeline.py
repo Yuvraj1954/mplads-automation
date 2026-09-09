@@ -479,6 +479,7 @@ def _write_pipeline_success(new_ts, cache_work_dir):
 
     Copies the fetched snapshot into $WORK_DIR/current/<new_ts>/ so the
     workflow can rotate it into the rolling cache.
+    Verifies _COMPLETE.json is present in the cache snapshot.
     """
     if not cache_work_dir:
         return
@@ -492,22 +493,45 @@ def _write_pipeline_success(new_ts, cache_work_dir):
     else:
         write_metadata("none", new_ts, work_dir)
 
+    # CRITICAL: Verify _COMPLETE.json is in cache current snapshot
+    cache_snapshot = work_dir / "current" / new_ts
+    if cache_snapshot.exists():
+        _ensure_complete_json(cache_snapshot)
+        print(f"Pipeline success: _COMPLETE.json verified in cache current/{new_ts}")
+    else:
+        print(f"WARNING: Cache current/{new_ts} not found during success write")
+
     print(f"Pipeline success markers written to {work_dir}")
+
+
+def _ensure_complete_json(snapshot_dir):
+    """Verify _COMPLETE.json exists in snapshot_dir; raise if missing or invalid."""
+    p = Path(snapshot_dir)
+    complete_file = p / "_COMPLETE.json"
+    if not complete_file.exists():
+        raise RuntimeError(
+            f"CRITICAL: _COMPLETE.json missing in {p}. "
+            f"Snapshot cannot be promoted to cache or Supabase without it."
+        )
+    try:
+        data = json.loads(complete_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"CRITICAL: _COMPLETE.json is corrupt in {p}: {exc}")
+    if data.get("status") != "complete":
+        raise RuntimeError(
+            f"CRITICAL: _COMPLETE.json status is '{data.get('status')}', "
+            f"expected 'complete' in {p}"
+        )
+    return data
 
 
 def _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir):
     """Copy the fetched snapshot into the cache current/ directory.
 
     This must be called BEFORE _cleanup_local_snapshot removes the temp dir.
+    Verifies _COMPLETE.json is present in source and target.
     """
     if not cache_work_dir or not local_snapshot_path:
-        return
-
-    work_dir = Path(cache_work_dir)
-    target = work_dir / "current" / new_ts
-
-    if target.exists():
-        print(f"Cache current/{new_ts} already exists, skipping copy")
         return
 
     src = Path(local_snapshot_path)
@@ -515,8 +539,23 @@ def _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir):
         print(f"WARNING: Fetched snapshot {src} not found, cannot preserve for cache")
         return
 
+    # CRITICAL: Verify _COMPLETE.json in source before copy
+    _ensure_complete_json(src)
+
+    work_dir = Path(cache_work_dir)
+    target = work_dir / "current" / new_ts
+
+    if target.exists():
+        print(f"Cache current/{new_ts} already exists, skipping copy")
+        # Still verify _COMPLETE.json is present in existing target
+        _ensure_complete_json(target)
+        return
+
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(str(src), str(target))
+
+    # CRITICAL: Verify _COMPLETE.json survived the copy
+    _ensure_complete_json(target)
     print(f"Fetched snapshot preserved for cache: {target}")
 
 
