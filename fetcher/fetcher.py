@@ -462,7 +462,7 @@ def upload_manifest(
             file_options={
                 "content-type": "application/json",
                 "cache-control": "3600",
-                "upsert": "false",
+                "upsert": "true",
             }
         )
     )
@@ -563,7 +563,7 @@ def upload_completion_marker(marker, supabase_client=None):
             file_options={
                 "content-type": "application/json",
                 "cache-control": "3600",
-                "upsert": "false",
+                "upsert": "true",
             }
         )
     )
