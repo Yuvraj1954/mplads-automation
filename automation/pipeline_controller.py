@@ -597,19 +597,7 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
         records = [_work_analysis_to_record(wa) for wa in analyses]
         work_ids = [r["work_id"] for r in records]
 
-        # Step 1: Delete affected records (by work_id ranges for efficiency)
-        if affected_work_ids is not None:
-            deleted = 0
-            for wid in work_ids:
-                try:
-                    sb_delete(db1_url, db1_key, table_name,
-                              {"work_id": f"eq.{wid}"})
-                    deleted += 1
-                except Exception:
-                    pass
-            print(f"  {label}: deleted {deleted} affected records")
-
-        # Step 2: Insert fresh records in batches
+        # Step 1: Insert fresh records FIRST to avoid data loss on failure
         batch_size = 500
         inserted = 0
         from supabase import create_client
@@ -627,6 +615,18 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
                         inserted += 1
                     except Exception as e2:
                         print(f"  WARNING: individual insert failed: {e2}")
+
+        # Step 2: Delete old records that were replaced (safe to fail — new data already persisted)
+        if affected_work_ids is not None:
+            deleted = 0
+            for wid in work_ids:
+                try:
+                    sb_delete(db1_url, db1_key, table_name,
+                              {"work_id": f"eq.{wid}"})
+                    deleted += 1
+                except Exception:
+                    pass
+            print(f"  {label}: deleted {deleted} affected records")
 
         print(f"  {label}: inserted {inserted} records")
         return inserted
@@ -1102,25 +1102,27 @@ def stage_analytics_persist_affected(pipeline_result, anomaly_result, affected_r
     for scope in ("BOTH", "MP", "MLA", None):
         scope_stats = [s for s in stats if s.get("scope") == scope]
         if scope_stats:
+            # Upsert first to avoid data loss if upsert fails
+            sb_upsert(db2_url, db2_key, "national_statistics", scope_stats)
+            written += len(scope_stats)
             filter_val = f"eq.{scope}" if scope else "is.null"
             try:
                 sb_delete(db2_url, db2_key, "national_statistics",
                           {"scope": filter_val})
             except Exception:
                 pass
-            sb_upsert(db2_url, db2_key, "national_statistics", scope_stats)
-            written += len(scope_stats)
 
     for mt in ("MP", "MLA"):
         mt_trends = [t for t in trends if t.get("member_type") == mt]
         if mt_trends:
+            # Upsert first to avoid data loss if upsert fails
+            sb_upsert(db2_url, db2_key, "trends", mt_trends)
+            written += len(mt_trends)
             try:
                 sb_delete(db2_url, db2_key, "trends",
                           {"member_type": f"eq.{mt}"})
             except Exception:
                 pass
-            sb_upsert(db2_url, db2_key, "trends", mt_trends)
-            written += len(mt_trends)
 
     print(f"  Total written: {written} analytics records")
     return {

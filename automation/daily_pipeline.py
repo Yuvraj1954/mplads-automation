@@ -741,8 +741,10 @@ def main():
         try:
             validate_remote_snapshot(new_ts)
         except Exception as exc:
-            print(f"WARNING: Remote snapshot validation failed: {exc}")
+            print(f"FATAL: Remote snapshot validation failed: {exc}")
             print("Local snapshot is valid but remote upload may be incomplete.")
+            print("Failing closed to prevent analysis on incomplete data.")
+            sys.exit(1)
 
     print("=== STEP 2: GET PREVIOUS SNAPSHOT ===")
     t_compare_start = _timer()

@@ -259,6 +259,7 @@ class GeminiScheduler:
 
         def _worker():
             while not stop_signal.is_set():
+                item = None
                 try:
                     item = work_queue.get(timeout=0.2)
                 except queue.Empty:
@@ -267,6 +268,8 @@ class GeminiScheduler:
                     continue
 
                 try:
+                    if stop_signal.is_set():
+                        return
                     self._process_packed_item(
                         item, work_queue, on_success, results, results_lock,
                         failures, failure_lock, _log_progress, stop_signal
@@ -319,22 +322,21 @@ class GeminiScheduler:
                              failures, failure_lock, log_progress, stop_signal):
         """Process a single packed request item with lane selection, retry, and partial response persistence."""
         while item.attempt <= item.max_attempts and not stop_signal.is_set():
-            # Check global daily request quota
-            if self.daily_quota and self._daily_count >= self.daily_quota:
-                with self._lock:
-                    self._total_failure += len(item.evidence_rows)
-                with failure_lock:
-                    for r in item.evidence_rows:
-                        failures.append({
-                            "entity_type": r["entity_type"],
-                            "entity_id": r["entity_id"],
-                            "evidence_id": r.get("evidence_id"),
-                            "reason": "daily_quota_exceeded",
-                        })
-                log_progress(len(item.evidence_rows))
-                return
-
             with self._lock:
+                # Check global daily request quota inside lock to avoid TOCTOU
+                if self.daily_quota and self._daily_count >= self.daily_quota:
+                    self._total_failure += len(item.evidence_rows)
+                    with failure_lock:
+                        for r in item.evidence_rows:
+                            failures.append({
+                                "entity_type": r["entity_type"],
+                                "entity_id": r["entity_id"],
+                                "evidence_id": r.get("evidence_id"),
+                                "reason": "daily_quota_exceeded",
+                            })
+                    log_progress(len(item.evidence_rows))
+                    return
+
                 lane, status = self._pick_lane_with_status(exclude_lanes=item.tried_lanes)
                 if lane is not None:
                     item.tried_lanes.add(lane.lane_id)
@@ -415,11 +417,12 @@ class GeminiScheduler:
                         if item.attempt < item.max_attempts:
                             with self._lock:
                                 self._total_retries += 1
-                            # Re-queue ONLY this specific failed evidence item for retry
+                            # Re-queue with tried_lanes carried to avoid reusing failing lane
                             retry_item = PackedQueueItem(
                                 evidence_rows=[row],
                                 attempt=item.attempt + 1,
                                 max_attempts=item.max_attempts,
+                                tried_lanes=set(item.tried_lanes),
                             )
                             work_queue.put(retry_item)
                         else:
