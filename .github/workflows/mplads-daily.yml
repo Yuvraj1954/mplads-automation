@@ -499,14 +499,28 @@ jobs:
           key: mplads-snapshot-state-${{ steps.new-ts.outputs.new_ts }}
 
       # ===========================================================
-      # CLEANUP: Best-effort old cache entries
+      # CLEANUP: Delete old cache entries (keep only latest)
       # ===========================================================
       - name: Cleanup old cache entries
-        if: success() && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
+        if: success() && steps.new-ts.outputs.new_ts != '' && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Cache cleanup is best-effort — never blocks pipeline"
-          echo "Old entries expire automatically per GitHub cache limits"
+          CURRENT_KEY="mplads-snapshot-state-${{ steps.new-ts.outputs.new_ts }}"
+          echo "Keeping cache: $CURRENT_KEY"
+          echo "Deleting all other mplads-snapshot-state-* caches..."
+          gh cache list --repo "${{ github.repository }}" --json id,key --jq '.[] | select(.key | startswith("mplads-snapshot-state-")) | select(.key != "'"$CURRENT_KEY"'") | .id' | while read -r cache_id; do
+            echo "  Deleting cache ID: $cache_id"
+            gh cache delete "$cache_id" --repo "${{ github.repository }}" || true
+          done
+          # Also delete old failure state caches
+          echo "Deleting all mplads-failure-state-* caches..."
+          gh cache list --repo "${{ github.repository }}" --json id,key --jq '.[] | select(.key | startswith("mplads-failure-state-")) | .id' | while read -r cache_id; do
+            echo "  Deleting failure state cache ID: $cache_id"
+            gh cache delete "$cache_id" --repo "${{ github.repository }}" || true
+          done
+          echo "Cache cleanup done"
 
       # ===========================================================
       # UPDATE FAILURE STATE: Increment on failure, reset on success
