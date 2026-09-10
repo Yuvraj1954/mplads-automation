@@ -776,13 +776,13 @@ def main():
         cache_dir = Path(cache_work_dir)
         ok, err = validate_cache(cache_dir)
         if ok:
-            prev_path = get_previous_local_path(cache_dir)
-            if prev_path:
-                old_timestamp = get_previous_timestamp(cache_dir)
-                old_local_path = str(prev_path)
+            curr_path = get_current_local_path(cache_dir)
+            if curr_path:
+                old_timestamp = get_current_timestamp(cache_dir)
+                old_local_path = str(curr_path)
                 print(f"Previous snapshot from cache: {old_timestamp}")
             else:
-                print("WARNING: Cache valid but no previous snapshot found")
+                print("WARNING: Cache valid but no current snapshot found")
         else:
             print(f"WARNING: Cache validation failed: {err}")
 
