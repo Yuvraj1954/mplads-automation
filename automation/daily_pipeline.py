@@ -610,6 +610,17 @@ def main():
             "to the real comparator path in your repo."
         )
 
+    sync_interval = os.environ.get("SYNC_INTERVAL_HOURS", "24")
+    print(f"Sync interval: {sync_interval} hours")
+    print(f"MP datasets: {len([d for d in DATASETS if not d.startswith('mla_')])}")
+    print(f"MLA datasets: {len([d for d in DATASETS if d.startswith('mla_')])}")
+    print(f"Mode: {args.mode}")
+    print(f"Bootstrap: {args.bootstrap}")
+    print(f"Local only: {args.local_only}")
+
+    cache_work_dir = os.environ.get("MPLADS_CACHE_WORK_DIR")
+    print(f"Cache work dir: {cache_work_dir or 'not set (Supabase-only mode)'}")
+
     # Clear stale failure-cleanup timestamp from previous runs.
     # .current_snapshot_ts must only contain THIS run's fetched snapshot.
     # If the file retains a previous run's timestamp and this run fails
@@ -622,17 +633,6 @@ def main():
                 print(f"Cleared stale .current_snapshot_ts from previous run")
             except Exception:
                 pass
-
-    sync_interval = os.environ.get("SYNC_INTERVAL_HOURS", "24")
-    print(f"Sync interval: {sync_interval} hours")
-    print(f"MP datasets: {len([d for d in DATASETS if not d.startswith('mla_')])}")
-    print(f"MLA datasets: {len([d for d in DATASETS if d.startswith('mla_')])}")
-    print(f"Mode: {args.mode}")
-    print(f"Bootstrap: {args.bootstrap}")
-    print(f"Local only: {args.local_only}")
-
-    cache_work_dir = os.environ.get("MPLADS_CACHE_WORK_DIR")
-    print(f"Cache work dir: {cache_work_dir or 'not set (Supabase-only mode)'}")
 
     # ================================================================
     # BOOTSTRAP MODE
