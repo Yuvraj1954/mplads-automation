@@ -1,5 +1,9 @@
 name: MPLADS Daily Pipeline
 
+permissions:
+  actions: write
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -500,21 +504,22 @@ jobs:
 
       # ===========================================================
       # CLEANUP: Delete old cache entries (keep only latest)
+      # Runs ALWAYS so stale caches don't pile up on repeated failures.
       # ===========================================================
       - name: Cleanup old cache entries
-        if: success() && steps.new-ts.outputs.new_ts != '' && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
+        if: always() && (github.event.inputs.bootstrap != 'true' || steps.strategy.outputs.bootstrap_mode == 'false')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          CURRENT_KEY="mplads-snapshot-state-${{ steps.new-ts.outputs.new_ts }}"
-          echo "Keeping cache: $CURRENT_KEY"
-          echo "Deleting all other mplads-snapshot-state-* caches..."
-          gh cache list --repo "${{ github.repository }}" --json id,key --jq '.[] | select(.key | startswith("mplads-snapshot-state-")) | select(.key != "'"$CURRENT_KEY"'") | .id' | while read -r cache_id; do
-            echo "  Deleting cache ID: $cache_id"
+          # Delete old snapshot caches (keep only the newest one)
+          echo "Finding old mplads-snapshot-state-* caches to delete..."
+          gh cache list --repo "${{ github.repository }}" --json id,key,createdAt \
+            --jq '[.[] | select(.key | startswith("mplads-snapshot-state-"))] | sort_by(.createdAt) | reverse | .[1:][] | .id' | while read -r cache_id; do
+            echo "  Deleting old snapshot cache ID: $cache_id"
             gh cache delete "$cache_id" --repo "${{ github.repository }}" || true
           done
-          # Also delete old failure state caches
+          # Delete ALL failure state caches (they're small and stale)
           echo "Deleting all mplads-failure-state-* caches..."
           gh cache list --repo "${{ github.repository }}" --json id,key --jq '.[] | select(.key | startswith("mplads-failure-state-")) | .id' | while read -r cache_id; do
             echo "  Deleting failure state cache ID: $cache_id"
