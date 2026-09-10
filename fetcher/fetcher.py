@@ -274,7 +274,7 @@ def upload_chunk(
             file_options={
                 "content-type": "application/x-ndjson",
                 "cache-control": "3600",
-                "upsert": "false",
+                "upsert": "true",
             }
         )
     )

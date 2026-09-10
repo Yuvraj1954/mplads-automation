@@ -484,7 +484,8 @@ class TestRateLimits:
 
         assert res["success_count"] == 0
         assert res["failure_count"] == 1
-        assert res["failures"][0]["reason"] == "all_lanes_rpd_exhausted"
+        # After final retry passes, the reason reflects retry exhaustion
+        assert "exhausted" in res["failures"][0]["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -612,3 +613,357 @@ class Test12LanesAndDualModel:
         # Both models should be evenly utilized
         assert called_models.count("gemini-3.1-flash-lite") == 6
         assert called_models.count("gemini-3.5-flash-lite") == 6
+
+
+# ---------------------------------------------------------------------------
+# 12. Final Retry Pass Regression Tests
+# ---------------------------------------------------------------------------
+
+class TestFinalRetryPasses:
+    """Tests for the two final sequential retry passes after the main parallel pass."""
+
+    def _make_sched(self, mock_call, max_workers=2, items_per_request=1):
+        from analysis.gemini_scheduler import GeminiScheduler
+        sched = GeminiScheduler(
+            api_keys=["k1", "k2"],
+            models=["gemini-3.1-flash-lite"],
+            max_workers=max_workers,
+            items_per_request=items_per_request,
+            max_attempts=3,
+        )
+        sched._clients["gemini-3.1-flash-lite"].call = mock_call
+        return sched
+
+    def _rows(self, n):
+        return [{"entity_type": "MP", "entity_id": str(i)} for i in range(1, n + 1)]
+
+    def test_zero_failures_skips_final_retries(self):
+        """When main pass succeeds all, final retry passes are skipped."""
+        def mock_call(prompt, api_key, model=None):
+            return [{"entity_id": str(i), "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for i in range(1, 6)]
+
+        sched = self._make_sched(mock_call, items_per_request=5)
+        res = sched.process(self._rows(5))
+
+        assert res["success_count"] == 5
+        assert res["failure_count"] == 0
+        assert res["failures"] == []
+        fr = res["final_retries"]
+        assert fr["retry1"]["candidates"] == 0
+        assert fr["retry2"]["candidates"] == 0
+        assert fr["total_recovered"] == 0
+        assert fr["unresolved"] == 0
+
+    def test_one_failed_record_retried(self):
+        """One failure in main pass triggers final retry #1."""
+        entity1_attempts = [0]
+
+        def mock_call(prompt, api_key, model=None):
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            # Main pass: entity "1" always fails (first 3 calls = max_attempts)
+            if "1" in ids:
+                entity1_attempts[0] += 1
+                if entity1_attempts[0] <= 3:
+                    return []
+            # All other calls: succeed
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(2))
+
+        assert res["success_count"] == 2
+        assert res["failure_count"] == 0
+        assert res["final_retries"]["retry1"]["recovered"] == 1
+
+    def test_six_failures_all_retry_sequentially(self):
+        """Six failures in main pass all retry in final retry #1."""
+        main_pass_calls = [0]
+
+        def mock_call(prompt, api_key, model=None):
+            main_pass_calls[0] += 1
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            # Main pass: all 6 items fail through all 3 attempts = 18 calls max
+            if main_pass_calls[0] <= 18:
+                return []
+            # Final retry: succeed
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(6))
+
+        assert res["success_count"] == 6
+        assert res["failure_count"] == 0
+        assert res["final_retries"]["retry1"]["candidates"] == 6
+        assert res["final_retries"]["retry1"]["recovered"] == 6
+
+    def test_retry1_recovers_all_skips_retry2(self):
+        """When retry #1 recovers all, retry #2 is skipped."""
+        # Each entity fails 3 times in main pass (max_attempts=3), then succeeds in retry #1
+        entity_attempts = {}
+
+        def mock_call(prompt, api_key, model=None):
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            for eid in ids:
+                entity_attempts[eid] = entity_attempts.get(eid, 0) + 1
+            # Main pass: each entity fails first 3 attempts
+            if any(entity_attempts.get(eid, 0) <= 3 for eid in ids):
+                return []
+            # Final retry #1: succeed
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(3))
+
+        assert res["success_count"] == 3
+        assert res["failure_count"] == 0
+        assert res["final_retries"]["retry1"]["recovered"] == 3
+        assert res["final_retries"]["retry2"]["candidates"] == 0
+
+    def test_retry1_recovers_some_retry2_gets_rest(self):
+        """When retry #1 recovers some, retry #2 gets only the remaining."""
+        entity_attempts = {}
+
+        def mock_call(prompt, api_key, model=None):
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            for eid in ids:
+                entity_attempts[eid] = entity_attempts.get(eid, 0) + 1
+            # Entity "1": fail 3 times (main pass), succeed on 4th (retry #1)
+            # Entity "2","3": fail 3 times (main pass) + 3 times (retry #1), succeed in retry #2
+            if "1" in ids and entity_attempts["1"] <= 3:
+                return []
+            if any(eid in ("2", "3") for eid in ids) and any(entity_attempts.get(eid, 0) <= 6 for eid in ids if eid in ("2", "3")):
+                return []
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(3))
+
+        assert res["success_count"] == 3
+        assert res["failure_count"] == 0
+        assert res["final_retries"]["retry1"]["recovered"] == 1
+        assert res["final_retries"]["retry1"]["failed"] == 2
+        assert res["final_retries"]["retry2"]["recovered"] == 2
+
+    def test_retry2_recovers_all_zero_unresolved(self):
+        """When retry #2 recovers all remaining, unresolved is 0."""
+        entity_attempts = {}
+
+        def mock_call(prompt, api_key, model=None):
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            for eid in ids:
+                entity_attempts[eid] = entity_attempts.get(eid, 0) + 1
+            # All entities fail through main pass (3) + retry #1 (3) = 6 calls each
+            if any(entity_attempts.get(eid, 0) <= 6 for eid in ids):
+                return []
+            # Retry #2: succeed
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(2))
+
+        assert res["success_count"] == 2
+        assert res["failure_count"] == 0
+        assert res["final_retries"]["unresolved"] == 0
+
+    def test_retry2_still_fails_record_unresolved(self):
+        """When retry #2 still fails, record remains unresolved."""
+        def mock_call(prompt, api_key, model=None):
+            return []  # Always fail
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(1))
+
+        assert res["success_count"] == 0
+        assert res["failure_count"] == 1
+        assert res["final_retries"]["unresolved"] == 1
+        assert res["failures"][0]["entity_id"] == "1"
+
+    def test_existing_ai_analysis_preserved_on_failed_replacement(self):
+        """Failed Gemini does not overwrite existing ai_analysis."""
+        successes = []
+
+        def on_success(res):
+            successes.append(res.entity_id)
+
+        entity1_attempts = [0]
+
+        def mock_call(prompt, api_key, model=None):
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            # Entity "1": fail all main pass attempts (3), then fail final retries too
+            if "1" in ids:
+                entity1_attempts[0] += 1
+                return []
+            # Entity "2": succeed always
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(2), on_success=on_success)
+
+        # Entity 2 succeeded, entity 1 failed
+        assert "2" in successes
+        assert "1" not in successes
+        assert res["failure_count"] == 1
+
+    def test_failed_record_not_marked_up_to_date(self):
+        """Failed record does not appear in results list."""
+        def mock_call(prompt, api_key, model=None):
+            return []  # Always fail
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(1))
+
+        assert len(res["results"]) == 0
+        assert res["failure_count"] == 1
+
+    def test_rpm_limited_during_final_retry(self):
+        """RPM_LIMITED during final retry rotates to another lane."""
+        from analysis.gemini_client import GeminiError, ErrorClass
+
+        entity1_attempts = [0]
+
+        def mock_call(prompt, api_key, model=None):
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            # Entity "1": fail all 3 main pass attempts
+            if "1" in ids:
+                entity1_attempts[0] += 1
+                if entity1_attempts[0] <= 3:
+                    return []
+            # Final retry: k1 is RPM limited, k2 succeeds
+            if api_key == "k1" and entity1_attempts[0] > 3:
+                raise GeminiError(ErrorClass.RPM_RATE_LIMITED, status_code=429, retry_after=1)
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(1))
+
+        assert res["success_count"] == 1
+        assert res["failure_count"] == 0
+
+    def test_server_disconnected_during_final_retry(self):
+        """Server disconnected during final retry is retried."""
+        from analysis.gemini_client import GeminiError, ErrorClass
+
+        entity1_attempts = [0]
+
+        def mock_call(prompt, api_key, model=None):
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            # Entity "1": fail all 3 main pass attempts
+            if "1" in ids:
+                entity1_attempts[0] += 1
+                if entity1_attempts[0] <= 3:
+                    return []
+            # Final retry attempt 1: server error (4th call)
+            if entity1_attempts[0] == 4:
+                raise GeminiError(ErrorClass.SERVER_ERROR, status_code=500, message="Server disconnected")
+            # Final retry attempt 2: succeed (5th call)
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(1))
+
+        assert res["success_count"] == 1
+        assert res["failure_count"] == 0
+
+    def test_g1_queue_join_not_hang_on_stop_signal(self):
+        """G1: queue.join() does not hang when stop_signal is set mid-processing."""
+        from analysis.gemini_scheduler import GeminiScheduler
+        from analysis.gemini_client import GeminiError, ErrorClass
+
+        def mock_call(prompt, api_key, model=None):
+            raise GeminiError(ErrorClass.RPD_EXHAUSTED, status_code=429, message="Daily quota")
+
+        sched = GeminiScheduler(
+            api_keys=["k1"],
+            models=["gemini-3.1-flash-lite"],
+            max_workers=2,
+            items_per_request=1,
+        )
+
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            import signal
+            def handler(signum, frame):
+                raise TimeoutError("queue.join() hung — G1 bug present")
+            old_handler = signal.signal(signal.SIGALRM, handler)
+            signal.alarm(10)
+            try:
+                res = sched.process([{"entity_type": "MP", "entity_id": str(i)} for i in range(5)])
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+
+        # Queue.join() completed (didn't hang). Some items processed, some drained.
+        # Drained items are not in failures but will be retried next daily run
+        # via filter_affected (no ai_analysis written for them).
+        assert res["success_count"] == 0
+        assert res["api_requests"] >= 1  # At least one item was attempted
+
+    def test_g2_quota_atomicity_under_concurrent_workers(self):
+        """G2: daily quota check+increment is atomic — no worker exceeds quota."""
+        from analysis.gemini_scheduler import GeminiScheduler
+
+        daily_count_log = []
+        lock = threading.Lock()
+
+        def mock_call(prompt, api_key, model=None):
+            with lock:
+                daily_count_log.append(1)
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = GeminiScheduler(
+            api_keys=["k1", "k2", "k3", "k4"],
+            models=["gemini-3.1-flash-lite"],
+            max_workers=4,
+            items_per_request=1,
+            daily_quota=5,
+        )
+
+        with patch.object(sched._clients["gemini-3.1-flash-lite"], "call", mock_call):
+            res = sched.process([{"entity_type": "MP", "entity_id": str(i)} for i in range(20)])
+
+        # With daily_quota=5, at most 5 API requests should be made
+        # (some may fail due to quota, but no more than 5 calls)
+        assert sched._daily_count <= 5
+        assert len(daily_count_log) <= 5
+
+    def test_counters_mathematically_consistent(self):
+        """Counters remain mathematically consistent: success + failure == candidates."""
+        entity_attempts = {}
+
+        def mock_call(prompt, api_key, model=None):
+            import re
+            ids = re.findall(r'"entity_id":\s*"(\d+)"', prompt)
+            for eid in ids:
+                entity_attempts[eid] = entity_attempts.get(eid, 0) + 1
+            # Entities "1","2": fail all main pass (3) + retry #1 (3) + retry #2 (3) = 9 each
+            if any(eid in ("1", "2") for eid in ids) and any(entity_attempts.get(eid, 0) <= 9 for eid in ids if eid in ("1", "2")):
+                return []
+            # Other entities: succeed always
+            return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []}
+                    for eid in ids]
+
+        sched = self._make_sched(mock_call, items_per_request=1)
+        res = sched.process(self._rows(5))
+
+        total = res["success_count"] + res["failure_count"]
+        assert total == 5, f"success({res['success_count']}) + failure({res['failure_count']}) != candidates(5)"
+        assert res["final_retries"]["unresolved"] == res["failure_count"]

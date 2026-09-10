@@ -261,13 +261,15 @@ class TestPersistOrder:
         assert ns_delete_pos != -1, "national_statistics delete not found"
         assert ns_upsert_pos < ns_delete_pos, "national_statistics upsert must come BEFORE delete"
 
-        # For trends: upsert must come before delete
+        # For trends: must use conflict_cols upsert (no destructive delete)
         trends_upsert_pos = source.find('sb_upsert(db2_url, db2_key, "trends"')
         trends_delete_pos = source.find('sb_delete(db2_url, db2_key, "trends"')
 
         assert trends_upsert_pos != -1, "trends upsert not found"
-        assert trends_delete_pos != -1, "trends delete not found"
-        assert trends_upsert_pos < trends_delete_pos, "trends upsert must come BEFORE delete"
+        # Trends must NOT use destructive delete — use conflict_cols upsert instead
+        assert trends_delete_pos == -1, (
+            "trends should NOT use sb_delete — use conflict_cols upsert instead"
+        )
 
 
 class TestRemoteValidationFailClosed:

@@ -569,6 +569,42 @@ def build_trends(trends_list):
     return records
 
 
+def deduplicate_trends(trend_records):
+    """Deduplicate trend records by (year, member_type), keeping the LAST occurrence.
+
+    When trend records from pipeline.trends, pipeline.mp_trends, and
+    pipeline.mla_trends are combined, duplicate (year, member_type) pairs
+    can exist. This function removes duplicates deterministically.
+
+    Args:
+        trend_records: list of dicts with 'year' and 'member_type' keys
+
+    Returns:
+        tuple of (deduplicated_records, stats_dict)
+    """
+    stats = {"generated": len(trend_records), "duplicates_found": 0, "deduplicated": 0}
+
+    if not trend_records:
+        return [], stats
+
+    seen = {}
+    for i, r in enumerate(trend_records):
+        key = (r["year"], r["member_type"])
+        if key in seen:
+            stats["duplicates_found"] += 1
+        seen[key] = i
+
+    stats["deduplicated"] = stats["duplicates_found"]
+
+    deduplicated = []
+    for i, r in enumerate(trend_records):
+        key = (r["year"], r["member_type"])
+        if seen[key] == i:
+            deduplicated.append(r)
+
+    return deduplicated, stats
+
+
 # ============================================================
 # RANKING
 # ============================================================

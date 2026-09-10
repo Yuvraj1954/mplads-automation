@@ -610,6 +610,19 @@ def main():
             "to the real comparator path in your repo."
         )
 
+    # Clear stale failure-cleanup timestamp from previous runs.
+    # .current_snapshot_ts must only contain THIS run's fetched snapshot.
+    # If the file retains a previous run's timestamp and this run fails
+    # before the fetch, workflow cleanup would delete the wrong snapshot.
+    if cache_work_dir:
+        stale_ts_file = Path(cache_work_dir) / ".current_snapshot_ts"
+        if stale_ts_file.exists():
+            try:
+                stale_ts_file.unlink()
+                print(f"Cleared stale .current_snapshot_ts from previous run")
+            except Exception:
+                pass
+
     sync_interval = os.environ.get("SYNC_INTERVAL_HOURS", "24")
     print(f"Sync interval: {sync_interval} hours")
     print(f"MP datasets: {len([d for d in DATASETS if not d.startswith('mla_')])}")
@@ -997,8 +1010,9 @@ if __name__ == "__main__":
         print(f"PIPELINE FAILED: {exc}", file=sys.stderr)
         print("OLD SNAPSHOT HAS NOT BEEN DELETED", file=sys.stderr)
         # Local cleanup only — remote cleanup handled by GitHub Actions workflow
-        if cache_work_dir:
-            ts_file = Path(cache_work_dir) / ".current_snapshot_ts"
+        _cw = os.environ.get("MPLADS_CACHE_WORK_DIR")
+        if _cw:
+            ts_file = Path(_cw) / ".current_snapshot_ts"
             if ts_file.exists():
                 try:
                     snapshot_ts = ts_file.read_text(encoding="utf-8").strip()

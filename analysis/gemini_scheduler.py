@@ -1,11 +1,15 @@
-"""Bounded parallel Gemini scheduler with rate limiting, key rotation, packing, and retries.
+"""Bounded parallel Gemini scheduler with rate limiting, key rotation, packing, retries, and final retry passes.
 
 Architecture:
-    Evidence Queue → Central Scheduler → 10 Worker Threads → 8 Lanes (2 Models × 4 Keys)
+    Evidence Queue → Central Scheduler → N Worker Threads → Lanes (Models × Keys)
          ↓
     Gemini API → JSON Array Response → Python Validation → Immediate Persistence (Valid)
          ↓
     Re-queue Only Missing/Failed Records
+         ↓
+    Final Retry Pass #1 (sequential, one-at-a-time)
+         ↓
+    Final Retry Pass #2 (sequential, one-at-a-time)
 
 Does NOT own:
 - Evidence persistence (pipeline_controller)
@@ -258,18 +262,21 @@ class GeminiScheduler:
         stop_signal = threading.Event()
 
         def _worker():
-            while not stop_signal.is_set():
+            while True:
                 item = None
                 try:
                     item = work_queue.get(timeout=0.2)
                 except queue.Empty:
-                    if work_queue.unfinished_tasks == 0 or stop_signal.is_set():
+                    if work_queue.unfinished_tasks == 0:
                         return
                     continue
 
+                if stop_signal.is_set():
+                    # G1 fix: drain queued items to prevent queue.join() hang
+                    work_queue.task_done()
+                    continue
+
                 try:
-                    if stop_signal.is_set():
-                        return
                     self._process_packed_item(
                         item, work_queue, on_success, results, results_lock,
                         failures, failure_lock, _log_progress, stop_signal
@@ -287,7 +294,7 @@ class GeminiScheduler:
         stop_signal.set()
 
         for t in threads:
-            t.join(timeout=1.0)
+            t.join(timeout=2.0)
 
         duration = time.monotonic() - start_time
 
@@ -299,7 +306,7 @@ class GeminiScheduler:
                 "rpd_exhausted": lane.rpd_exhausted,
             }
 
-        print("Gemini complete")
+        print("Gemini main pass complete")
         print(f"  processed={total_records}")
         print(f"  successful={self._total_success}")
         print(f"  failed={self._total_failure}")
@@ -307,16 +314,223 @@ class GeminiScheduler:
         print(f"  api_requests={self._total_api_requests}")
         print(f"  duration={duration:.2f}s")
 
+        # ── Final Retry Pass #1 ──────────────────────────────────────────
+        # Collect ONLY genuinely failed records (not successful, not already up-to-date)
+        failed_entity_keys = set()
+        for f in failures:
+            failed_entity_keys.add((f["entity_type"], str(f["entity_id"])))
+
+        evidence_by_key = {}
+        for row in evidence_rows:
+            evidence_by_key[(row["entity_type"], str(row["entity_id"]))] = row
+
+        retry1_candidates = []
+        for key in failed_entity_keys:
+            row = evidence_by_key.get(key)
+            if row is not None:
+                retry1_candidates.append(row)
+
+        retry1_recovered = []
+        retry1_still_failed = []
+
+        if retry1_candidates:
+            print(f"\n=== GEMINI FINAL RETRY #1 ===")
+            print(f"  candidates={len(retry1_candidates)}")
+            retry1_start = time.monotonic()
+
+            retry1_recovered, retry1_still_failed = self._final_retry_pass(
+                retry1_candidates, on_success, results, results_lock,
+                failures, failure_lock, log_progress=_log_progress,
+                pass_label="RETRY #1",
+            )
+
+            retry1_duration = time.monotonic() - retry1_start
+            print(f"  attempted={len(retry1_candidates)}")
+            print(f"  recovered={len(retry1_recovered)}")
+            print(f"  failed={len(retry1_still_failed)}")
+            print(f"  duration={retry1_duration:.2f}s")
+        else:
+            print("\n=== GEMINI FINAL RETRY #1 ===")
+            print("  candidates=0 — skipped")
+
+        # ── Final Retry Pass #2 ──────────────────────────────────────────
+        retry2_recovered = []
+        retry2_still_failed = []
+
+        if retry1_still_failed:
+            print(f"\n=== GEMINI FINAL RETRY #2 ===")
+            print(f"  candidates={len(retry1_still_failed)}")
+            retry2_start = time.monotonic()
+
+            retry2_recovered, retry2_still_failed = self._final_retry_pass(
+                retry1_still_failed, on_success, results, results_lock,
+                failures, failure_lock, log_progress=_log_progress,
+                pass_label="RETRY #2",
+            )
+
+            retry2_duration = time.monotonic() - retry2_start
+            print(f"  attempted={len(retry1_still_failed)}")
+            print(f"  recovered={len(retry2_recovered)}")
+            print(f"  failed={len(retry2_still_failed)}")
+            print(f"  duration={retry2_duration:.2f}s")
+        else:
+            print("\n=== GEMINI FINAL RETRY #2 ===")
+            print("  candidates=0 — skipped")
+
+        # ── Final Summary ────────────────────────────────────────────────
+        total_recovered = len(retry1_recovered) + len(retry2_recovered)
+        unresolved_count = len(retry2_still_failed)
+        final_success = self._total_success
+        final_failure = unresolved_count
+
+        print(f"\n=== GEMINI FINAL RESULT ===")
+        print(f"  candidates={total_records}")
+        print(f"  successful={final_success}")
+        print(f"  unresolved={unresolved_count}")
+
         return {
             "results": results,
-            "success_count": self._total_success,
-            "failure_count": self._total_failure,
-            "failures": failures,
+            "success_count": final_success,
+            "failure_count": final_failure,
+            "failures": retry2_still_failed,
             "retries": self._total_retries,
             "api_requests": self._total_api_requests,
             "lane_stats": lane_stats,
             "duration": duration,
+            "final_retries": {
+                "retry1": {
+                    "candidates": len(retry1_candidates),
+                    "recovered": len(retry1_recovered),
+                    "failed": len(retry1_still_failed),
+                },
+                "retry2": {
+                    "candidates": len(retry1_still_failed),
+                    "recovered": len(retry2_recovered),
+                    "failed": len(retry2_still_failed),
+                },
+                "total_recovered": total_recovered,
+                "unresolved": unresolved_count,
+            },
         }
+
+    def _final_retry_pass(self, failed_rows, on_success, results, results_lock,
+                           failures, failure_lock, log_progress=None, pass_label="RETRY"):
+        """Sequentially retry failed records one at a time.
+
+        Args:
+            failed_rows: list of evidence row dicts to retry
+            on_success: callback(GeminiResult) for successful results
+            results: shared results list
+            results_lock: lock for results list
+            failures: shared failures list
+            failure_lock: lock for failures list
+            log_progress: optional progress callback
+            pass_label: label for logging
+
+        Returns:
+            (recovered_rows, still_failed_rows) tuple
+        """
+        recovered = []
+        still_failed = []
+
+        for row in failed_rows:
+            entity_label = f"{row['entity_type']} {row['entity_id']}"
+
+            # Try up to 3 attempts for this single record
+            succeeded = False
+            for attempt in range(1, self.max_attempts + 1):
+                # Pick a lane (exclude RPD-exhausted lanes)
+                lane = self._pick_lane()
+                if lane is None:
+                    # All lanes unavailable — wait briefly then retry lane selection
+                    time.sleep(1.0)
+                    lane = self._pick_lane()
+                    if lane is None:
+                        break
+
+                # Check daily quota
+                with self._lock:
+                    if self.daily_quota and self._daily_count >= self.daily_quota:
+                        break
+                    lane.record_request()
+                    self._daily_count += 1
+                    self._total_api_requests += 1
+
+                client = self._clients[lane.model]
+                prompt = build_packed_prompt([row])
+
+                try:
+                    raw_response = client.call(prompt, lane.api_key)
+                    valid_results, failed_entries = validate_packed_output(raw_response, [row])
+
+                    if valid_results:
+                        # Success
+                        lane.success_count += 1
+                        with self._lock:
+                            self._total_success += 1
+                        with results_lock:
+                            results.extend(valid_results)
+
+                        if on_success:
+                            for res in valid_results:
+                                try:
+                                    on_success(res)
+                                except Exception as exc:
+                                    print(f"    Error in on_success callback for {res.entity_type} {res.entity_id}: {exc}")
+
+                        recovered.append(row)
+                        succeeded = True
+                        if log_progress:
+                            log_progress(1)
+                        break
+                    else:
+                        # Validation failed — retry if attempts remain
+                        if attempt < self.max_attempts:
+                            with self._lock:
+                                self._total_retries += 1
+                            time.sleep(min(5, 2 ** (attempt - 1)))
+
+                except GeminiError as gemini_err:
+                    if gemini_err.rpd_exhausted:
+                        lane.rpd_exhausted = True
+                        with self._lock:
+                            self._total_retries += 1
+                        break  # No point retrying if RPD exhausted
+
+                    if gemini_err.rpm_limited:
+                        wait = gemini_err.retry_after or 10.0
+                        lane.apply_cooldown(wait)
+                        with self._lock:
+                            self._total_retries += 1
+                        # Try another lane
+                        continue
+
+                    if gemini_err.permanent:
+                        with self._lock:
+                            self._total_retries += 1
+                        break  # Permanent error — don't retry
+
+                    # Other retryable error
+                    with self._lock:
+                        self._total_retries += 1
+                    if attempt < self.max_attempts:
+                        time.sleep(min(5, 2 ** (attempt - 1)))
+
+                except Exception:
+                    with self._lock:
+                        self._total_retries += 1
+                    if attempt < self.max_attempts:
+                        time.sleep(min(5, 2 ** (attempt - 1)))
+
+            if not succeeded:
+                still_failed.append({
+                    "entity_type": row["entity_type"],
+                    "entity_id": row["entity_id"],
+                    "evidence_id": row.get("evidence_id"),
+                    "reason": f"final_{pass_label.lower()}_exhausted",
+                })
+
+        return recovered, still_failed
 
     def _process_packed_item(self, item, work_queue, on_success, results, results_lock,
                              failures, failure_lock, log_progress, stop_signal):

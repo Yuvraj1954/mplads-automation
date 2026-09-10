@@ -510,6 +510,9 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
     Uses delete-then-insert (not upsert) because DB1 work_analysis tables
     lack a unique index on work_id.
 
+    Uses bounded parallelism for the delete phase (the bottleneck) when
+    there are affected work_ids. MP and MLA tables are processed in parallel.
+
     Args:
         work_analyses: list of WorkAnalysis objects from stage_analyze
         affected_work_ids: set of snapshot work_ids that are affected.
@@ -518,6 +521,9 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
     Returns:
         dict with write stats
     """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     print("\n=== STAGE 6b: WORK ANALYSIS PERSIST ===")
 
     db1_url, db1_key = get_db1()
@@ -588,20 +594,10 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
             "last_calculated": now_str,
         }
 
-    def _persist_batch(table_name, analyses, label):
-        """Delete affected records then insert fresh ones."""
-        if not analyses:
-            print(f"  {label}: no analyses to persist")
-            return 0
-
-        records = [_work_analysis_to_record(wa) for wa in analyses]
-        work_ids = [r["work_id"] for r in records]
-
-        # Step 1: Insert fresh records FIRST to avoid data loss on failure
+    def _insert_records(client, table_name, records, label):
+        """Insert records in batches of 500. Returns count inserted."""
         batch_size = 500
         inserted = 0
-        from supabase import create_client
-        client = create_client(db1_url, db1_key)
         for start in range(0, len(records), batch_size):
             batch = records[start:start + batch_size]
             try:
@@ -615,24 +611,82 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
                         inserted += 1
                     except Exception as e2:
                         print(f"  WARNING: individual insert failed: {e2}")
-
-        # Step 2: Delete old records that were replaced (safe to fail — new data already persisted)
-        if affected_work_ids is not None:
-            deleted = 0
-            for wid in work_ids:
-                try:
-                    sb_delete(db1_url, db1_key, table_name,
-                              {"work_id": f"eq.{wid}"})
-                    deleted += 1
-                except Exception:
-                    pass
-            print(f"  {label}: deleted {deleted} affected records")
-
-        print(f"  {label}: inserted {inserted} records")
         return inserted
 
-    mp_written = _persist_batch("work_analysis", mp_analyses, "MP work_analysis")
-    mla_written = _persist_batch("mla_work_analysis", mla_analyses, "MLA mla_work_analysis")
+    def _delete_work_ids_partition(partition, table_name, label, worker_idx):
+        """Delete old records for a partition of work_ids. Returns count deleted."""
+        deleted = 0
+        for wid in partition:
+            try:
+                sb_delete(db1_url, db1_key, table_name,
+                          {"work_id": f"eq.{wid}"})
+                deleted += 1
+            except Exception:
+                pass
+        return deleted
+
+    def _persist_table_parallel(table_name, analyses, label):
+        """Persist analyses for one table with parallel delete phase."""
+        if not analyses:
+            print(f"  {label}: no analyses to persist")
+            return 0
+
+        t_start = time.time()
+        records = [_work_analysis_to_record(wa) for wa in analyses]
+        work_ids = [r["work_id"] for r in records]
+
+        # Step 1: Insert fresh records (sequential, already batched)
+        from supabase import create_client
+        client = create_client(db1_url, db1_key)
+        inserted = _insert_records(client, table_name, records, label)
+        insert_elapsed = time.time() - t_start
+
+        # Step 2: Delete old records in parallel (the bottleneck)
+        if affected_work_ids is not None and work_ids:
+            del_start = time.time()
+            num_workers = min(5, len(work_ids))
+            partitions = [[] for _ in range(num_workers)]
+            for i, wid in enumerate(work_ids):
+                partitions[i % num_workers].append(wid)
+
+            delete_errors = []
+            total_deleted = 0
+
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {}
+                for idx, partition in enumerate(partitions):
+                    if partition:
+                        f = executor.submit(
+                            _delete_work_ids_partition,
+                            partition, table_name, label, idx
+                        )
+                        futures[f] = idx
+
+                for f in as_completed(futures):
+                    try:
+                        total_deleted += f.result()
+                    except Exception as exc:
+                        delete_errors.append(str(exc))
+
+            del_elapsed = time.time() - del_start
+            print(f"  {label}: inserted {inserted} ({insert_elapsed:.1f}s), "
+                  f"deleted {total_deleted} old records ({del_elapsed:.1f}s, "
+                  f"{num_workers} workers)")
+        else:
+            print(f"  {label}: inserted {inserted} records ({insert_elapsed:.1f}s)")
+
+        return inserted
+
+    # Run MP and MLA tables in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        mp_future = executor.submit(
+            _persist_table_parallel, "work_analysis", mp_analyses, "MP work_analysis"
+        )
+        mla_future = executor.submit(
+            _persist_table_parallel, "mla_work_analysis", mla_analyses, "MLA mla_work_analysis"
+        )
+        mp_written = mp_future.result()
+        mla_written = mla_future.result()
 
     total = mp_written + mla_written
     print(f"  Total work analysis persisted: {total}")
@@ -755,13 +809,16 @@ def stage_analytics_persist(pipeline_result, anomaly_result):
         pipeline.state_metrics, state_anomalies, pipeline.member_metrics
     )
     stats = build_national_statistics(pipeline.statistics)
-    trends = build_trends(pipeline.trends)
+    trends_raw = build_trends(pipeline.trends)
+    trends_raw.extend(build_trends(pipeline.mp_trends))
+    trends_raw.extend(build_trends(pipeline.mla_trends))
 
-    # Also build MP-only and MLA-only statistics and trends
+    from analysis.db2_analytics_persistence import deduplicate_trends
+    trends, trends_dedup = deduplicate_trends(trends_raw)
+
+    # Also build MP-only and MLA-only statistics
     stats.extend(build_national_statistics(pipeline.mp_statistics))
     stats.extend(build_national_statistics(pipeline.mla_statistics))
-    trends.extend(build_trends(pipeline.mp_trends))
-    trends.extend(build_trends(pipeline.mla_trends))
 
     # Compute rankings
     compute_member_ranks(members)
@@ -771,7 +828,9 @@ def stage_analytics_persist(pipeline_result, anomaly_result):
     print(f"  Member metrics: {len(members)}")
     print(f"  State metrics: {len(states)}")
     print(f"  National statistics: {len(stats)}")
-    print(f"  Trends: {len(trends)}")
+    print(f"  Trends generated: {trends_dedup['generated']}")
+    print(f"  Trends duplicates: {trends_dedup['duplicates_found']}")
+    print(f"  Trends after dedup: {len(trends)}")
 
     # Upsert all records to DB2
     written = 0
@@ -817,17 +876,22 @@ def stage_analytics_persist(pipeline_result, anomaly_result):
             sb_upsert(db2_url, db2_key, "national_statistics", scope_stats)
             written += len(scope_stats)
 
-    # Trends (delete old + insert new for each member_type)
-    for mt in ("MP", "MLA"):
-        mt_trends = [t for t in trends if t.get("member_type") == mt]
-        if mt_trends:
-            try:
-                sb_delete(db2_url, db2_key, "trends",
-                          {"member_type": f"eq.{mt}"})
-            except Exception:
-                pass
-            sb_upsert(db2_url, db2_key, "trends", mt_trends)
-            written += len(mt_trends)
+    # Trends (upsert by year + member_type)
+    if trends:
+        trends_written = 0
+        trends_failed = 0
+        for mt in ("MP", "MLA"):
+            mt_trends = [t for t in trends if t.get("member_type") == mt]
+            if mt_trends:
+                try:
+                    sb_upsert(db2_url, db2_key, "trends", mt_trends,
+                              conflict_cols=["year", "member_type"])
+                    trends_written += len(mt_trends)
+                except Exception as exc:
+                    print(f"  WARNING: trends upsert failed for {mt}: {exc}")
+                    trends_failed += len(mt_trends)
+        print(f"  Trends written: {trends_written}, failed: {trends_failed}")
+        written += trends_written
 
     print(f"  Total written: {written} analytics records")
     return {
@@ -844,34 +908,49 @@ def stage_evidence_work_refs(evidence_records, work_analyses):
     """Stage 8b: Build and persist evidence_work_refs.
 
     Links evidence records to specific source works.
+    Uses parallel batch inserts for throughput.
     Returns:
         dict with write stats
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from analysis.evidence_work_refs import build_evidence_work_refs
 
     print("\n=== STAGE 8b: EVIDENCE WORK REFS ===")
 
     db2_url, db2_key = get_db2()
 
+    t_start = time.time()
     refs = build_evidence_work_refs(evidence_records, work_analyses)
+    build_elapsed = time.time() - t_start
 
     if refs:
-        # Delete old refs and insert new (full rebuild for refs)
+        # Delete old refs (single call for full rebuild)
         try:
             sb_delete(db2_url, db2_key, "evidence_work_refs",
                       {"ref_id": "gte.0"})
         except Exception:
             pass
 
-        # Write in batches
+        # Write in parallel batches
         batch_size = 500
-        written = 0
-        for start in range(0, len(refs), batch_size):
-            batch = refs[start:start + batch_size]
-            sb_upsert(db2_url, db2_key, "evidence_work_refs", batch)
-            written += len(batch)
+        batches = [refs[start:start + batch_size]
+                   for start in range(0, len(refs), batch_size)]
 
-        print(f"  Evidence work refs: {written}")
+        def _insert_batch(batch):
+            sb_upsert(db2_url, db2_key, "evidence_work_refs", batch)
+            return len(batch)
+
+        written = 0
+        if len(batches) <= 2:
+            for batch in batches:
+                written += _insert_batch(batch)
+        else:
+            with ThreadPoolExecutor(max_workers=min(4, len(batches))) as executor:
+                futures = {executor.submit(_insert_batch, b): i for i, b in enumerate(batches)}
+                for f in as_completed(futures):
+                    written += f.result()
+
+        print(f"  Evidence work refs: {written} (build={build_elapsed:.1f}s)")
     else:
         written = 0
         print("  No evidence work refs to write")
@@ -1062,9 +1141,12 @@ def stage_analytics_persist_affected(pipeline_result, anomaly_result, affected_r
     stats = build_national_statistics(pipeline.statistics)
     stats.extend(build_national_statistics(pipeline.mp_statistics))
     stats.extend(build_national_statistics(pipeline.mla_statistics))
-    trends = build_trends(pipeline.trends)
-    trends.extend(build_trends(pipeline.mp_trends))
-    trends.extend(build_trends(pipeline.mla_trends))
+    trends_raw = build_trends(pipeline.trends)
+    trends_raw.extend(build_trends(pipeline.mp_trends))
+    trends_raw.extend(build_trends(pipeline.mla_trends))
+
+    from analysis.db2_analytics_persistence import deduplicate_trends
+    trends, trends_dedup = deduplicate_trends(trends_raw)
 
     compute_member_ranks(members)
     compute_state_ranks(states)
@@ -1073,7 +1155,9 @@ def stage_analytics_persist_affected(pipeline_result, anomaly_result, affected_r
     print(f"  Member metrics (affected): {len(members)}")
     print(f"  State metrics (affected): {len(states)}")
     print(f"  National statistics (full): {len(stats)}")
-    print(f"  Trends (full): {len(trends)}")
+    print(f"  Trends generated: {trends_dedup['generated']}")
+    print(f"  Trends duplicates: {trends_dedup['duplicates_found']}")
+    print(f"  Trends after dedup: {len(trends)}")
 
     written = 0
 
@@ -1112,17 +1196,22 @@ def stage_analytics_persist_affected(pipeline_result, anomaly_result, affected_r
             except Exception:
                 pass
 
-    for mt in ("MP", "MLA"):
-        mt_trends = [t for t in trends if t.get("member_type") == mt]
-        if mt_trends:
-            # Upsert first to avoid data loss if upsert fails
-            sb_upsert(db2_url, db2_key, "trends", mt_trends)
-            written += len(mt_trends)
-            try:
-                sb_delete(db2_url, db2_key, "trends",
-                          {"member_type": f"eq.{mt}"})
-            except Exception:
-                pass
+    # Trends (upsert by year + member_type)
+    if trends:
+        trends_written = 0
+        trends_failed = 0
+        for mt in ("MP", "MLA"):
+            mt_trends = [t for t in trends if t.get("member_type") == mt]
+            if mt_trends:
+                try:
+                    sb_upsert(db2_url, db2_key, "trends", mt_trends,
+                              conflict_cols=["year", "member_type"])
+                    trends_written += len(mt_trends)
+                except Exception as exc:
+                    print(f"  WARNING: trends upsert failed for {mt}: {exc}")
+                    trends_failed += len(mt_trends)
+        print(f"  Trends written: {trends_written}, failed: {trends_failed}")
+        written += trends_written
 
     print(f"  Total written: {written} analytics records")
     return {
@@ -1193,47 +1282,74 @@ def stage_evidence_work_refs_affected(evidence_records, work_analyses, affected_
     """Stage 8b-affected: Build evidence_work_refs for affected entities only.
 
     Only replaces refs for affected entities, preserves all others.
+    Uses parallel deletes and parallel batch inserts for throughput.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from analysis.evidence_work_refs import build_evidence_work_refs
 
     print("\n=== STAGE 8b: EVIDENCE WORK REFS (AFFECTED) ===")
 
     db2_url, db2_key = get_db2()
 
+    t_start = time.time()
     refs = build_evidence_work_refs(evidence_records, work_analyses)
+    build_elapsed = time.time() - t_start
 
     if refs:
-        # For affected mode: delete only affected entity refs, then insert
         affected_members = affected_result.get("affected_members", set())
         affected_states = affected_result.get("affected_states", set())
 
-        deleted = 0
+        # Collect all delete tasks
+        delete_tasks = []
         for member_type, member_id in affected_members:
-            try:
-                sb_delete(db2_url, db2_key, "evidence_work_refs",
-                          {"entity_type": f"eq.{member_type}", "entity_id": f"eq.{member_id}"})
-                deleted += 1
-            except Exception:
-                pass
-
+            delete_tasks.append(
+                (db2_url, db2_key, "evidence_work_refs",
+                 {"entity_type": f"eq.{member_type}", "entity_id": f"eq.{member_id}"})
+            )
         for state_id in affected_states:
+            delete_tasks.append(
+                (db2_url, db2_key, "evidence_work_refs",
+                 {"entity_type": "eq.STATE", "entity_id": f"eq.{state_id}"})
+            )
+
+        # Parallel delete
+        def _delete_one(task):
+            url, key, tbl, filters = task
             try:
-                sb_delete(db2_url, db2_key, "evidence_work_refs",
-                          {"entity_type": "eq.STATE", "entity_id": f"eq.{state_id}"})
-                deleted += 1
+                sb_delete(url, key, tbl, filters)
+                return 1
             except Exception:
-                pass
+                return 0
 
-        print(f"  Cleaned affected refs: {deleted} entities")
+        deleted = 0
+        if delete_tasks:
+            with ThreadPoolExecutor(max_workers=min(10, len(delete_tasks))) as executor:
+                futures = [executor.submit(_delete_one, t) for t in delete_tasks]
+                for f in as_completed(futures):
+                    deleted += f.result()
 
+        print(f"  Cleaned affected refs: {deleted} entities ({time.time() - t_start:.1f}s)")
+
+        # Parallel batch insert
         batch_size = 500
-        written = 0
-        for start in range(0, len(refs), batch_size):
-            batch = refs[start:start + batch_size]
-            sb_upsert(db2_url, db2_key, "evidence_work_refs", batch)
-            written += len(batch)
+        batches = [refs[start:start + batch_size]
+                   for start in range(0, len(refs), batch_size)]
 
-        print(f"  Evidence work refs written: {written}")
+        def _insert_batch(batch):
+            sb_upsert(db2_url, db2_key, "evidence_work_refs", batch)
+            return len(batch)
+
+        written = 0
+        if len(batches) <= 2:
+            for batch in batches:
+                written += _insert_batch(batch)
+        else:
+            with ThreadPoolExecutor(max_workers=min(4, len(batches))) as executor:
+                futures = {executor.submit(_insert_batch, b): i for i, b in enumerate(batches)}
+                for f in as_completed(futures):
+                    written += f.result()
+
+        print(f"  Evidence work refs written: {written} ({time.time() - t_start:.1f}s total)")
     else:
         written = 0
         print("  No evidence work refs to write")

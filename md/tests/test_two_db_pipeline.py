@@ -1448,6 +1448,51 @@ class TestDB2AnalyticsPersistence:
         assert r["member_type"] == "MP"
         assert r["total_works"] == 1000
 
+    def test_deduplicate_trends_removes_duplicates(self):
+        from analysis.db2_analytics_persistence import deduplicate_trends
+        records = [
+            {"year": 2024, "member_type": "MP", "total_works": 100},
+            {"year": 2024, "member_type": "MLA", "total_works": 80},
+            {"year": 2024, "member_type": "MP", "total_works": 105},
+            {"year": 2024, "member_type": "MLA", "total_works": 85},
+        ]
+        deduped, stats = deduplicate_trends(records)
+        assert stats["generated"] == 4
+        assert stats["duplicates_found"] == 2
+        assert len(deduped) == 2
+        mp = [r for r in deduped if r["member_type"] == "MP"][0]
+        mla = [r for r in deduped if r["member_type"] == "MLA"][0]
+        assert mp["total_works"] == 105, "Last occurrence wins"
+        assert mla["total_works"] == 85, "Last occurrence wins"
+
+    def test_deduplicate_trends_no_duplicates(self):
+        from analysis.db2_analytics_persistence import deduplicate_trends
+        records = [
+            {"year": 2023, "member_type": "MP", "total_works": 50},
+            {"year": 2024, "member_type": "MP", "total_works": 60},
+            {"year": 2023, "member_type": "MLA", "total_works": 40},
+        ]
+        deduped, stats = deduplicate_trends(records)
+        assert stats["duplicates_found"] == 0
+        assert len(deduped) == 3
+
+    def test_deduplicate_trends_empty_input(self):
+        from analysis.db2_analytics_persistence import deduplicate_trends
+        deduped, stats = deduplicate_trends([])
+        assert deduped == []
+        assert stats["generated"] == 0
+
+    def test_deduplicate_trends_7_year_2_member(self):
+        from analysis.db2_analytics_persistence import deduplicate_trends
+        records = []
+        for year in range(2018, 2025):
+            for mt in ("MP", "MLA"):
+                records.append({"year": year, "member_type": mt, "total_works": year * 10})
+        assert len(records) == 14
+        deduped, stats = deduplicate_trends(records)
+        assert len(deduped) == 14, "No duplicates when all (year, member_type) are unique"
+        assert stats["duplicates_found"] == 0
+
     def test_compute_member_ranks(self):
         from analysis.db2_analytics_persistence import compute_member_ranks
         records = [
@@ -1488,6 +1533,21 @@ class TestDB2AnalyticsPersistence:
         import inspect
         src = inspect.getsource(stage_analytics_persist)
         assert "sb_upsert" in src
+
+    def test_trends_persistence_uses_conflict_cols(self):
+        """Trends must upsert with conflict_cols=[year, member_type], not delete."""
+        import inspect
+        from automation.pipeline_controller import stage_analytics_persist
+        src = inspect.getsource(stage_analytics_persist)
+        assert 'conflict_cols=["year", "member_type"]' in src
+
+    def test_trends_persistence_no_destructive_delete(self):
+        """Trends must NOT use sb_delete — upsert with conflict_cols handles dedup."""
+        import inspect
+        from automation.pipeline_controller import stage_analytics_persist
+        src = inspect.getsource(stage_analytics_persist)
+        # national_statistics can still use delete, but trends must not
+        assert 'sb_delete(db2_url, db2_key, "trends"' not in src
 
     def test_analytics_persist_includes_rankings(self):
         from automation.pipeline_controller import stage_analytics_persist

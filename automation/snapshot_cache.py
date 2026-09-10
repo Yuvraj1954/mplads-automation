@@ -44,16 +44,40 @@ def _get_work_dir() -> Path:
 
 
 def _find_snapshot_ts(base: Path) -> Optional[str]:
-    """Find the timestamp directory inside base/ (e.g., previous/ or current/).
+    """Find the NEWEST timestamp directory inside base/ (e.g., previous/ or current/).
 
-    Returns the timestamp string or None if not found.
+    Returns the newest (lexicographically last) timestamp string or None if not found.
+    ISO 8601 timestamps sort chronologically, so last = newest.
     """
     if not base.exists() or not base.is_dir():
         return None
+    candidates = [
+        d.name for d in sorted(base.iterdir())
+        if d.is_dir() and not d.name.startswith(".") and not d.name.startswith("_")
+    ]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        print(f"SNAPSHOT CACHE: Found {len(candidates)} snapshots in {base.name}/: {candidates}")
+        print(f"SNAPSHOT CACHE: Selecting newest: {candidates[-1]}")
+    return candidates[-1]
+
+
+def _cleanup_stale_snapshots(base: Path, keep_ts: str) -> int:
+    """Remove all snapshot directories in base/ except keep_ts.
+
+    Returns the number of directories removed.
+    """
+    if not base.exists() or not base.is_dir():
+        return 0
+    removed = 0
     for d in sorted(base.iterdir()):
         if d.is_dir() and not d.name.startswith(".") and not d.name.startswith("_"):
-            return d.name
-    return None
+            if d.name != keep_ts:
+                print(f"SNAPSHOT CACHE: Removing stale snapshot: {base.name}/{d.name}")
+                shutil.rmtree(d)
+                removed += 1
+    return removed
 
 
 def validate_snapshot_structure(snapshot_dir: Path) -> Tuple[bool, str]:
@@ -98,8 +122,36 @@ def validate_snapshot_structure(snapshot_dir: Path) -> Tuple[bool, str]:
     return True, ""
 
 
+def _find_valid_snapshot_ts(base: Path) -> Optional[str]:
+    """Find the newest valid snapshot timestamp in base/.
+
+    Iterates from newest to oldest, returning the first that passes
+    validate_snapshot_structure. Cleans up any stale invalid snapshots found.
+    """
+    if not base.exists() or not base.is_dir():
+        return None
+    candidates = sorted(
+        [
+            d.name for d in base.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and not d.name.startswith("_")
+        ],
+        reverse=True,
+    )
+    for ts in candidates:
+        ok, err = validate_snapshot_structure(base / ts)
+        if ok:
+            # Clean up any older stale snapshots
+            _cleanup_stale_snapshots(base, ts)
+            return ts
+        print(f"SNAPSHOT CACHE: {base.name}/{ts} invalid: {err}")
+    return None
+
+
 def validate_cache(work_dir: Optional[Path] = None) -> Tuple[bool, str]:
     """Validate that the cache contains both previous and current snapshots.
+
+    Selects the NEWEST valid snapshot for previous (not the oldest).
+    Falls back to older snapshots if the newest is invalid.
 
     Returns (is_valid, error_message).
     """
@@ -108,25 +160,15 @@ def validate_cache(work_dir: Optional[Path] = None) -> Tuple[bool, str]:
     if not work_dir.exists():
         return False, f"Cache work directory does not exist: {work_dir}"
 
-    # Find previous snapshot
-    prev_ts = _find_snapshot_ts(work_dir / PREVIOUS_DIR)
+    # Find newest valid previous snapshot (tries newest first, falls back)
+    prev_ts = _find_valid_snapshot_ts(work_dir / PREVIOUS_DIR)
     if not prev_ts:
-        return False, "No previous snapshot found in cache"
+        return False, "No valid previous snapshot found in cache"
 
-    prev_dir = work_dir / PREVIOUS_DIR / prev_ts
-    ok, err = validate_snapshot_structure(prev_dir)
-    if not ok:
-        return False, f"Previous snapshot invalid: {err}"
-
-    # Find current snapshot
-    curr_ts = _find_snapshot_ts(work_dir / CURRENT_DIR)
+    # Find newest valid current snapshot
+    curr_ts = _find_valid_snapshot_ts(work_dir / CURRENT_DIR)
     if not curr_ts:
-        return False, "No current snapshot found in cache"
-
-    curr_dir = work_dir / CURRENT_DIR / curr_ts
-    ok, err = validate_snapshot_structure(curr_dir)
-    if not ok:
-        return False, f"Current snapshot invalid: {err}"
+        return False, "No valid current snapshot found in cache"
 
     return True, ""
 
@@ -159,43 +201,39 @@ def validate_bootstrap_cache(work_dir: Optional[Path] = None) -> Tuple[bool, str
 
 
 def get_previous_local_path(work_dir: Optional[Path] = None) -> Optional[Path]:
-    """Return the local path to the previous snapshot directory.
+    """Return the local path to the newest valid previous snapshot directory.
 
     Returns None if no valid previous snapshot exists.
     """
     work_dir = work_dir or _get_work_dir()
-    prev_ts = _find_snapshot_ts(work_dir / PREVIOUS_DIR)
+    prev_ts = _find_valid_snapshot_ts(work_dir / PREVIOUS_DIR)
     if not prev_ts:
         return None
-    prev_dir = work_dir / PREVIOUS_DIR / prev_ts
-    ok, _ = validate_snapshot_structure(prev_dir)
-    return prev_dir if ok else None
+    return work_dir / PREVIOUS_DIR / prev_ts
 
 
 def get_current_local_path(work_dir: Optional[Path] = None) -> Optional[Path]:
-    """Return the local path to the current snapshot directory.
+    """Return the local path to the newest valid current snapshot directory.
 
     Returns None if no valid current snapshot exists.
     """
     work_dir = work_dir or _get_work_dir()
-    curr_ts = _find_snapshot_ts(work_dir / CURRENT_DIR)
+    curr_ts = _find_valid_snapshot_ts(work_dir / CURRENT_DIR)
     if not curr_ts:
         return None
-    curr_dir = work_dir / CURRENT_DIR / curr_ts
-    ok, _ = validate_snapshot_structure(curr_dir)
-    return curr_dir if ok else None
+    return work_dir / CURRENT_DIR / curr_ts
 
 
 def get_previous_timestamp(work_dir: Optional[Path] = None) -> Optional[str]:
-    """Return the previous snapshot timestamp string."""
+    """Return the newest valid previous snapshot timestamp string."""
     work_dir = work_dir or _get_work_dir()
-    return _find_snapshot_ts(work_dir / PREVIOUS_DIR)
+    return _find_valid_snapshot_ts(work_dir / PREVIOUS_DIR)
 
 
 def get_current_timestamp(work_dir: Optional[Path] = None) -> Optional[str]:
-    """Return the current snapshot timestamp string."""
+    """Return the newest valid current snapshot timestamp string."""
     work_dir = work_dir or _get_work_dir()
-    return _find_snapshot_ts(work_dir / CURRENT_DIR)
+    return _find_valid_snapshot_ts(work_dir / CURRENT_DIR)
 
 
 def rotate_snapshots(
@@ -215,8 +253,15 @@ def rotate_snapshots(
     prev_dir = work_dir / PREVIOUS_DIR
     curr_dir = work_dir / CURRENT_DIR
 
-    # Find existing current timestamp (becomes new previous)
-    old_curr_ts = _find_snapshot_ts(curr_dir)
+    # Find the OLD current timestamp (the one that was there before the new
+    # snapshot was added). Exclude new_snapshot_ts since it may already exist
+    # in current/ from _preserve_fetched_snapshot.
+    old_curr_ts = None
+    if curr_dir.exists():
+        for d in sorted(curr_dir.iterdir()):
+            if (d.is_dir() and not d.name.startswith(".")
+                    and not d.name.startswith("_") and d.name != new_snapshot_ts):
+                old_curr_ts = d.name
 
     # Clean up old previous
     if prev_dir.exists():
