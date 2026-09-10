@@ -25,10 +25,12 @@ if not SUPABASE_URL:
 if not SUPABASE_SECRET_KEY:
     raise RuntimeError("SUPABASE_SECRET_KEY is missing from .env")
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_SECRET_KEY
-)
+def create_supabase_client():
+    """Create a new Supabase client. Each worker must call this to get
+    its own independent client — supabase-py wraps httpx.Client which is
+    NOT thread-safe, so a shared global client would corrupt under
+    concurrent uploads."""
+    return create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 DASHBOARD_URL = (
     "https://mplads.mospi.gov.in/digigov/dashboard.html"
@@ -222,6 +224,7 @@ def upload_chunk(
     records,
     local_snapshot_dir,
     local_only=False,
+    supabase_client=None,
 ):
     folder = f"{timestamp}/{dataset_name}"
     filename = f"part_{chunk_number:04d}.ndjson"
@@ -260,8 +263,9 @@ def upload_chunk(
         f"{size_mb:.2f} MB)"
     )
 
+    client = supabase_client or create_supabase_client()
     result = (
-        supabase
+        client
         .storage
         .from_(BUCKET)
         .upload(
@@ -290,6 +294,7 @@ def upload_dataset(
     timestamp,
     local_snapshot_dir,
     local_only=False,
+    supabase_client=None,
 ):
     dataset_key, records = extract_records(
         data,
@@ -397,6 +402,7 @@ def upload_dataset(
             records=chunk,
             local_snapshot_dir=local_snapshot_dir,
             local_only=local_only,
+            supabase_client=supabase_client,
         )
 
         uploaded_records += len(chunk)
@@ -420,7 +426,8 @@ def upload_dataset(
 def upload_manifest(
     dataset_name,
     timestamp,
-    result
+    result,
+    supabase_client=None,
 ):
     manifest = {
         "dataset": dataset_name,
@@ -444,8 +451,9 @@ def upload_manifest(
         ensure_ascii=False
     ).encode("utf-8")
 
+    client = supabase_client or create_supabase_client()
     (
-        supabase
+        client
         .storage
         .from_(BUCKET)
         .upload(
@@ -530,7 +538,7 @@ def build_completion_marker(timestamp, results):
     }
 
 
-def upload_completion_marker(marker):
+def upload_completion_marker(marker, supabase_client=None):
     """Upload a pre-built completion marker to Supabase Storage.
 
     The marker dict is serialized and uploaded as _COMPLETE.json
@@ -544,8 +552,9 @@ def upload_completion_marker(marker):
         ensure_ascii=False
     ).encode("utf-8")
 
+    client = supabase_client or create_supabase_client()
     (
-        supabase
+        client
         .storage
         .from_(BUCKET)
         .upload(
@@ -574,6 +583,7 @@ def process_dataset(
     local_snapshot_dir,
     combo,
     local_only=False,
+    supabase_client=None,
 ):
     data = fetch_dataset(
         session,
@@ -588,13 +598,15 @@ def process_dataset(
         timestamp,
         local_snapshot_dir,
         local_only=local_only,
+        supabase_client=supabase_client,
     )
 
     if not local_only:
         upload_manifest(
             dataset_name,
             timestamp,
-            result
+            result,
+            supabase_client=supabase_client,
         )
 
     return result
@@ -817,6 +829,7 @@ def fetch_all_datasets_concurrently(
 
         def _worker():
             session = create_session()
+            worker_supabase = create_supabase_client()
             try:
                 establish_session(session)
             except Exception as e:
@@ -841,6 +854,7 @@ def fetch_all_datasets_concurrently(
                         local_snapshot_dir,
                         combo,
                         local_only=local_only,
+                        supabase_client=worker_supabase,
                     )
                     with results_lock:
                         all_results[storage_name] = res
@@ -1024,7 +1038,7 @@ def main():
 
     if not local_only:
         try:
-            upload_completion_marker(marker)
+            upload_completion_marker(marker, supabase_client=create_supabase_client())
         except Exception as error:
             print()
             print(

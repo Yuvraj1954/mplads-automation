@@ -696,6 +696,13 @@ def main():
                 local_snapshot_path = line.split("=", 1)[1].strip()
                 break
 
+        if local_snapshot_path is None:
+            raise RuntimeError(
+                "Fetcher completed but did not emit LOCAL_SNAPSHOT_PATH=. "
+                "The fetcher process may have failed silently or produced "
+                "unexpected output. Check fetcher logs above."
+            )
+
     if local_snapshot_path:
         validate_local_snapshot(local_snapshot_path)
 
