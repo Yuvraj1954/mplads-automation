@@ -355,6 +355,11 @@ jobs:
           DB2_URL: ${{ secrets.DB2_URL }}
           DB2_SERVICE_ROLE_KEY: ${{ secrets.DB2_SERVICE_ROLE_KEY }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
+          GEMINI_CONCURRENCY: "12"
+          GEMINI_ITEMS_PER_REQUEST: "5"
+          FETCH_CONCURRENCY: "5"
+          INGEST_CONCURRENCY: "5"
           SYNC_INTERVAL_HOURS: ${{ github.event.inputs.sync_interval_hours || '24' }}
           MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
           USE_SUPABASE_FALLBACK: ${{ steps.strategy.outputs.use_supabase_fallback }}
@@ -371,6 +376,11 @@ jobs:
           DB2_URL: ${{ secrets.DB2_URL }}
           DB2_SERVICE_ROLE_KEY: ${{ secrets.DB2_SERVICE_ROLE_KEY }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
+          GEMINI_CONCURRENCY: "12"
+          GEMINI_ITEMS_PER_REQUEST: "5"
+          FETCH_CONCURRENCY: "5"
+          INGEST_CONCURRENCY: "5"
           MPLADS_CACHE_WORK_DIR: /tmp/mplads-work
         run: python automation/daily_pipeline.py --bootstrap
 

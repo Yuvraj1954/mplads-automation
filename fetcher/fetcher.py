@@ -774,6 +774,146 @@ def fetch_member_type(
     return results, successful, failed, failed_datasets
 
 
+def fetch_all_datasets_concurrently(
+    timestamp,
+    local_snapshot_dir,
+    concurrency=5,
+    local_only=False,
+):
+    """Fetch all 12 MP and MLA datasets concurrently using bounded worker pool."""
+    import queue
+    import threading
+
+    jobs = []
+    for name, key in MP_DATASETS.items():
+        jobs.append({
+            "storage_name": name,
+            "dataset_key": key,
+            "combo": MP_COMBO,
+            "member_type": "MP",
+        })
+    for name, key in MLA_DATASETS.items():
+        jobs.append({
+            "storage_name": f"mla_{name}",
+            "dataset_key": key,
+            "combo": MLA_COMBO,
+            "member_type": "MLA",
+        })
+
+    print()
+    print("Fetch scheduler:")
+    print(f"  jobs={len(jobs)}")
+    print(f"  concurrency={concurrency}")
+
+    all_results = {}
+    failed_datasets = []
+    results_lock = threading.Lock()
+    failures_lock = threading.Lock()
+
+    def _execute_phase(job_list, is_retry=False, retry_num=0):
+        work_queue = queue.Queue()
+        for j in job_list:
+            work_queue.put(j)
+
+        def _worker():
+            session = create_session()
+            try:
+                establish_session(session)
+            except Exception as e:
+                print(f"  ✗ Worker session warning: {e}")
+
+            while True:
+                try:
+                    job = work_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                storage_name = job.get("storage_name") or job.get("name")
+                dataset_key = job.get("dataset_key") or job.get("key")
+                combo = job.get("combo")
+
+                try:
+                    res = process_dataset(
+                        session,
+                        storage_name,
+                        dataset_key,
+                        timestamp,
+                        local_snapshot_dir,
+                        combo,
+                        local_only=local_only,
+                    )
+                    with results_lock:
+                        all_results[storage_name] = res
+                    if is_retry:
+                        print(f"✓ {storage_name} succeeded on retry {retry_num}")
+                except Exception as error:
+                    print(f"✗ {storage_name} FAILED: {error}")
+                    with failures_lock:
+                        failed_datasets.append({
+                            "name": storage_name,
+                            "key": dataset_key,
+                            "storage_name": storage_name,
+                            "dataset_key": dataset_key,
+                            "combo": combo,
+                            "member_type": job.get("member_type"),
+                            "error": str(error),
+                        })
+                finally:
+                    work_queue.task_done()
+
+            try:
+                session.close()
+            except Exception:
+                pass
+
+        threads = []
+        num_workers = min(concurrency, len(job_list))
+        for _ in range(num_workers):
+            t = threading.Thread(target=_worker)
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+    # PHASE 1: Initial concurrent fetch
+    print()
+    print("=" * 70)
+    print("PHASE 1 — INITIAL CONCURRENT FETCH (12 datasets)")
+    print("=" * 70)
+    _execute_phase(jobs)
+
+    # PHASE 2: Retry failed datasets
+    if failed_datasets:
+        print()
+        print("=" * 70)
+        print("PHASE 2 — RETRY FAILED DATASETS")
+        print("=" * 70)
+
+        for retry_number in range(1, MAX_RETRIES + 1):
+            with failures_lock:
+                to_retry = list(failed_datasets)
+                failed_datasets.clear()
+
+            if not to_retry:
+                break
+
+            print()
+            print(f"--- Retry attempt {retry_number}/{MAX_RETRIES} ({len(to_retry)} datasets) ---")
+            time.sleep(RETRY_DELAY_SECONDS)
+            _execute_phase(to_retry, is_retry=True, retry_num=retry_number)
+
+            expected_datasets = {j["storage_name"] for j in jobs}
+            missing = expected_datasets - set(all_results.keys())
+            if not missing:
+                break
+
+    total_successful = len(all_results)
+    total_failed = len(jobs) - total_successful
+
+    return all_results, total_successful, total_failed, failed_datasets
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MPLADS Fetcher")
@@ -805,155 +945,108 @@ def main():
     )
     print(f"Local snapshot: {local_snapshot_dir}")
 
-    # --------------------------------------
-    # Initial session
-    # --------------------------------------
+    fetch_concurrency = int(os.environ.get("FETCH_CONCURRENCY", "5"))
 
-    session = create_session()
+    all_results, total_successful, total_failed, all_failed_datasets = fetch_all_datasets_concurrently(
+        timestamp=timestamp,
+        local_snapshot_dir=local_snapshot_dir,
+        concurrency=fetch_concurrency,
+        local_only=local_only,
+    )
 
-    all_results = {}
-    total_successful = 0
-    total_failed = 0
-    all_failed_datasets = []
+    # ==================================
+    # Final summary
+    # ==================================
+
+    print()
+    print("=" * 70)
+    print("FETCH COMPLETE")
+    print("=" * 70)
+
+    print(f"Successful: {total_successful}")
+    print(f"Failed:     {total_failed}")
+
+    print()
+    print("Cloud structure:")
+    print(f"{timestamp}/")
+
+    for dataset_name in all_results:
+        result = all_results[dataset_name]
+
+        print(f"├── {dataset_name}/")
+        print("│   ├── manifest.json")
+        print("│   └── part_0001.ndjson ...")
+
+    if all_failed_datasets:
+        print()
+        print("Failed datasets after all retries:")
+
+        for item in all_failed_datasets:
+            print(
+                f"  ✗ {item['name']}: "
+                f"{item['error']}"
+            )
+
+    print()
+    print(f"Timestamp folder: {timestamp}")
+
+    # ==================================
+    # COMPLETION MARKER
+    # ==================================
+
+    if total_failed:
+        print()
+        print(
+            "Run failed because one or more "
+            "datasets could not be fetched "
+            "after all retry attempts."
+        )
+        raise SystemExit(1)
+
+    print()
+    print("Writing completion marker...")
 
     try:
+        marker = build_completion_marker(timestamp, all_results)
+    except Exception as error:
         print()
-        print("Connecting to MPLADS...")
-        establish_session(session)
-
-        # ==================================
-        # Fetch MP datasets
-        # ==================================
-
-        mp_results, mp_successful, mp_failed, mp_failed_datasets = fetch_member_type(
-            session,
-            "MP",
-            MP_DATASETS,
-            MP_COMBO,
-            timestamp,
-            local_snapshot_dir,
-            local_only=local_only,
+        print(
+            f"✗ FAILED to build "
+            f"completion marker: {error}"
         )
+        raise SystemExit(1)
 
-        all_results.update(mp_results)
-        total_successful += mp_successful
-        total_failed += mp_failed
-        all_failed_datasets.extend(mp_failed_datasets)
+    marker_path = local_snapshot_dir / "_COMPLETE.json"
+    marker_path.write_text(
+        json.dumps(marker, indent=2, ensure_ascii=False)
+    )
+    print(f"  ✓ Local completion marker written: {marker_path}")
 
-        # ==================================
-        # Fetch MLA datasets
-        # ==================================
-
-        mla_results, mla_successful, mla_failed, mla_failed_datasets = fetch_member_type(
-            session,
-            "MLA",
-            MLA_DATASETS,
-            MLA_COMBO,
-            timestamp,
-            local_snapshot_dir,
-            local_only=local_only,
-        )
-
-        all_results.update(mla_results)
-        total_successful += mla_successful
-        total_failed += mla_failed
-        all_failed_datasets.extend(mla_failed_datasets)
-
-        # ==================================
-        # Final summary
-        # ==================================
-
-        print()
-        print("=" * 70)
-        print("FETCH COMPLETE")
-        print("=" * 70)
-
-        print(f"Successful: {total_successful}")
-        print(f"Failed:     {total_failed}")
-
-        print()
-        print("Cloud structure:")
-        print(f"{timestamp}/")
-
-        for dataset_name in all_results:
-            result = all_results[dataset_name]
-
-            print(f"├── {dataset_name}/")
-            print("│   ├── manifest.json")
-            print("│   └── part_0001.ndjson ...")
-
-        if all_failed_datasets:
-            print()
-            print("Failed datasets after all retries:")
-
-            for item in all_failed_datasets:
-                print(
-                    f"  ✗ {item['name']}: "
-                    f"{item['error']}"
-                )
-
-        print()
-        print(f"Timestamp folder: {timestamp}")
-
-        # ==================================
-        # COMPLETION MARKER
-        # ==================================
-
-        if total_failed:
-            print()
-            print(
-                "Run failed because one or more "
-                "datasets could not be fetched "
-                "after all retry attempts."
-            )
-            raise SystemExit(1)
-
-        print()
-        print("Writing completion marker...")
-
+    if not local_only:
         try:
-            marker = build_completion_marker(timestamp, all_results)
+            upload_completion_marker(marker)
         except Exception as error:
             print()
             print(
-                f"✗ FAILED to build "
+                f"✗ FAILED to upload "
                 f"completion marker: {error}"
+            )
+            print(
+                "Run treated as FAILED because "
+                "_COMPLETE.json could not be "
+                "uploaded."
             )
             raise SystemExit(1)
 
-        marker_path = local_snapshot_dir / "_COMPLETE.json"
-        marker_path.write_text(
-            json.dumps(marker, indent=2, ensure_ascii=False)
-        )
-        print(f"  ✓ Local completion marker written: {marker_path}")
+    print()
+    print("✓ ALL DATASETS SUCCESSFUL")
+    print("✓ COMPLETION MARKER WRITTEN")
+    if not local_only:
+        print("✓ COMPLETION MARKER UPLOADED")
+    print("✓ SNAPSHOT IS READY FOR INGESTION")
+    print(f"✓ Local snapshot: {local_snapshot_dir}")
+    print(f"LOCAL_SNAPSHOT_PATH={local_snapshot_dir}")
 
-        if not local_only:
-            try:
-                upload_completion_marker(marker)
-            except Exception as error:
-                print()
-                print(
-                    f"✗ FAILED to upload "
-                    f"completion marker: {error}"
-                )
-                print(
-                    "Run treated as FAILED because "
-                    "_COMPLETE.json could not be "
-                    "uploaded."
-                )
-                raise SystemExit(1)
-
-        print()
-        print("✓ ALL DATASETS SUCCESSFUL")
-        print("✓ COMPLETION MARKER WRITTEN")
-        if not local_only:
-            print("✓ COMPLETION MARKER UPLOADED")
-        print("✓ SNAPSHOT IS READY FOR INGESTION")
-        print(f"✓ Local snapshot: {local_snapshot_dir}")
-        print(f"LOCAL_SNAPSHOT_PATH={local_snapshot_dir}")
-
-    finally:
-        session.close()
 
 
 if __name__ == "__main__":

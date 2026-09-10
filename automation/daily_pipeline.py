@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import time
+import threading
 import argparse
 from pathlib import Path
 
@@ -852,40 +853,86 @@ def main():
     print("Expected jobs:", expected_jobs)
 
     print("=== STEP 6: RUN WORKER ===")
+    ingest_concurrency = int(os.environ.get("INGEST_CONCURRENCY", "5"))
+    print("Ingestion scheduler:")
+    print(f"  jobs={expected_jobs}")
+    print(f"  concurrency={ingest_concurrency}")
+
     worker_max_minutes = 80
     worker_start = time.time()
-    worker_interval = 60
     per_job_timeout_seconds = 5 * 60  # 5 minutes per job
-    max_retries = 3
+    all_completed = threading.Event()
+    stop_event = threading.Event()
+    worker_errors = []
+    errors_lock = threading.Lock()
 
-    while True:
+    def _ingest_worker(worker_idx):
+        while not stop_event.is_set() and not all_completed.is_set():
+            elapsed = time.time() - worker_start
+            if elapsed > worker_max_minutes * 60:
+                stop_event.set()
+                break
+
+            job_start = time.time()
+            try:
+                result = call_edge("mplads-worker", {"run_id": run_id})
+            except Exception as exc:
+                job_elapsed = time.time() - job_start
+                print(f"[Worker {worker_idx}] call failed after {job_elapsed:.1f}s: {exc}")
+                if job_elapsed >= per_job_timeout_seconds:
+                    print(f"[Worker {worker_idx}] per-job timeout ({per_job_timeout_seconds}s) exceeded")
+                time.sleep(5)
+                continue
+
+            if result.get("success"):
+                msg = result.get("message", "")
+                completed_count = result.get("completed", 0)
+                remaining = result.get("progress", {}).get("remaining", None)
+
+                if msg == "All ingestion jobs completed." and completed_count >= expected_jobs:
+                    print(f"[Worker {worker_idx}] All {expected_jobs} ingestion jobs completed.")
+                    all_completed.set()
+                    break
+                elif remaining == 0:
+                    print(f"[Worker {worker_idx}] Ingestion progress: remaining=0.")
+                    all_completed.set()
+                    break
+                elif msg == "Job was already claimed. Try again.":
+                    time.sleep(1)
+                    continue
+                elif msg == "All ingestion jobs completed.":
+                    # In-flight jobs still being processed by other worker threads
+                    time.sleep(3)
+                    continue
+                else:
+                    print(f"[Worker {worker_idx}] Worker:", result)
+            else:
+                err = result.get("error", "Unknown worker error")
+                print(f"[Worker {worker_idx}] Worker returned error: {err}")
+                with errors_lock:
+                    worker_errors.append(err)
+                time.sleep(5)
+
+    threads = []
+    num_workers = min(ingest_concurrency, expected_jobs)
+    for i in range(num_workers):
+        t = threading.Thread(target=_ingest_worker, args=(i + 1,))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    if not all_completed.is_set():
         elapsed = time.time() - worker_start
         if elapsed > worker_max_minutes * 60:
             raise RuntimeError(
                 f"Worker loop timed out after {worker_max_minutes} minutes"
             )
-
-        job_start = time.time()
-        try:
-            result = call_edge("mplads-worker", {"run_id": run_id})
-        except Exception as exc:
-            job_elapsed = time.time() - job_start
-            print(f"Worker call failed after {job_elapsed:.1f}s: {exc}")
-            if job_elapsed >= per_job_timeout_seconds:
-                print(f"Per-job timeout ({per_job_timeout_seconds}s) exceeded")
-            time.sleep(worker_interval)
-            continue
-
-        print("Worker:", result)
-        if result.get("success") and (
-            result.get("message") == "All ingestion jobs completed."
-            or result.get("progress", {}).get("remaining", 1) == 0
-        ):
-            break
-
-        remaining = worker_max_minutes - (elapsed / 60)
-        print(f"Worker remaining budget: {remaining:.1f} minutes")
-        time.sleep(worker_interval)
+        if not verify_run(run_id, expected_jobs):
+            raise RuntimeError(
+                f"Worker finished without completing all jobs. Errors: {worker_errors}"
+            )
 
     print("=== STEP 7: VERIFY ===")
     if not verify_run(run_id, expected_jobs):

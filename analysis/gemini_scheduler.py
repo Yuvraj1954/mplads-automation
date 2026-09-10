@@ -107,7 +107,7 @@ class GeminiScheduler:
         if models is None:
             models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
-        env_concurrency = int(os.environ.get("GEMINI_CONCURRENCY", "10"))
+        env_concurrency = int(os.environ.get("GEMINI_CONCURRENCY", "12"))
         env_items_per_req = int(os.environ.get("GEMINI_ITEMS_PER_REQUEST", "5"))
 
         self.max_workers = max_workers if max_workers is not None else env_concurrency
@@ -138,6 +138,7 @@ class GeminiScheduler:
             self.max_workers = 0
 
         # Clients per model
+        self.models = list(models)
         self._clients = {}
         for model in models:
             self._clients[model] = GeminiClient(model=model)
@@ -165,18 +166,18 @@ class GeminiScheduler:
         if not eligible:
             return None, "ALL_RPD_EXHAUSTED"
 
-        # Check available lanes
+        # Check available lanes, preferring least recently used to balance across models and keys
         best = None
-        best_oldest = float("inf")
+        best_metric = float("inf")
         for lane in eligible:
             if lane.lane_id in exclude:
                 continue
             if not lane.available(now):
                 continue
-            oldest = min(lane.request_times) if lane.request_times else 0
-            if oldest < best_oldest:
+            last_used = max(lane.request_times) if lane.request_times else 0.0
+            if last_used < best_metric:
                 best = lane
-                best_oldest = oldest
+                best_metric = last_used
 
         if best is not None:
             return best, "AVAILABLE"
@@ -219,6 +220,8 @@ class GeminiScheduler:
         print(f"  estimated_requests={estimated_requests}")
         print(f"  concurrency={self.max_workers}")
         print(f"  lanes={len(self.lanes)}")
+        print(f"  models={len(self._clients)}")
+
 
         # Build initial work queue using packing + token safety
         work_queue = queue.Queue()
@@ -331,7 +334,13 @@ class GeminiScheduler:
                 log_progress(len(item.evidence_rows))
                 return
 
-            lane, status = self._pick_lane_with_status(exclude_lanes=item.tried_lanes)
+            with self._lock:
+                lane, status = self._pick_lane_with_status(exclude_lanes=item.tried_lanes)
+                if lane is not None:
+                    item.tried_lanes.add(lane.lane_id)
+                    lane.record_request()
+                    self._daily_count += 1
+                    self._total_api_requests += 1
 
             if status == "ALL_RPD_EXHAUSTED":
                 with self._log_lock:
@@ -367,13 +376,6 @@ class GeminiScheduler:
                 item.tried_lanes.clear()
                 continue
 
-            item.tried_lanes.add(lane.lane_id)
-
-            # Record API call
-            lane.record_request()
-            with self._lock:
-                self._daily_count += 1
-                self._total_api_requests += 1
 
             client = self._clients[lane.model]
             prompt = build_packed_prompt(item.evidence_rows)

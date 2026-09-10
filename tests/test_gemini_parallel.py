@@ -542,3 +542,73 @@ class TestPipelineIntegration:
         affected = filter_affected(evidence, existing)
         assert len(affected) == 1
         assert affected[0]["entity_id"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 11. 12-Lane & Dual-Model Concurrency Tests
+# ---------------------------------------------------------------------------
+
+class Test12LanesAndDualModel:
+    """Tests for 12 lanes (6 keys × 2 models) and true dual-model distribution."""
+
+    def test_12_lanes_created_for_6_keys_and_2_models(self):
+        from analysis.gemini_scheduler import GeminiScheduler
+        keys = [f"key_{i}" for i in range(1, 7)]
+        sched = GeminiScheduler(
+            api_keys=keys,
+            models=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
+            max_workers=12,
+        )
+        assert len(sched.lanes) == 12
+        assert sched.max_workers == 12
+        m1_lanes = [l for l in sched.lanes if l.model == "gemini-3.1-flash-lite"]
+        m2_lanes = [l for l in sched.lanes if l.model == "gemini-3.5-flash-lite"]
+        assert len(m1_lanes) == 6
+        assert len(m2_lanes) == 6
+
+    def test_default_models_and_concurrency(self):
+        from analysis.gemini_scheduler import GeminiScheduler
+        keys = [f"key_{i}" for i in range(1, 7)]
+        sched = GeminiScheduler(api_keys=keys)
+        assert sched.models == ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+        assert sched.max_workers == 12
+        assert len(sched.lanes) == 12
+
+    def test_both_models_are_called_in_scheduler(self):
+        from analysis.gemini_scheduler import GeminiScheduler
+
+        keys = [f"key_{i}" for i in range(1, 7)]
+        sched = GeminiScheduler(
+            api_keys=keys,
+            models=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
+            max_workers=12,
+            items_per_request=1,
+        )
+
+        called_models = []
+        lock = threading.Lock()
+
+        def make_mock(model_name):
+            def mock_call(prompt, api_key):
+                with lock:
+                    called_models.append(model_name)
+                import re
+                eids = re.findall(r'"entity_id":\s*"([^"]+)"', prompt)
+                if not eids:
+                    eids = ["1"]
+                return [{"entity_id": eid, "summary": "s", "highlights": ["h1", "h2", "h3"], "cautions": []} for eid in eids]
+            return mock_call
+
+        for m in sched.models:
+            sched._clients[m].call = make_mock(m)
+
+        # Process 12 items (1 item per request = 12 requests)
+        items = [{"entity_type": "MP", "entity_id": str(i)} for i in range(12)]
+        res = sched.process(items)
+
+        assert res["success_count"] == 12
+        assert "gemini-3.1-flash-lite" in called_models
+        assert "gemini-3.5-flash-lite" in called_models
+        # Both models should be evenly utilized
+        assert called_models.count("gemini-3.1-flash-lite") == 6
+        assert called_models.count("gemini-3.5-flash-lite") == 6

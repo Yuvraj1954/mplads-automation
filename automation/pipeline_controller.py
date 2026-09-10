@@ -931,7 +931,7 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
         else:
             models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
-    concurrency = int(os.environ.get("GEMINI_CONCURRENCY", "10"))
+    concurrency = int(os.environ.get("GEMINI_CONCURRENCY", "12"))
     items_per_req = int(os.environ.get("GEMINI_ITEMS_PER_REQUEST", "5"))
 
     scheduler = GeminiScheduler(
