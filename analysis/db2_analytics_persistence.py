@@ -621,17 +621,22 @@ def deduplicate_trends(trend_records):
 # ============================================================
 
 def compute_member_ranks(member_records):
-    """Compute rank for each member based on anomaly_score.
+    """Compute performance rank for each member.
 
     Ranking only applies to ranking_qualified members.
-    Rank 1 = highest anomaly score (most anomalous).
+    Rank 1 = best performer (highest completion_rate_pct + fund_utilization_pct).
 
     Modifies records in-place, setting the 'rank' field.
     """
+    def _perf_score(r):
+        comp = r.get("completion_rate_pct") or 0
+        util = r.get("fund_utilization_pct") or 0
+        return float(comp) + float(util)
+
     qualified = [r for r in member_records if r.get("ranking_qualified")]
     unqualified = [r for r in member_records if not r.get("ranking_qualified")]
 
-    qualified.sort(key=lambda r: -(r.get("anomaly_score") or 0))
+    qualified.sort(key=lambda r: -_perf_score(r))
 
     for i, r in enumerate(qualified, 1):
         r["rank"] = i
@@ -643,14 +648,19 @@ def compute_member_ranks(member_records):
 
 
 def compute_state_ranks(state_records):
-    """Compute rank for each state based on anomaly_score.
+    """Compute performance rank for each state.
 
-    Rank 1 = highest anomaly score.
+    Rank 1 = best performer (highest completion_rate_pct + fund_utilization_pct).
     """
-    qualified = [r for r in state_records if r.get("anomaly_score") is not None]
-    unqualified = [r for r in state_records if r.get("anomaly_score") is None]
+    def _perf_score(r):
+        comp = r.get("completion_rate_pct") or 0
+        util = r.get("fund_utilization_pct") or 0
+        return float(comp) + float(util)
 
-    qualified.sort(key=lambda r: -(r.get("anomaly_score") or 0))
+    qualified = [r for r in state_records if r.get("ranking_qualified")]
+    unqualified = [r for r in state_records if not r.get("ranking_qualified")]
+
+    qualified.sort(key=lambda r: -_perf_score(r))
 
     for i, r in enumerate(qualified, 1):
         r["rank"] = i
