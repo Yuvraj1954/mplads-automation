@@ -73,8 +73,16 @@ def compute_ranks(records):
 
 
 def compute_state_ranks(records):
-    """Return dict of state_id -> rank for state records."""
-    qualified = [r for r in records if r.get("ranking_qualified")]
+    """Return dict of state_id -> rank for state records.
+
+    state_metrics does not persist `ranking_qualified`, so we recompute it
+    here from the same rule used in analysis/phase_a_state.py:
+        ranking_qualified = total_works >= 10 and active_members >= 2
+    """
+    qualified = [
+        r for r in records
+        if (r.get("total_works") or 0) >= 10 and (r.get("active_members") or 0) >= 2
+    ]
     qualified.sort(key=lambda r: -perf_score(r))
     ranks = {}
     for i, r in enumerate(qualified, 1):
@@ -144,7 +152,7 @@ def main():
     states = fetch_all(
         client,
         "state_metrics",
-        "state_id, completion_rate_pct, fund_utilization_pct, ranking_qualified",
+        "state_id, completion_rate_pct, fund_utilization_pct, total_works, active_members",
     )
     print(f"  Fetched {len(states)} state rows")
     state_ranks = compute_state_ranks(states)
