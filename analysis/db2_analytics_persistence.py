@@ -397,6 +397,7 @@ def build_state_metrics(state_metrics_list, state_anomalies=None,
 
     # Build state member counts
     state_member_counts = {}
+    state_allocated = {}
     if member_metrics_list:
         for m in member_metrics_list:
             sid = m.state_id
@@ -407,16 +408,26 @@ def build_state_metrics(state_metrics_list, state_anomalies=None,
                 state_member_counts[sid]["mp"] += 1
             else:
                 state_member_counts[sid]["mla"] += 1
+            # APPENDED: aggregate allocated_amount per state from members
+            master = getattr(m, "_master_record", None)
+            alloc = 0.0
+            if master:
+                try:
+                    alloc = float(master.get("allocated_amount") or 0)
+                except (TypeError, ValueError):
+                    alloc = 0.0
+            state_allocated[sid] = state_allocated.get(sid, 0.0) + alloc
 
     records = []
     for s in state_metrics_list:
-        r = _state_to_record(s, anomaly_map, state_member_counts)
+        r = _state_to_record(s, anomaly_map, state_member_counts,
+                             state_allocated.get(s.state_id, 0.0))
         records.append(r)
 
     return records
 
 
-def _state_to_record(s, anomaly_map, state_member_counts):
+def _state_to_record(s, anomaly_map, state_member_counts, allocated_amount=0.0):
     """Convert a StateMetrics object to a DB2 record dict."""
     anomaly = anomaly_map.get(s.state_id)
     counts = state_member_counts.get(s.state_id, {})
@@ -443,7 +454,7 @@ def _state_to_record(s, anomaly_map, state_member_counts):
         "pending_works": s.total_works - s.completed_works - s.ongoing_works,
         "completion_rate_pct": s.completion_rate_pct,
         "sanction_rate_pct": s.sanction_rate_pct,
-        "allocated_amount": 0,
+        "allocated_amount": _safe_float(allocated_amount, 0),
         "recommended_amount": _safe_float(s.recommended_amount, 0),
         "sanctioned_amount": _safe_float(s.sanctioned_amount, 0),
         "expenditure_amount": _safe_float(s.expenditure_amount, 0),

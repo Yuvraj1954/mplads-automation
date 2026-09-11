@@ -443,6 +443,15 @@ def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
         if not m.state_name and m.state_id:
             m.state_name = state_name_map.get(m.state_id)
 
+    # APPENDED: attach authoritative master-population records (allocated_amount,
+    # state_name, house/tenure) to work-bearing members. The affected path skips
+    # zero-work injection, so without this allocation/identity would be 0/NULL.
+    try:
+        from analysis.zero_work_members import attach_master_records
+        attach_master_records(pipeline.member_metrics, snapshot_dir)
+    except Exception as _e:
+        print(f"  [warn] master record attach skipped: {_e}")
+
     # Filter work_analyses to affected works only
     affected_work_ids = affected_result.get("affected_work_ids", set())
     affected_work_analyses = [

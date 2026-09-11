@@ -231,6 +231,27 @@ def inject_zero_work_members(member_metrics, snapshot_dir,
     # Build existing member IDs set
     existing_ids = {(m.member_type, m.member_id) for m in member_metrics}
 
+    # ------------------------------------------------------------------
+    # APPENDED: Attach the authoritative master-population record to
+    # WORK-BEARING members too (matched by name). Previously only zero-work
+    # members carried `_master_record`, so `allocated_amount`, state_name and
+    # house/tenure context were 0/NULL for every member that actually had
+    # works. This makes allocation + identity available for all members.
+    # ------------------------------------------------------------------
+    master_by_name = {}
+    for record in master["all_records"]:
+        name = record.get("member_name")
+        if name and name not in master_by_name:
+            master_by_name[name] = record
+    for m in member_metrics:
+        rec = master_by_name.get(getattr(m, "member_name", None))
+        if rec:
+            if getattr(m, "_master_record", None) is None:
+                m._master_record = rec
+            if not getattr(m, "state_name", None):
+                m.state_name = rec.get("state_name")
+    # ------------------------------------------------------------------
+
     # Build member name → ID mapping for zero-work members
     # Use existing IDs where members match by name
     name_to_id = {}
@@ -346,6 +367,40 @@ def inject_zero_work_members(member_metrics, snapshot_dir,
     print(f"  Total members after injection: {len(all_members)}")
 
     return all_members
+
+
+def attach_master_records(member_metrics, snapshot_dir, verbose=True):
+    """Attach the authoritative master-population record to members matched by
+    name — provides allocated_amount + identity context (state_name, house,
+    tenure) for WORK-BEARING members. Does NOT inject new members.
+
+    This is the additive companion to inject_zero_work_members for the
+    affected-only pipeline path, where zero-work injection is skipped but
+    allocation/identity context is still required for accurate metrics.
+    """
+    master = discover_master_population(snapshot_dir)
+    if not master["all_records"]:
+        return member_metrics
+
+    by_name = {}
+    for r in master["all_records"]:
+        name = r.get("member_name")
+        if name and name not in by_name:
+            by_name[name] = r
+
+    attached = 0
+    for m in member_metrics:
+        rec = by_name.get(getattr(m, "member_name", None))
+        if rec:
+            if getattr(m, "_master_record", None) is None:
+                m._master_record = rec
+                attached += 1
+            if not getattr(m, "state_name", None):
+                m.state_name = rec.get("state_name")
+
+    if verbose:
+        print(f"  Master records attached to {attached} work-bearing members")
+    return member_metrics
 
 
 def get_master_population_context(member_metrics):
