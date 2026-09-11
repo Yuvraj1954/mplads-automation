@@ -992,6 +992,7 @@ def main():
     print("=== STEP 9: CLEANUP ===")
     t_cleanup = _timer()
     delete_delta_run(run_id)
+    delete_old_raw_snapshots([new_ts])
 
     _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
     _cleanup_local_snapshot(local_snapshot_path)

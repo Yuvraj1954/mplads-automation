@@ -40,7 +40,8 @@ def expand_affected_works(delta_work_ids, works_by_id,
     return affected, affected_members
 
 
-def expand_time_sensitive(works_by_id, existing_analyses, reference_date):
+def expand_time_sensitive(works_by_id, existing_analyses, reference_date,
+                         affected_members=None):
     """Identify works whose status may change soon or need fresh analysis.
 
     Uses canonical date fields from raw work records (which lack a 'status'
@@ -48,10 +49,18 @@ def expand_time_sensitive(works_by_id, existing_analyses, reference_date):
       - IN_PROGRESS: has sanction_date but no completion_date
       - RECOMMENDED: has recommendation_date but no sanction/completion
       - COMPLETED: has completion_date (still time-sensitive if recent)
+
+    When affected_members is provided, only works belonging to those members
+    are considered. This prevents unrelated members from being pulled in.
     """
     time_sensitive = set()
 
     for wid, w in works_by_id.items():
+        if affected_members is not None:
+            member_key = (w.get("member_type"), w.get("member_id"))
+            if member_key not in affected_members:
+                continue
+
         sanction_date = w.get("sanction_date")
         completion_date = w.get("completion_date")
         recommendation_date = w.get("recommendation_date")
