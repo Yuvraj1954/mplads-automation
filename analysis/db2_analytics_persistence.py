@@ -397,6 +397,8 @@ def _member_to_record(m, anomaly_map, master_ctx):
         "ranking_qualified": m.ranking_qualified,
         "performance_classification": perf_class,
         "rank": rank,
+        "scale_score": None,
+        "performance_score_weighted": None,
         "calculated_at": _now_iso(),
     }
 
@@ -675,28 +677,84 @@ def deduplicate_trends(trend_records):
 # ============================================================
 
 def compute_member_ranks(member_records):
-    """Compute performance rank for each member.
+    """Compute member rank using a transparent weighted formula.
 
-    Ranking only applies to ranking_qualified members.
-    Rank 1 = best performer (highest completion_rate_pct + fund_utilization_pct).
+    Performance Score (drives rank):
+        performance_score_weighted =
+              0.40 * completion_rate_pct
+            + 0.40 * fund_utilization_pct
+            + 0.20 * scale_score
 
-    Modifies records in-place, setting the 'rank' field.
+    scale_score is the percentile rank (0–100) of total_works across all
+    ranking_qualified members, computed as:
+        scale_score = (count_below + 0.5 * count_equal) / n * 100
+    (midrank — standard convention for handling ties).
+
+    Ranking only applies to ranking_qualified members (set by
+    phase_a_member.py from total_works and active_members criteria).
+    Non-qualified members receive rank=NULL.
+
+    Raw metrics (completion_rate_pct, fund_utilization_pct, total_works,
+    performance_score) are NEVER overwritten. New fields
+    `scale_score` and `performance_score_weighted` are written alongside
+    them so the ranking is fully explainable.
+
+    Tie-handling: standard competition ranking — tied members receive
+    the same rank; the next rank skips (1, 2, 2, 4). Deterministic via
+    stable secondary sort on (member_id, member_type).
     """
-    def _perf_score(r):
-        comp = r.get("completion_rate_pct") or 0
-        util = r.get("fund_utilization_pct") or 0
-        return float(comp) + float(util)
-
     qualified = [r for r in member_records if r.get("ranking_qualified")]
-    unqualified = [r for r in member_records if not r.get("ranking_qualified")]
+    non_qualified = [r for r in member_records if not r.get("ranking_qualified")]
 
-    qualified.sort(key=lambda r: -_perf_score(r))
+    if not qualified:
+        for r in member_records:
+            r["rank"] = None
+            r["scale_score"] = None
+            r["performance_score_weighted"] = None
+        return member_records
 
-    for i, r in enumerate(qualified, 1):
-        r["rank"] = i
+    # --- Percentile rank of total_works across qualified members ---
+    n_q = len(qualified)
+    tw_sorted = sorted(_safe_int(r.get("total_works")) for r in qualified)
+    for r in qualified:
+        tw = _safe_int(r.get("total_works"))
+        below = sum(1 for v in tw_sorted if v < tw)
+        at = sum(1 for v in tw_sorted if v == tw)
+        r["scale_score"] = round((below + 0.5 * at) / n_q * 100.0, 2)
 
-    for r in unqualified:
+    # --- Weighted performance score (40 / 40 / 20) ---
+    for r in qualified:
+        comp = _safe_float(r.get("completion_rate_pct"), 0.0) or 0.0
+        util = _safe_float(r.get("fund_utilization_pct"), 0.0) or 0.0
+        scale = r.get("scale_score") or 0.0
+        r["performance_score_weighted"] = round(
+            comp * 0.40 + util * 0.40 + scale * 0.20, 2
+        )
+
+    # --- Rank by performance_score_weighted, descending (competition ranking) ---
+    sorted_q = sorted(
+        qualified,
+        key=lambda r: (
+            -(r.get("performance_score_weighted") or 0),
+            r.get("member_type") or "",
+            r.get("member_id") or 0,
+        ),
+    )
+    last_score = None
+    last_rank = 0
+    for i, r in enumerate(sorted_q, 1):
+        score = r.get("performance_score_weighted")
+        if last_score is not None and score == last_score:
+            r["rank"] = last_rank  # tie
+        else:
+            r["rank"] = i
+            last_rank = i
+            last_score = score
+
+    for r in non_qualified:
         r["rank"] = None
+        r["scale_score"] = None
+        r["performance_score_weighted"] = None
 
     return member_records
 

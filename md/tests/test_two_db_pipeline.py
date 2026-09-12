@@ -1494,16 +1494,146 @@ class TestDB2AnalyticsPersistence:
         assert stats["duplicates_found"] == 0
 
     def test_compute_member_ranks(self):
+        """Weighted 40/40/20 ranking. ranking_qualified=True is required."""
         from analysis.db2_analytics_persistence import compute_member_ranks
         records = [
-            {"member_id": 1, "ranking_qualified": True, "anomaly_score": 1.5},
-            {"member_id": 2, "ranking_qualified": True, "anomaly_score": 2.5},
-            {"member_id": 3, "ranking_qualified": False, "anomaly_score": None},
+            # Strong performance, mid scale → top rank
+            {"member_id": 1, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 80.0, "fund_utilization_pct": 80.0,
+             "total_works": 100},
+            # Mediocre performance, large scale → mid rank
+            {"member_id": 2, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 30.0, "fund_utilization_pct": 40.0,
+             "total_works": 1000},
+            # Strong performance, tiny scale
+            {"member_id": 3, "member_type": "MLA", "ranking_qualified": True,
+             "completion_rate_pct": 70.0, "fund_utilization_pct": 70.0,
+             "total_works": 5},
+            # Not qualified
+            {"member_id": 4, "member_type": "MLA", "ranking_qualified": False,
+             "completion_rate_pct": 99.0, "fund_utilization_pct": 99.0,
+             "total_works": 200},
         ]
         compute_member_ranks(records)
-        assert records[0]["rank"] == 2  # score 1.5
-        assert records[1]["rank"] == 1  # score 2.5
-        assert records[2]["rank"] is None
+        ranks = {r["member_id"]: r["rank"] for r in records}
+        # Non-qualified gets rank=NULL
+        assert ranks[4] is None
+        # Qualified members all get ranks
+        for mid in (1, 2, 3):
+            assert ranks[mid] is not None
+        # New fields present for qualified members
+        for r in records:
+            if r["ranking_qualified"]:
+                assert r["scale_score"] is not None
+                assert r["performance_score_weighted"] is not None
+                # Raw fields preserved
+                assert r["completion_rate_pct"] in (80.0, 30.0, 70.0)
+                assert r["fund_utilization_pct"] in (80.0, 40.0, 70.0)
+                assert r["total_works"] in (100, 1000, 5)
+
+    def test_compute_member_ranks_formula_is_40_40_20(self):
+        from analysis.db2_analytics_persistence import compute_member_ranks
+        records = [
+            {"member_id": 1, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 50.0, "fund_utilization_pct": 64.0,
+             "total_works": 50},
+        ]
+        compute_member_ranks(records)
+        # In 1-member pop: scale percentile = (0 + 0.5*1)/1*100 = 50
+        expected = 50.0 * 0.40 + 64.0 * 0.40 + 50.0 * 0.20
+        r = records[0]
+        assert abs(r["performance_score_weighted"] - expected) < 0.01
+
+    def test_compute_member_ranks_spec_example(self):
+        """Worked example from the spec applied to members."""
+        from analysis.db2_analytics_persistence import compute_member_ranks
+        # 10 qualified members with total_works 10,20,...,100
+        records = [
+            {"member_id": i + 1, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 50.0, "fund_utilization_pct": 64.0,
+             "total_works": (i + 1) * 10}
+            for i in range(10)
+        ]
+        compute_member_ranks(records)
+        # Member with tw=90 in a sorted 10-member pop:
+        # below=8, at=1 → percentile = (8 + 0.5)/10*100 = 85
+        target = next(r for r in records if r["total_works"] == 90)
+        assert abs(target["scale_score"] - 85.0) < 0.01
+        # score = 50*0.4 + 64*0.4 + 85*0.2 = 20 + 25.6 + 17 = 62.6
+        expected = 50 * 0.40 + 64 * 0.40 + 85 * 0.20
+        assert abs(target["performance_score_weighted"] - expected) < 0.01
+
+    def test_compute_member_ranks_scale_does_not_dominate(self):
+        """A small high-perf member must outrank a large low-perf member."""
+        from analysis.db2_analytics_persistence import compute_member_ranks
+        big = {"member_id": 1, "member_type": "MP", "ranking_qualified": True,
+               "completion_rate_pct": 5.0, "fund_utilization_pct": 5.0,
+               "total_works": 10000}
+        small = {"member_id": 2, "member_type": "MP", "ranking_qualified": True,
+                 "completion_rate_pct": 80.0, "fund_utilization_pct": 80.0,
+                 "total_works": 10}
+        filler = [
+            {"member_id": i, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 30.0, "fund_utilization_pct": 30.0,
+             "total_works": 100 * i}
+            for i in range(3, 8)
+        ]
+        records = [big, small] + filler
+        compute_member_ranks(records)
+        ranks = {r["member_id"]: r["rank"] for r in records}
+        assert ranks[2] < ranks[1]
+
+    def test_compute_member_ranks_non_qualified_excluded(self):
+        from analysis.db2_analytics_persistence import compute_member_ranks
+        records = [
+            {"member_id": 1, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 50.0, "fund_utilization_pct": 50.0,
+             "total_works": 100},
+            {"member_id": 2, "member_type": "MP", "ranking_qualified": False,
+             "completion_rate_pct": 99.0, "fund_utilization_pct": 99.0,
+             "total_works": 200},
+        ]
+        compute_member_ranks(records)
+        assert records[0]["rank"] == 1
+        assert records[1]["rank"] is None
+        assert records[1]["scale_score"] is None
+        assert records[1]["performance_score_weighted"] is None
+
+    def test_compute_member_ranks_deterministic(self):
+        from analysis.db2_analytics_persistence import compute_member_ranks
+        records_a = [
+            {"member_id": i, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 50.0, "fund_utilization_pct": 60.0 + i,
+             "total_works": 100 * i}
+            for i in range(1, 6)
+        ]
+        records_b = [dict(r) for r in records_a]
+        compute_member_ranks(records_a)
+        compute_member_ranks(records_b)
+        ranks_a = {r["member_id"]: r["rank"] for r in records_a}
+        ranks_b = {r["member_id"]: r["rank"] for r in records_b}
+        assert ranks_a == ranks_b
+
+    def test_compute_member_ranks_ties(self):
+        """Two members with identical inputs get the same rank; next rank
+        skips (competition ranking)."""
+        from analysis.db2_analytics_persistence import compute_member_ranks
+        records = [
+            {"member_id": 1, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 50.0, "fund_utilization_pct": 50.0,
+             "total_works": 100},
+            {"member_id": 2, "member_type": "MLA", "ranking_qualified": True,
+             "completion_rate_pct": 50.0, "fund_utilization_pct": 50.0,
+             "total_works": 100},
+            {"member_id": 3, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 30.0, "fund_utilization_pct": 30.0,
+             "total_works": 50},
+        ]
+        compute_member_ranks(records)
+        ranks = {r["member_id"]: r["rank"] for r in records}
+        assert ranks[1] == 1
+        assert ranks[2] == 1
+        assert ranks[3] == 3
 
     def test_compute_state_ranks(self):
         """Weighted 40/40/20 ranking. All qualifying states get a rank."""
