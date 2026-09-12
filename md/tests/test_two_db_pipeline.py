@@ -1508,14 +1508,21 @@ class TestDB2AnalyticsPersistence:
     def test_compute_state_ranks(self):
         from analysis.db2_analytics_persistence import compute_state_ranks
         records = [
-            {"state_id": 1, "anomaly_score": 1.0},
-            {"state_id": 2, "anomaly_score": 2.0},
-            {"state_id": 3, "anomaly_score": None},
+            {"state_id": 1, "total_works": 100, "active_members": 5,
+             "completion_rate_pct": 40.0, "fund_utilization_pct": 60.0},
+            {"state_id": 2, "total_works": 200, "active_members": 10,
+             "completion_rate_pct": 50.0, "fund_utilization_pct": 70.0},
+            {"state_id": 3, "total_works": 5, "active_members": 5,
+             "completion_rate_pct": 90.0, "fund_utilization_pct": 90.0},
+            {"state_id": 4, "total_works": 100, "active_members": 1,
+             "completion_rate_pct": 90.0, "fund_utilization_pct": 90.0},
         ]
         compute_state_ranks(records)
-        assert records[0]["rank"] == 2
-        assert records[1]["rank"] == 1
-        assert records[2]["rank"] is None
+        ranks = {r["state_id"]: r["rank"] for r in records}
+        assert ranks[2] == 1
+        assert ranks[1] == 2
+        assert ranks[3] is None
+        assert ranks[4] is None
 
     def test_analytics_persist_stage_callable(self):
         from automation.pipeline_controller import stage_analytics_persist

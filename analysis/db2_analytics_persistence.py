@@ -651,14 +651,25 @@ def compute_state_ranks(state_records):
     """Compute performance rank for each state.
 
     Rank 1 = best performer (highest completion_rate_pct + fund_utilization_pct).
+
+    `ranking_qualified` is NOT persisted in the state_metrics table, so we
+    recompute it here from the same rule used in phase_a_state.py:
+        ranking_qualified = total_works >= 10 and active_members >= 2
+    Mirrors the logic in automation/backfill_ranks.py.
     """
+    def _is_qualified(r):
+        return (
+            (r.get("total_works") or 0) >= 10
+            and (r.get("active_members") or 0) >= 2
+        )
+
     def _perf_score(r):
         comp = r.get("completion_rate_pct") or 0
         util = r.get("fund_utilization_pct") or 0
         return float(comp) + float(util)
 
-    qualified = [r for r in state_records if r.get("ranking_qualified")]
-    unqualified = [r for r in state_records if not r.get("ranking_qualified")]
+    qualified = [r for r in state_records if _is_qualified(r)]
+    unqualified = [r for r in state_records if not _is_qualified(r)]
 
     qualified.sort(key=lambda r: -_perf_score(r))
 
