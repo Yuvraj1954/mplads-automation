@@ -1635,6 +1635,70 @@ class TestDB2AnalyticsPersistence:
         assert ranks[2] == 1
         assert ranks[3] == 3
 
+    def test_classify_member_performance_no_unclassified(self):
+        """Every member must fall into one of the 6 real buckets.
+        UNCLASSIFIED is not a valid value."""
+        from analysis.db2_analytics_persistence import _classify_member_performance
+
+        class M:
+            def __init__(self, comp=0, util=0, total=0, zero=False, low=False):
+                self.completion_rate_pct = comp
+                self.expenditure_sanction_utilization_pct = util
+                self.total_works = total
+                self.zero_work_member = zero
+                self.low_sample_member = low
+
+        valid = {"PERFORMER", "AVERAGE", "NEEDS_ATTENTION",
+                 "UNDERPERFORMER", "NO_DATA", "INSUFFICIENT_DATA"}
+
+        # Rahul Gandhi-like member (low comp/util but not zero/low-sample)
+        cls = _classify_member_performance(M(comp=38.54, util=36.06, total=192), None)
+        assert cls == "UNDERPERFORMER"
+        assert cls in valid
+
+        # Zero works → NO_DATA
+        cls = _classify_member_performance(M(total=0), None)
+        assert cls == "NO_DATA"
+
+        # Low sample → INSUFFICIENT_DATA
+        cls = _classify_member_performance(M(total=3, comp=80, util=80), None)
+        assert cls == "INSUFFICIENT_DATA"
+
+        # Sweep across all (comp, util) pairs and assert every result is valid
+        for comp in (0, 30, 40, 60, 80, 100):
+            for util in (0, 30, 40, 60, 80, 100):
+                cls = _classify_member_performance(
+                    M(comp=comp, util=util, total=100), None,
+                )
+                assert cls in valid, f"got {cls!r} for comp={comp} util={util}"
+                assert cls != "UNCLASSIFIED"
+
+    def test_classify_state_performance_no_unclassified(self):
+        from analysis.db2_analytics_persistence import _classify_state_performance
+
+        class S:
+            def __init__(self, comp=0, util=0, rq=True):
+                self.completion_rate_pct = comp
+                self.expenditure_utilization_pct = util
+                self.ranking_qualified = rq
+
+        valid = {"PERFORMER", "AVERAGE", "NEEDS_ATTENTION",
+                 "UNDERPERFORMER", "INSUFFICIENT_DATA"}
+
+        # Maharashtra-like state (low comp, low util, qualified)
+        cls = _classify_state_performance(S(comp=19.85, util=33.99), None)
+        assert cls in valid
+        assert cls == "UNDERPERFORMER"
+
+        # Sweep
+        for comp in (0, 30, 40, 60, 80, 100):
+            for util in (0, 30, 40, 60, 80, 100):
+                cls = _classify_state_performance(
+                    S(comp=comp, util=util, rq=True), None,
+                )
+                assert cls in valid, f"got {cls!r} for comp={comp} util={util}"
+                assert cls != "UNCLASSIFIED"
+
     def test_compute_state_ranks(self):
         """Weighted 40/40/20 ranking. All qualifying states get a rank."""
         from analysis.db2_analytics_persistence import compute_state_ranks

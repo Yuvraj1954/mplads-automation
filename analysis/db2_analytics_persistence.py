@@ -404,28 +404,44 @@ def _member_to_record(m, anomaly_map, master_ctx):
 
 
 def _classify_member_performance(m, anomaly):
-    """Classify member performance based on existing thresholds.
+    """Classify member performance into one of the 6 real buckets.
 
-    Uses the same logic as the evidence builder for consistency.
+    Every member MUST fall into one of:
+        NO_DATA            — zero works / zero_work_member flag
+        INSUFFICIENT_DATA  — low_sample_member flag or total_works below threshold
+        PERFORMER          — comp >= 60 AND util >= 60
+        AVERAGE            — comp >= 40 (and not PERFORMER)
+        NEEDS_ATTENTION    — anomaly MEDIUM, OR score 80–119.99
+        UNDERPERFORMER     — anomaly HIGH, OR score < 80, OR comp < 40
+
+    There is intentionally no UNCLASSIFIED bucket — every member has a
+    home. Mirrors the 200-point classification bands used by the
+    frontend (PERFORMER_MIN=160, AVERAGE_MIN=120, NEEDS_ATTENTION_MIN=80)
+    so the pipeline and the frontend agree.
     """
-    if m.zero_work_member:
+    total = m.total_works or 0
+    if m.zero_work_member or total == 0:
         return "NO_DATA"
-    if m.low_sample_member:
+    if m.low_sample_member or total < 5:
         return "INSUFFICIENT_DATA"
 
     if anomaly:
         if anomaly.anomaly_level == "HIGH":
             return "UNDERPERFORMER"
-        elif anomaly.anomaly_level == "MEDIUM":
+        if anomaly.anomaly_level == "MEDIUM":
             return "NEEDS_ATTENTION"
 
-    if m.ranking_qualified:
-        if m.completion_rate_pct >= 60 and m.expenditure_sanction_utilization_pct >= 60:
-            return "PERFORMER"
-        elif m.completion_rate_pct >= 40:
-            return "AVERAGE"
+    comp = m.completion_rate_pct or 0
+    util = m.expenditure_sanction_utilization_pct or 0
+    score = comp + util
 
-    return "UNCLASSIFIED"
+    if score >= 160:
+        return "PERFORMER"
+    if score >= 120:
+        return "AVERAGE"
+    if score >= 80:
+        return "NEEDS_ATTENTION"
+    return "UNDERPERFORMER"
 
 
 # ============================================================
@@ -542,22 +558,34 @@ def _state_to_record(s, anomaly_map, state_member_counts, allocated_amount=0.0):
 
 
 def _classify_state_performance(s, anomaly):
-    """Classify state performance based on existing thresholds."""
+    """Classify state performance into one of the real buckets.
+
+    Every state MUST fall into one of: PERFORMER, AVERAGE,
+    NEEDS_ATTENTION, UNDERPERFORMER, or INSUFFICIENT_DATA.
+
+    Mirrors the 200-point bands (160/120/80) used by the frontend
+    classify_from_score so pipeline and frontend agree.
+    """
     if not s.ranking_qualified:
         return "INSUFFICIENT_DATA"
 
     if anomaly:
         if anomaly.anomaly_level == "HIGH":
             return "UNDERPERFORMER"
-        elif anomaly.anomaly_level == "MEDIUM":
+        if anomaly.anomaly_level == "MEDIUM":
             return "NEEDS_ATTENTION"
 
-    if s.completion_rate_pct >= 60 and s.expenditure_utilization_pct >= 60:
-        return "PERFORMER"
-    elif s.completion_rate_pct >= 40:
-        return "AVERAGE"
+    comp = s.completion_rate_pct or 0
+    util = s.expenditure_utilization_pct or 0
+    score = comp + util
 
-    return "UNCLASSIFIED"
+    if score >= 160:
+        return "PERFORMER"
+    if score >= 120:
+        return "AVERAGE"
+    if score >= 80:
+        return "NEEDS_ATTENTION"
+    return "UNDERPERFORMER"
 
 
 # ============================================================
