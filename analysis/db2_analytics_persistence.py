@@ -648,22 +648,38 @@ def compute_member_ranks(member_records):
 
 
 def compute_state_ranks(state_records):
-    """Compute performance rank for each state.
+    """Compute performance rank for each state using Bayesian shrinkage.
 
-    Rank 1 = best performer (highest completion_rate_pct + fund_utilization_pct).
+    Raw score (completion + utilization) is biased toward small states —
+    a 2-member state with 136 works naturally has higher completion% and
+    utilization% than a 51-member state with 7,669 works.
 
-    `ranking_qualified` is NOT persisted in the state_metrics table, so we
-    recompute it here from the same rule used in phase_a_state.py:
-        ranking_qualified = total_works >= 10 and active_members >= 2
-    Mirrors the logic in automation/backfill_ranks.py.
+    Bayesian shrinkage pulls small-sample states toward the national average:
+        effective_score = (state_score * am + national_avg * K) / (am + K)
+    with K = 5.
+
+    Effect on rank ordering (K=5, assuming national_avg ≈ 88):
+        am=2   →  ~71% weight on national_avg, 29% on raw score
+        am=10  →  ~33% weight on national_avg, 67% on raw score
+        am=20  →  ~20% weight on national_avg, 80% on raw score
+        am=50+ →  ~9% weight on national_avg (nearly unaffected)
+
+    Larger states (Bihar, UP, Maharashtra, MP) move up; tiny NE states drop.
+    All qualifying states still receive a rank — no exclusions.
+
+    `ranking_qualified` is NOT persisted in state_metrics, so we recompute
+    it here from total_works >= 10 and active_members >= 2 (same rule as
+    phase_a_state.py / backfill_ranks.py).
     """
+    K = 5  # prior weight on the national average
+
     def _is_qualified(r):
         return (
             (r.get("total_works") or 0) >= 10
             and (r.get("active_members") or 0) >= 2
         )
 
-    def _perf_score(r):
+    def _raw_score(r):
         comp = r.get("completion_rate_pct") or 0
         util = r.get("fund_utilization_pct") or 0
         return float(comp) + float(util)
@@ -671,7 +687,17 @@ def compute_state_ranks(state_records):
     qualified = [r for r in state_records if _is_qualified(r)]
     unqualified = [r for r in state_records if not _is_qualified(r)]
 
-    qualified.sort(key=lambda r: -_perf_score(r))
+    if qualified:
+        national_avg = sum(_raw_score(r) for r in qualified) / len(qualified)
+    else:
+        national_avg = 0
+
+    def _effective_score(r):
+        score = _raw_score(r)
+        am = r.get("active_members") or 0
+        return (score * am + national_avg * K) / (am + K)
+
+    qualified.sort(key=lambda r: -_effective_score(r))
 
     for i, r in enumerate(qualified, 1):
         r["rank"] = i

@@ -78,12 +78,29 @@ def compute_state_ranks(records):
     state_metrics does not persist `ranking_qualified`, so we recompute it
     here from the same rule used in analysis/phase_a_state.py:
         ranking_qualified = total_works >= 10 and active_members >= 2
+
+    Uses Bayesian shrinkage to remove the small-sample bias that
+    favors tiny states (Nagaland, Mizoram, etc.) over large ones
+    (Bihar, UP, Maharashtra):
+        effective = (raw * am + national_avg * K) / (am + K)
     """
+    K = 5  # prior weight (must match db2_analytics_persistence.compute_state_ranks)
+
     qualified = [
         r for r in records
         if (r.get("total_works") or 0) >= 10 and (r.get("active_members") or 0) >= 2
     ]
-    qualified.sort(key=lambda r: -perf_score(r))
+    if qualified:
+        national_avg = sum(perf_score(r) for r in qualified) / len(qualified)
+    else:
+        national_avg = 0
+
+    def _effective(r):
+        score = perf_score(r)
+        am = r.get("active_members") or 0
+        return (score * am + national_avg * K) / (am + K)
+
+    qualified.sort(key=lambda r: -_effective(r))
     ranks = {}
     for i, r in enumerate(qualified, 1):
         ranks[r.get("state_id")] = i

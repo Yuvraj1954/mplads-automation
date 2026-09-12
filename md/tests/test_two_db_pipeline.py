@@ -1524,6 +1524,32 @@ class TestDB2AnalyticsPersistence:
         assert ranks[3] is None
         assert ranks[4] is None
 
+    def test_compute_state_ranks_bayesian_shrinkage(self):
+        """Tiny states with only slightly-better raw scores should be outranked
+        by much larger states. Shrinkage prevents low-scale states from
+        dominating purely by being small."""
+        from analysis.db2_analytics_persistence import compute_state_ranks
+        # Tiny state (am=2) and big state (am=50) with similar raw scores.
+        # Without shrinkage, the tiny state wins because small samples produce
+        # higher percentages. With shrinkage, the big state should win because
+        # its larger sample is more trustworthy.
+        tiny = {"state_id": 1, "total_works": 100, "active_members": 2,
+                "completion_rate_pct": 55.0, "fund_utilization_pct": 60.0}
+        big = {"state_id": 2, "total_works": 5000, "active_members": 50,
+               "completion_rate_pct": 50.0, "fund_utilization_pct": 58.0}
+        # Filler states to give a realistic national average
+        filler = [
+            {"state_id": i, "total_works": 2000, "active_members": 20,
+             "completion_rate_pct": 30.0, "fund_utilization_pct": 50.0}
+            for i in range(3, 10)
+        ]
+        records = [tiny, big] + filler
+        compute_state_ranks(records)
+        ranks = {r["state_id"]: r["rank"] for r in records}
+        assert ranks[2] < ranks[1], (
+            "big state must outrank tiny state when raw scores are similar"
+        )
+
     def test_analytics_persist_stage_callable(self):
         from automation.pipeline_controller import stage_analytics_persist
         import inspect
