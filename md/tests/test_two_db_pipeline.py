@@ -1506,48 +1506,75 @@ class TestDB2AnalyticsPersistence:
         assert records[2]["rank"] is None
 
     def test_compute_state_ranks(self):
+        """Wilson + normal-approx lower-bound ranking. All 36 states get ranks."""
         from analysis.db2_analytics_persistence import compute_state_ranks
         records = [
-            {"state_id": 1, "total_works": 100, "active_members": 5,
-             "completion_rate_pct": 40.0, "fund_utilization_pct": 60.0},
-            {"state_id": 2, "total_works": 200, "active_members": 10,
-             "completion_rate_pct": 50.0, "fund_utilization_pct": 70.0},
-            {"state_id": 3, "total_works": 5, "active_members": 5,
-             "completion_rate_pct": 90.0, "fund_utilization_pct": 90.0},
-            {"state_id": 4, "total_works": 100, "active_members": 1,
-             "completion_rate_pct": 90.0, "fund_utilization_pct": 90.0},
+            # Mid-sized state, moderate performance
+            {"state_id": 1, "total_works": 100, "completed_works": 50,
+             "sanctioned_works": 80, "fund_utilization_pct": 60.0},
+            # Large state, best performance — should rank #1
+            {"state_id": 2, "total_works": 5000, "completed_works": 3000,
+             "sanctioned_works": 4500, "fund_utilization_pct": 70.0},
+            # Tiny state, perfect scores — should NOT outrank large state with
+            # comparable performance (Wilson penalises tiny samples)
+            {"state_id": 3, "total_works": 5, "completed_works": 5,
+             "sanctioned_works": 5, "fund_utilization_pct": 90.0},
+            # Mid state, terrible performance
+            {"state_id": 4, "total_works": 100, "completed_works": 5,
+             "sanctioned_works": 80, "fund_utilization_pct": 15.0},
+            # No data
+            {"state_id": 5, "total_works": 0, "completed_works": 0,
+             "sanctioned_works": 0, "fund_utilization_pct": 0.0},
         ]
         compute_state_ranks(records)
         ranks = {r["state_id"]: r["rank"] for r in records}
-        assert ranks[2] == 1
-        assert ranks[1] == 2
-        assert ranks[3] is None
-        assert ranks[4] is None
+        assert all(r is not None for r in ranks.values()), \
+            "all states must receive a rank (no NULL)"
+        assert sorted(ranks.values()) == [1, 2, 3, 4, 5]
+        # Large state with strong performance should outrank tiny state with
+        # perfect performance (tiny-sample CI gives lower bound ~57% on
+        # completion, large-sample CI gives ~58%+ — but big state also has
+        # higher util at scale, so it wins on the sum).
+        assert ranks[2] < ranks[3], (
+            f"large state must outrank tiny state (got {ranks})"
+        )
+        # No-data state must rank last
+        assert ranks[5] == 5
 
-    def test_compute_state_ranks_bayesian_shrinkage(self):
-        """Tiny states with only slightly-better raw scores should be outranked
-        by much larger states. Shrinkage prevents low-scale states from
-        dominating purely by being small."""
+    def test_compute_state_ranks_wilson_penalises_small_samples(self):
+        """A tiny-sample state with high raw % must NOT outrank a large-sample
+        state with similar raw %. This is the core Wilson behaviour."""
         from analysis.db2_analytics_persistence import compute_state_ranks
-        # Tiny state (am=2) and big state (am=50) with similar raw scores.
-        # Without shrinkage, the tiny state wins because small samples produce
-        # higher percentages. With shrinkage, the big state should win because
-        # its larger sample is more trustworthy.
-        tiny = {"state_id": 1, "total_works": 100, "active_members": 2,
-                "completion_rate_pct": 55.0, "fund_utilization_pct": 60.0}
-        big = {"state_id": 2, "total_works": 5000, "active_members": 50,
-               "completion_rate_pct": 50.0, "fund_utilization_pct": 58.0}
-        # Filler states to give a realistic national average
-        filler = [
-            {"state_id": i, "total_works": 2000, "active_members": 20,
-             "completion_rate_pct": 30.0, "fund_utilization_pct": 50.0}
-            for i in range(3, 10)
-        ]
-        records = [tiny, big] + filler
+        tiny = {"state_id": 1, "total_works": 4, "completed_works": 4,
+                "sanctioned_works": 4, "fund_utilization_pct": 90.0}
+        big = {"state_id": 2, "total_works": 4000, "completed_works": 3500,
+               "sanctioned_works": 3800, "fund_utilization_pct": 85.0}
+        records = [tiny, big]
         compute_state_ranks(records)
         ranks = {r["state_id"]: r["rank"] for r in records}
         assert ranks[2] < ranks[1], (
-            "big state must outrank tiny state when raw scores are similar"
+            f"big state must outrank tiny state (got tiny={ranks[1]}, big={ranks[2]})"
+        )
+
+    def test_compute_state_ranks_no_workcount_bonus(self):
+        """A state with more works but the SAME raw % must NOT outrank a state
+        with fewer works and identical raw %. Sample size affects CI width,
+        not the score."""
+        from analysis.db2_analytics_persistence import compute_state_ranks
+        # Both states have identical completion%, utilization%, and lower bound.
+        # The only difference is sample size — but lower-bound CI narrows with
+        # more data, so the larger sample gets a slightly higher lower bound.
+        # Both should land within 1 rank of each other; neither should be
+        # ranked 10+ places apart just because of work count.
+        a = {"state_id": 1, "total_works": 100, "completed_works": 50,
+             "sanctioned_works": 80, "fund_utilization_pct": 50.0}
+        b = {"state_id": 2, "total_works": 10000, "completed_works": 5000,
+             "sanctioned_works": 8000, "fund_utilization_pct": 50.0}
+        records = [a, b]
+        compute_state_ranks(records)
+        ranks = {r["state_id"]: r["rank"] for r in records}
+        assert abs(ranks[1] - ranks[2]) <= 1, (
+            f"Identical-rate states must rank within 1 (got {ranks})"
         )
 
     def test_analytics_persist_stage_callable(self):

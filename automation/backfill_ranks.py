@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """Backfill `rank` column in DB2 member_metrics and state_metrics.
 
-Ranks are computed based on PERFORMANCE (completion_rate_pct + fund_utilization_pct):
-  Rank 1 = best performer (highest score)
-
-Only ranking_qualified records receive a rank; others are set to NULL.
-
-The previous pipeline implementation ranked by anomaly_score, which produced
-inverted rankings (rank 1 = most anomalous = worst performer). This script
-recomputes all existing ranks using the correct performance-based metric.
+Member ranks: raw completion% + utilization% (only ranking_qualified members).
+State ranks: statistical lower-bound CI on completion% + utilization%
+  (Wilson score for completion, normal-approx for utilization).
+  Sample size is accounted for via the math itself — no hard-coded
+  size thresholds, no work-count bonuses. Workload/scale is shown
+  separately on the frontend.
 
 Usage:
     python automation/backfill_ranks.py
 """
 
+import math
 import os
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +33,9 @@ if not DB2_URL or not DB2_KEY:
     sys.exit(1)
 
 BATCH = 1000
+
+# z = 1.96 → 95% confidence
+_Z_95 = 1.96
 
 
 def fetch_all(client, table: str, columns: str = "*"):
@@ -61,8 +62,30 @@ def perf_score(row):
         return 0.0
 
 
+def wilson_lower_bound(successes, total, z=_Z_95):
+    """Lower bound of the Wilson score interval for a binomial proportion."""
+    if total <= 0:
+        return 0.0
+    p = successes / total
+    denom = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denom
+    spread = z * math.sqrt(
+        p * (1 - p) / total + z * z / (4 * total * total)
+    ) / denom
+    return max(0.0, center - spread)
+
+
+def normal_lower_bound_pct(p_pct, n, z=_Z_95):
+    """Lower bound of normal-approx CI for a proportion (percent)."""
+    if n <= 0:
+        return 0.0
+    p = max(0.0, min(1.0, p_pct / 100.0))
+    se = math.sqrt(p * (1 - p) / n)
+    return max(0.0, p_pct - z * se * 100)
+
+
 def compute_ranks(records):
-    """Return dict of primary_key -> rank, where rank 1 = best performance."""
+    """Member ranks: raw completion + utilization, only for ranking_qualified."""
     qualified = [r for r in records if r.get("ranking_qualified")]
     qualified.sort(key=lambda r: -perf_score(r))
     ranks = {}
@@ -73,36 +96,28 @@ def compute_ranks(records):
 
 
 def compute_state_ranks(records):
-    """Return dict of state_id -> rank for state records.
+    """State ranks via statistical lower-bound CI (Wilson + normal approx).
 
-    state_metrics does not persist `ranking_qualified`, so we recompute it
-    here from the same rule used in analysis/phase_a_state.py:
-        ranking_qualified = total_works >= 10 and active_members >= 2
-
-    Uses Bayesian shrinkage to remove the small-sample bias that
-    favors tiny states (Nagaland, Mizoram, etc.) over large ones
-    (Bihar, UP, Maharashtra):
-        effective = (raw * am + national_avg * K) / (am + K)
+    Must mirror analysis/db2_analytics_persistence.compute_state_ranks:
+        rank_score = lower_bound_95CI(completion%) + lower_bound_95CI(utilization%)
+    Sample size is accounted for via the math itself. No hard-coded size
+    thresholds. No work-count bonus. Workload/scale stays separate.
     """
-    K = 5  # prior weight (must match db2_analytics_persistence.compute_state_ranks)
+    def _rank_score(r):
+        comp_lb = wilson_lower_bound(
+            int(r.get("completed_works") or 0),
+            int(r.get("total_works") or 0),
+        ) * 100.0
+        util_pct = float(r.get("fund_utilization_pct") or 0)
+        util_lb = normal_lower_bound_pct(
+            util_pct,
+            int(r.get("sanctioned_works") or 0),
+        )
+        return comp_lb + util_lb
 
-    qualified = [
-        r for r in records
-        if (r.get("total_works") or 0) >= 10 and (r.get("active_members") or 0) >= 2
-    ]
-    if qualified:
-        national_avg = sum(perf_score(r) for r in qualified) / len(qualified)
-    else:
-        national_avg = 0
-
-    def _effective(r):
-        score = perf_score(r)
-        am = r.get("active_members") or 0
-        return (score * am + national_avg * K) / (am + K)
-
-    qualified.sort(key=lambda r: -_effective(r))
+    sorted_records = sorted(records, key=_rank_score, reverse=True)
     ranks = {}
-    for i, r in enumerate(qualified, 1):
+    for i, r in enumerate(sorted_records, 1):
         ranks[r.get("state_id")] = i
     return ranks
 
@@ -169,11 +184,11 @@ def main():
     states = fetch_all(
         client,
         "state_metrics",
-        "state_id, completion_rate_pct, fund_utilization_pct, total_works, active_members",
+        "state_id, total_works, completed_works, sanctioned_works, fund_utilization_pct",
     )
     print(f"  Fetched {len(states)} state rows")
     state_ranks = compute_state_ranks(states)
-    print(f"  Computed {len(state_ranks)} state ranks (ranking_qualified=True)")
+    print(f"  Computed {len(state_ranks)} state ranks (all 36 states/UTs)")
 
     print("\n[4/4] Updating state_metrics.rank...")
     updated = update_ranks(

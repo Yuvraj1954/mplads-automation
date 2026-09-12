@@ -42,6 +42,55 @@ def _safe_int(val, default=0):
 
 
 # ============================================================
+# STATISTICAL HELPERS
+# ============================================================
+# Used by compute_state_ranks to produce a sample-size-adjusted
+# performance ranking. Sample size is accounted for through the math
+# itself (CI width scales with 1/sqrt(n)) — no hard-coded thresholds,
+# no work-count bonuses.
+
+import math as _math
+
+# z = 1.96 → 95% confidence
+_Z_95 = 1.96
+
+
+def _wilson_lower_bound(successes, total, z=_Z_95):
+    """Lower bound of the Wilson score interval for a binomial proportion.
+
+    Standard technique for ranking items with binary outcomes when sample
+    sizes vary (used by Reddit, Stack Overflow, A/B testing frameworks).
+    For small n, the lower bound is significantly lower than the raw
+    proportion, naturally penalising small samples. For large n, the
+    lower bound approaches the raw proportion.
+
+    Returns a value in [0, 1].
+    """
+    if total <= 0:
+        return 0.0
+    p = successes / total
+    denom = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denom
+    spread = z * _math.sqrt(
+        p * (1 - p) / total + z * z / (4 * total * total)
+    ) / denom
+    return max(0.0, center - spread)
+
+
+def _normal_lower_bound_pct(p_pct, n, z=_Z_95):
+    """Lower bound of the normal-approximation CI for a proportion (percent).
+
+    Used for utilization% (a continuous ratio) by treating each sanctioned
+    work as a Bernoulli trial with success probability = util%/100.
+    """
+    if n <= 0:
+        return 0.0
+    p = max(0.0, min(1.0, p_pct / 100.0))
+    se = _math.sqrt(p * (1 - p) / n)
+    return max(0.0, p_pct - z * se * 100)
+
+
+# ============================================================
 # OVERALL METRICS
 # ============================================================
 
@@ -648,61 +697,45 @@ def compute_member_ranks(member_records):
 
 
 def compute_state_ranks(state_records):
-    """Compute performance rank for each state using Bayesian shrinkage.
+    """Compute performance rank for each state using a statistical lower-bound CI.
 
-    Raw score (completion + utilization) is biased toward small states —
-    a 2-member state with 136 works naturally has higher completion% and
-    utilization% than a 51-member state with 7,669 works.
+    Rank score = lower_bound_95CI(completion%) + lower_bound_95CI(utilization%)
+    Rank 1 = highest combined lower-bound CI.
 
-    Bayesian shrinkage pulls small-sample states toward the national average:
-        effective_score = (state_score * am + national_avg * K) / (am + K)
-    with K = 5.
+    Sample size is accounted for through the math itself (CI width scales
+    with 1/sqrt(n)), so tiny-sample states naturally rank lower without
+    any hard-coded size thresholds or work-count bonuses. A state with 50%
+    completion out of 4 works gets a much lower lower bound than a state
+    with 50% completion out of 4,000 works — correctly reflecting that
+    the former is far less informative.
 
-    Effect on rank ordering (K=5, assuming national_avg ≈ 88):
-        am=2   →  ~71% weight on national_avg, 29% on raw score
-        am=10  →  ~33% weight on national_avg, 67% on raw score
-        am=20  →  ~20% weight on national_avg, 80% on raw score
-        am=50+ →  ~9% weight on national_avg (nearly unaffected)
+    Workload/scale (total_works, active_members) is intentionally NOT
+    blended into the rank score — it is shown as a separate dimension on
+    the frontend. Only performance metrics drive rank.
 
-    Larger states (Bihar, UP, Maharashtra, MP) move up; tiny NE states drop.
-    All qualifying states still receive a rank — no exclusions.
-
-    `ranking_qualified` is NOT persisted in state_metrics, so we recompute
-    it here from total_works >= 10 and active_members >= 2 (same rule as
-    phase_a_state.py / backfill_ranks.py).
+    All 36 states/UTs receive a rank. States with very small samples get
+    the lowest ranks automatically.
     """
-    K = 5  # prior weight on the national average
+    def _rank_score(r):
+        # Completion: Wilson lower bound on completed_works / total_works
+        comp_lb = _wilson_lower_bound(
+            _safe_int(r.get("completed_works")),
+            _safe_int(r.get("total_works")),
+        ) * 100.0
 
-    def _is_qualified(r):
-        return (
-            (r.get("total_works") or 0) >= 10
-            and (r.get("active_members") or 0) >= 2
+        # Utilization: normal-approx lower bound on utilization%, with
+        # effective sample size = sanctioned_works (each treated as a
+        # Bernoulli trial).
+        util_pct = _safe_float(r.get("fund_utilization_pct"), 0.0) or 0.0
+        util_lb = _normal_lower_bound_pct(
+            util_pct,
+            _safe_int(r.get("sanctioned_works")),
         )
 
-    def _raw_score(r):
-        comp = r.get("completion_rate_pct") or 0
-        util = r.get("fund_utilization_pct") or 0
-        return float(comp) + float(util)
+        return comp_lb + util_lb
 
-    qualified = [r for r in state_records if _is_qualified(r)]
-    unqualified = [r for r in state_records if not _is_qualified(r)]
-
-    if qualified:
-        national_avg = sum(_raw_score(r) for r in qualified) / len(qualified)
-    else:
-        national_avg = 0
-
-    def _effective_score(r):
-        score = _raw_score(r)
-        am = r.get("active_members") or 0
-        return (score * am + national_avg * K) / (am + K)
-
-    qualified.sort(key=lambda r: -_effective_score(r))
-
-    for i, r in enumerate(qualified, 1):
+    sorted_records = sorted(state_records, key=_rank_score, reverse=True)
+    for i, r in enumerate(sorted_records, 1):
         r["rank"] = i
-
-    for r in unqualified:
-        r["rank"] = None
 
     return state_records
