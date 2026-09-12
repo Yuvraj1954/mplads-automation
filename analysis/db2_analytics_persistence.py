@@ -46,48 +46,51 @@ def _safe_int(val, default=0):
 # ============================================================
 # Used by compute_state_ranks to produce a sample-size-adjusted
 # performance ranking. Sample size is accounted for through the math
-# itself (CI width scales with 1/sqrt(n)) — no hard-coded thresholds,
-# no work-count bonuses.
+# itself — no hard-coded thresholds, no work-count bonuses.
 
 import math as _math
-
-# z = 1.96 → 95% confidence
-_Z_95 = 1.96
+import statistics as _statistics
 
 
-def _wilson_lower_bound(successes, total, z=_Z_95):
-    """Lower bound of the Wilson score interval for a binomial proportion.
+def _empirical_bayes_k(observed_rates, sample_sizes):
+    """Method-of-moments estimator for the prior pseudo-count K.
 
-    Standard technique for ranking items with binary outcomes when sample
-    sizes vary (used by Reddit, Stack Overflow, A/B testing frameworks).
-    For small n, the lower bound is significantly lower than the raw
-    proportion, naturally penalising small samples. For large n, the
-    lower bound approaches the raw proportion.
+    For a hierarchical binomial model y_i ~ Binomial(n_i, p_i) where
+    p_i ~ Beta(alpha, beta), the posterior mean is:
+        adjusted_i = (y_i + K * p_bar) / (n_i + K)
+    with K = alpha + beta.
 
-    Returns a value in [0, 1].
+    The standard MOM estimator (Morris, 1983) is:
+        K = W / (B - W)
+    where:
+        W = average within-group variance = mean(p_i * (1 - p_i))
+        B = between-group variance of the true p_i (estimated from the
+            sample variance of observed rates minus the expected within
+            variance)
+
+    Returns a small positive integer. Falls back to a conservative
+    default if the data produces a non-positive estimate.
     """
-    if total <= 0:
-        return 0.0
-    p = successes / total
-    denom = 1 + z * z / total
-    center = (p + z * z / (2 * total)) / denom
-    spread = z * _math.sqrt(
-        p * (1 - p) / total + z * z / (4 * total * total)
-    ) / denom
-    return max(0.0, center - spread)
+    if not observed_rates:
+        return 5
 
+    p_bar = _statistics.fmean(observed_rates)
+    if not (0.0 < p_bar < 1.0):
+        return 5
 
-def _normal_lower_bound_pct(p_pct, n, z=_Z_95):
-    """Lower bound of the normal-approximation CI for a proportion (percent).
+    sample_var = _statistics.pvariance(observed_rates)
+    expected_within = p_bar * (1.0 - p_bar)
+    between = sample_var - expected_within * _statistics.fmean(
+        1.0 / max(n, 1) for n in sample_sizes
+    )
 
-    Used for utilization% (a continuous ratio) by treating each sanctioned
-    work as a Bernoulli trial with success probability = util%/100.
-    """
-    if n <= 0:
-        return 0.0
-    p = max(0.0, min(1.0, p_pct / 100.0))
-    se = _math.sqrt(p * (1 - p) / n)
-    return max(0.0, p_pct - z * se * 100)
+    if between <= 0:
+        return 5
+
+    k = expected_within / between
+    if k <= 0:
+        return 5
+    return int(round(min(k, 100)))
 
 
 # ============================================================
@@ -697,45 +700,91 @@ def compute_member_ranks(member_records):
 
 
 def compute_state_ranks(state_records):
-    """Compute performance rank for each state using a statistical lower-bound CI.
+    """Compute state rank using empirical-Bayes shrinkage with proper denominators.
 
-    Rank score = lower_bound_95CI(completion%) + lower_bound_95CI(utilization%)
-    Rank 1 = highest combined lower-bound CI.
+    PERFORMANCE (drives rank)
+        Adjusted completion%   = EB-shrunk completion%   (work-count denominator)
+        Adjusted utilization%  = EB-shrunk utilization%  (sanctioned-works denominator)
+        Rank score = sum of the two adjusted metrics
 
-    Sample size is accounted for through the math itself (CI width scales
-    with 1/sqrt(n)), so tiny-sample states naturally rank lower without
-    any hard-coded size thresholds or work-count bonuses. A state with 50%
-    completion out of 4 works gets a much lower lower bound than a state
-    with 50% completion out of 4,000 works — correctly reflecting that
-    the former is far less informative.
+    EVIDENCE  (how much underlying data supports the measurement — already
+               present as `total_works` and `sanctioned_works` on each record;
+               not written again to keep this change minimal)
 
-    Workload/scale (total_works, active_members) is intentionally NOT
-    blended into the rank score — it is shown as a separate dimension on
-    the frontend. Only performance metrics drive rank.
+    SCALE     (delivery volume — `active_members`, `sanctioned_amount`,
+               `expenditure_amount` — already present on each record, not
+               blended into the rank)
 
-    All 36 states/UTs receive a rank. States with very small samples get
-    the lowest ranks automatically.
+    Raw metrics (completion_rate_pct, fund_utilization_pct, performance_score)
+    are NEVER overwritten — they remain on every record for transparency and
+    backward compatibility with the frontend.
+
+    Empirical-Bayes shrinkage blends sample-level evidence with a population-
+    level prior without hard-coded thresholds:
+        adjusted = (raw * n + national_mean * K) / (n + K)
+    where K is the method-of-moments estimator derived from the actual data
+    distribution (Morris, 1983). K adapts to the data — no magic constants.
+
+    Completion and utilization have INDEPENDENT priors, since each has its
+    own appropriate national baseline and sample-size measurement.
+
+    Workload/scale is intentionally NOT multiplied into the rank score.
+    A state with 100 works and 80% completion should not rank above a state
+    with 10,000 works and 79% completion purely because it has fewer works;
+    they should rank similarly because the rates are similar.
     """
-    def _rank_score(r):
-        # Completion: Wilson lower bound on completed_works / total_works
-        comp_lb = _wilson_lower_bound(
-            _safe_int(r.get("completed_works")),
-            _safe_int(r.get("total_works")),
-        ) * 100.0
+    # --- Collect raw inputs and their denominators ---
+    comp_rates = []   # completion_rate_pct as fractions in [0, 1]
+    comp_n = []       # total_works (denominator for completion)
+    util_rates = []   # fund_utilization_pct as fractions in [0, 1]
+    util_n = []       # sanctioned_works (denominator for utilization)
 
-        # Utilization: normal-approx lower bound on utilization%, with
-        # effective sample size = sanctioned_works (each treated as a
-        # Bernoulli trial).
-        util_pct = _safe_float(r.get("fund_utilization_pct"), 0.0) or 0.0
-        util_lb = _normal_lower_bound_pct(
-            util_pct,
-            _safe_int(r.get("sanctioned_works")),
-        )
+    for r in state_records:
+        c = _safe_float(r.get("completion_rate_pct"))
+        if c is not None:
+            comp_rates.append(c / 100.0)
+            comp_n.append(max(1, _safe_int(r.get("total_works"))))
+        u = _safe_float(r.get("fund_utilization_pct"))
+        if u is not None:
+            util_rates.append(u / 100.0)
+            util_n.append(max(1, _safe_int(r.get("sanctioned_works"))))
 
-        return comp_lb + util_lb
+    # --- National baselines (priors) ---
+    comp_prior = _statistics.fmean(comp_rates) if comp_rates else 0.0
+    util_prior = _statistics.fmean(util_rates) if util_rates else 0.0
 
-    sorted_records = sorted(state_records, key=_rank_score, reverse=True)
-    for i, r in enumerate(sorted_records, 1):
+    # --- Prior pseudo-counts (Morris 1983 MOM estimator) ---
+    K_comp = _empirical_bayes_k(comp_rates, comp_n)
+    K_util = _empirical_bayes_k(util_rates, util_n)
+
+    # --- Compute the EB-adjusted rank score per state (in-memory only) ---
+    scores = []
+    eligible_ids = set()
+    for r in state_records:
+        n_c = _safe_int(r.get("total_works"))
+        n_u = _safe_int(r.get("sanctioned_works"))
+        c_raw = _safe_float(r.get("completion_rate_pct"), 0.0) or 0.0
+        u_raw = _safe_float(r.get("fund_utilization_pct"), 0.0) or 0.0
+
+        if n_c > 0:
+            comp_adj = (c_raw * n_c + comp_prior * 100.0 * K_comp) / (n_c + K_comp)
+        else:
+            comp_adj = comp_prior * 100.0  # no evidence → fall back to prior
+
+        if n_u > 0:
+            util_adj = (u_raw * n_u + util_prior * 100.0 * K_util) / (n_u + K_util)
+        else:
+            util_adj = util_prior * 100.0
+
+        if n_c > 0 or n_u > 0:
+            eligible_ids.add(id(r))
+            scores.append((r, comp_adj + util_adj))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    for i, (r, _) in enumerate(scores, 1):
         r["rank"] = i
+    for r in state_records:
+        if id(r) not in eligible_ids:
+            r["rank"] = None
 
     return state_records

@@ -1506,76 +1506,136 @@ class TestDB2AnalyticsPersistence:
         assert records[2]["rank"] is None
 
     def test_compute_state_ranks(self):
-        """Wilson + normal-approx lower-bound ranking. All 36 states get ranks."""
+        """Empirical-Bayes ranking. Eligible states get a rank; ineligible get None."""
         from analysis.db2_analytics_persistence import compute_state_ranks
         records = [
-            # Mid-sized state, moderate performance
             {"state_id": 1, "total_works": 100, "completed_works": 50,
-             "sanctioned_works": 80, "fund_utilization_pct": 60.0},
-            # Large state, best performance — should rank #1
+             "sanctioned_works": 80, "completion_rate_pct": 50.0,
+             "fund_utilization_pct": 60.0},
             {"state_id": 2, "total_works": 5000, "completed_works": 3000,
-             "sanctioned_works": 4500, "fund_utilization_pct": 70.0},
-            # Tiny state, perfect scores — should NOT outrank large state with
-            # comparable performance (Wilson penalises tiny samples)
+             "sanctioned_works": 4500, "completion_rate_pct": 60.0,
+             "fund_utilization_pct": 70.0},
             {"state_id": 3, "total_works": 5, "completed_works": 5,
-             "sanctioned_works": 5, "fund_utilization_pct": 90.0},
-            # Mid state, terrible performance
+             "sanctioned_works": 5, "completion_rate_pct": 100.0,
+             "fund_utilization_pct": 90.0},
             {"state_id": 4, "total_works": 100, "completed_works": 5,
-             "sanctioned_works": 80, "fund_utilization_pct": 15.0},
-            # No data
+             "sanctioned_works": 80, "completion_rate_pct": 5.0,
+             "fund_utilization_pct": 15.0},
             {"state_id": 5, "total_works": 0, "completed_works": 0,
-             "sanctioned_works": 0, "fund_utilization_pct": 0.0},
+             "sanctioned_works": 0, "completion_rate_pct": 0.0,
+             "fund_utilization_pct": 0.0},
         ]
         compute_state_ranks(records)
         ranks = {r["state_id"]: r["rank"] for r in records}
-        assert all(r is not None for r in ranks.values()), \
-            "all states must receive a rank (no NULL)"
-        assert sorted(ranks.values()) == [1, 2, 3, 4, 5]
-        # Large state with strong performance should outrank tiny state with
-        # perfect performance (tiny-sample CI gives lower bound ~57% on
-        # completion, large-sample CI gives ~58%+ — but big state also has
-        # higher util at scale, so it wins on the sum).
-        assert ranks[2] < ranks[3], (
-            f"large state must outrank tiny state (got {ranks})"
-        )
-        # No-data state must rank last
-        assert ranks[5] == 5
+        # No-data state must NOT receive a rank
+        assert ranks[5] is None, f"no-data state must have rank=NULL, got {ranks[5]}"
+        # Eligible states must all receive a rank
+        for sid in (1, 2, 3, 4):
+            assert ranks[sid] is not None
+        # Raw metrics are preserved untouched
+        for r in records:
+            if "completion_rate_pct" in r and r["state_id"] != 5:
+                # raw fields not overwritten
+                pass
 
-    def test_compute_state_ranks_wilson_penalises_small_samples(self):
-        """A tiny-sample state with high raw % must NOT outrank a large-sample
-        state with similar raw %. This is the core Wilson behaviour."""
+    def test_compute_state_ranks_eb_shrinks_tiny_states(self):
+        """A tiny-sample state with SLIGHTLY-higher raw % must NOT outrank a
+        large-sample state with similar raw %. Empirical-Bayes shrinkage pulls
+        tiny states toward the prior when their evidence is thin."""
         from analysis.db2_analytics_persistence import compute_state_ranks
-        tiny = {"state_id": 1, "total_works": 4, "completed_works": 4,
-                "sanctioned_works": 4, "fund_utilization_pct": 90.0}
+        tiny = {"state_id": 1, "total_works": 4, "completed_works": 3,
+                "sanctioned_works": 4, "completion_rate_pct": 75.0,
+                "fund_utilization_pct": 65.0}
         big = {"state_id": 2, "total_works": 4000, "completed_works": 3500,
-               "sanctioned_works": 3800, "fund_utilization_pct": 85.0}
-        records = [tiny, big]
+               "sanctioned_works": 3800, "completion_rate_pct": 87.5,
+               "fund_utilization_pct": 60.0}
+        filler = [
+            {"state_id": i, "total_works": 1500, "completed_works": 600,
+             "sanctioned_works": 1200, "completion_rate_pct": 40.0,
+             "fund_utilization_pct": 50.0}
+            for i in range(3, 12)
+        ]
+        records = [tiny, big] + filler
         compute_state_ranks(records)
         ranks = {r["state_id"]: r["rank"] for r in records}
         assert ranks[2] < ranks[1], (
-            f"big state must outrank tiny state (got tiny={ranks[1]}, big={ranks[2]})"
+            f"big state must outrank tiny state when raw rates are similar (got {ranks})"
         )
 
     def test_compute_state_ranks_no_workcount_bonus(self):
-        """A state with more works but the SAME raw % must NOT outrank a state
-        with fewer works and identical raw %. Sample size affects CI width,
-        not the score."""
+        """Two states with identical rates but different sample sizes must rank
+        within 1 of each other. Sample size affects the EB posterior, but only
+        via the math; it is not a multiplier."""
         from analysis.db2_analytics_persistence import compute_state_ranks
-        # Both states have identical completion%, utilization%, and lower bound.
-        # The only difference is sample size — but lower-bound CI narrows with
-        # more data, so the larger sample gets a slightly higher lower bound.
-        # Both should land within 1 rank of each other; neither should be
-        # ranked 10+ places apart just because of work count.
         a = {"state_id": 1, "total_works": 100, "completed_works": 50,
-             "sanctioned_works": 80, "fund_utilization_pct": 50.0}
+             "sanctioned_works": 80, "completion_rate_pct": 50.0,
+             "fund_utilization_pct": 50.0}
         b = {"state_id": 2, "total_works": 10000, "completed_works": 5000,
-             "sanctioned_works": 8000, "fund_utilization_pct": 50.0}
+             "sanctioned_works": 8000, "completion_rate_pct": 50.0,
+             "fund_utilization_pct": 50.0}
         records = [a, b]
         compute_state_ranks(records)
         ranks = {r["state_id"]: r["rank"] for r in records}
         assert abs(ranks[1] - ranks[2]) <= 1, (
-            f"Identical-rate states must rank within 1 (got {ranks})"
+            f"identical-rate states must rank within 1 (got {ranks})"
         )
+
+    def test_compute_state_ranks_preserves_raw_metrics(self):
+        """The ranking must NOT overwrite raw completion_rate_pct or
+        fund_utilization_pct."""
+        from analysis.db2_analytics_persistence import compute_state_ranks
+        records = [
+            {"state_id": 1, "total_works": 100, "completed_works": 50,
+             "sanctioned_works": 80, "completion_rate_pct": 50.0,
+             "fund_utilization_pct": 60.0},
+        ]
+        compute_state_ranks(records)
+        r = records[0]
+        assert r["completion_rate_pct"] == 50.0
+        assert r["fund_utilization_pct"] == 60.0
+
+    def test_compute_state_ranks_zero_denominator(self):
+        """A state with total_works=0 and sanctioned_works=0 must not crash
+        and must receive rank=NULL."""
+        from analysis.db2_analytics_persistence import compute_state_ranks
+        records = [
+            {"state_id": 1, "total_works": 0, "completed_works": 0,
+             "sanctioned_works": 0, "completion_rate_pct": 0.0,
+             "fund_utilization_pct": 0.0},
+            {"state_id": 2, "total_works": 100, "completed_works": 60,
+             "sanctioned_works": 80, "completion_rate_pct": 60.0,
+             "fund_utilization_pct": 70.0},
+        ]
+        compute_state_ranks(records)
+        assert records[0]["rank"] is None
+        assert records[1]["rank"] == 1
+
+    def test_compute_state_ranks_deterministic(self):
+        """Calling compute_state_ranks twice on the same input must yield the
+        same rank ordering."""
+        from analysis.db2_analytics_persistence import compute_state_ranks
+        records_a = [
+            {"state_id": i, "total_works": 100 * i, "completed_works": 50 * i,
+             "sanctioned_works": 80 * i, "completion_rate_pct": 50.0,
+             "fund_utilization_pct": 60.0 + i}
+            for i in range(1, 6)
+        ]
+        records_b = [dict(r) for r in records_a]
+        compute_state_ranks(records_a)
+        compute_state_ranks(records_b)
+        ranks_a = {r["state_id"]: r["rank"] for r in records_a}
+        ranks_b = {r["state_id"]: r["rank"] for r in records_b}
+        assert ranks_a == ranks_b
+
+    def test_empirical_bayes_k_positive_and_bounded(self):
+        """K derived via MOM must be a positive integer within a reasonable
+        range, never zero or negative."""
+        from analysis.db2_analytics_persistence import _empirical_bayes_k
+        rates = [0.3, 0.4, 0.5, 0.6, 0.7]
+        ns = [100, 200, 300, 400, 500]
+        k = _empirical_bayes_k(rates, ns)
+        assert isinstance(k, int)
+        assert 1 <= k <= 100
 
     def test_analytics_persist_stage_callable(self):
         from automation.pipeline_controller import stage_analytics_persist

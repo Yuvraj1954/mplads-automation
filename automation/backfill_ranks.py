@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """Backfill `rank` column in DB2 member_metrics and state_metrics.
 
-Member ranks: raw completion% + utilization% (only ranking_qualified members).
-State ranks: statistical lower-bound CI on completion% + utilization%
-  (Wilson score for completion, normal-approx for utilization).
-  Sample size is accounted for via the math itself — no hard-coded
-  size thresholds, no work-count bonuses. Workload/scale is shown
-  separately on the frontend.
+Member ranks:
+    raw completion% + utilization%, only ranking_qualified members.
+
+State ranks:
+    Empirical-Bayes shrinkage with proper denominators:
+        completion%   uses total_works      as the sample-size measure
+        utilization%  uses sanctioned_works as the sample-size measure
+    K is derived from the data via MOM estimator (Morris, 1983). K adapts
+    to the actual data — no hard-coded thresholds.
+
+    Only the `rank` column is updated. Raw metrics
+    (completion_rate_pct, fund_utilization_pct, performance_score) are
+    preserved untouched, so PERFORMANCE / EVIDENCE / SCALE remain visible
+    on every row through the existing columns:
+        PERFORMANCE: completion_rate_pct + fund_utilization_pct
+        EVIDENCE:    total_works (completion denom) + sanctioned_works (util denom)
+        SCALE:       active_members + sanctioned_amount + expenditure_amount
 
 Usage:
     python automation/backfill_ranks.py
 """
 
-import math
 import os
 import sys
+import statistics
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,9 +44,6 @@ if not DB2_URL or not DB2_KEY:
     sys.exit(1)
 
 BATCH = 1000
-
-# z = 1.96 → 95% confidence
-_Z_95 = 1.96
 
 
 def fetch_all(client, table: str, columns: str = "*"):
@@ -62,26 +70,24 @@ def perf_score(row):
         return 0.0
 
 
-def wilson_lower_bound(successes, total, z=_Z_95):
-    """Lower bound of the Wilson score interval for a binomial proportion."""
-    if total <= 0:
-        return 0.0
-    p = successes / total
-    denom = 1 + z * z / total
-    center = (p + z * z / (2 * total)) / denom
-    spread = z * math.sqrt(
-        p * (1 - p) / total + z * z / (4 * total * total)
-    ) / denom
-    return max(0.0, center - spread)
-
-
-def normal_lower_bound_pct(p_pct, n, z=_Z_95):
-    """Lower bound of normal-approx CI for a proportion (percent)."""
-    if n <= 0:
-        return 0.0
-    p = max(0.0, min(1.0, p_pct / 100.0))
-    se = math.sqrt(p * (1 - p) / n)
-    return max(0.0, p_pct - z * se * 100)
+def empirical_bayes_k(observed_rates, sample_sizes):
+    """Method-of-moments estimator for the prior pseudo-count K."""
+    if not observed_rates:
+        return 5
+    p_bar = statistics.fmean(observed_rates)
+    if not (0.0 < p_bar < 1.0):
+        return 5
+    sample_var = statistics.pvariance(observed_rates)
+    expected_within = p_bar * (1.0 - p_bar)
+    between = sample_var - expected_within * statistics.fmean(
+        1.0 / max(n, 1) for n in sample_sizes
+    )
+    if between <= 0:
+        return 5
+    k = expected_within / between
+    if k <= 0:
+        return 5
+    return int(round(min(k, 100)))
 
 
 def compute_ranks(records):
@@ -95,35 +101,54 @@ def compute_ranks(records):
     return ranks
 
 
-def compute_state_ranks(records):
-    """State ranks via statistical lower-bound CI (Wilson + normal approx).
+def compute_state_ranks_eb(records):
+    """State ranks via empirical-Bayes shrinkage.
 
-    Must mirror analysis/db2_analytics_persistence.compute_state_ranks:
-        rank_score = lower_bound_95CI(completion%) + lower_bound_95CI(utilization%)
-    Sample size is accounted for via the math itself. No hard-coded size
-    thresholds. No work-count bonus. Workload/scale stays separate.
+    Mirrors analysis/db2_analytics_persistence.compute_state_ranks.
+    Returns dict state_id -> rank (or None for zero-evidence states).
     """
-    def _rank_score(r):
-        comp_lb = wilson_lower_bound(
-            int(r.get("completed_works") or 0),
-            int(r.get("total_works") or 0),
-        ) * 100.0
-        util_pct = float(r.get("fund_utilization_pct") or 0)
-        util_lb = normal_lower_bound_pct(
-            util_pct,
-            int(r.get("sanctioned_works") or 0),
-        )
-        return comp_lb + util_lb
+    comp_rates, comp_n = [], []
+    util_rates, util_n = [], []
+    for r in records:
+        c = r.get("completion_rate_pct")
+        u = r.get("fund_utilization_pct")
+        if c is not None:
+            comp_rates.append(c / 100.0)
+            comp_n.append(max(1, int(r.get("total_works") or 0)))
+        if u is not None:
+            util_rates.append(u / 100.0)
+            util_n.append(max(1, int(r.get("sanctioned_works") or 0)))
 
-    sorted_records = sorted(records, key=_rank_score, reverse=True)
+    comp_prior = statistics.fmean(comp_rates) if comp_rates else 0.0
+    util_prior = statistics.fmean(util_rates) if util_rates else 0.0
+    K_comp = empirical_bayes_k(comp_rates, comp_n)
+    K_util = empirical_bayes_k(util_rates, util_n)
+
+    enriched = []
+    for r in records:
+        n_c = int(r.get("total_works") or 0)
+        n_u = int(r.get("sanctioned_works") or 0)
+        c_raw = float(r.get("completion_rate_pct") or 0)
+        u_raw = float(r.get("fund_utilization_pct") or 0)
+        comp_adj = ((c_raw * n_c + comp_prior * 100.0 * K_comp) / (n_c + K_comp)) if n_c > 0 else comp_prior * 100.0
+        util_adj = ((u_raw * n_u + util_prior * 100.0 * K_util) / (n_u + K_util)) if n_u > 0 else util_prior * 100.0
+        eligible = n_c > 0 or n_u > 0
+        enriched.append((r["state_id"], comp_adj + util_adj, eligible))
+
+    eligible = sorted(
+        [(sid, score) for sid, score, ok in enriched if ok],
+        key=lambda x: x[1], reverse=True,
+    )
     ranks = {}
-    for i, r in enumerate(sorted_records, 1):
-        ranks[r.get("state_id")] = i
+    for i, (sid, _) in enumerate(eligible, 1):
+        ranks[sid] = i
+    for sid, _, ok in enriched:
+        if not ok:
+            ranks[sid] = None
     return ranks
 
 
-def update_ranks(client, table: str, records, ranks_by_key, key_fields):
-    """Update the `rank` column for each record."""
+def update_ranks(client, table, records, ranks_by_key, key_fields):
     updated = 0
     batch_size = 200
     batch = []
@@ -131,20 +156,19 @@ def update_ranks(client, table: str, records, ranks_by_key, key_fields):
         if len(key_fields) == 2:
             key = (r.get(key_fields[0]), r.get(key_fields[1]))
             rank = ranks_by_key.get(key)
+            update_row = {
+                key_fields[0]: r[key_fields[0]],
+                key_fields[1]: r[key_fields[1]],
+                "rank": rank,
+            }
         else:
             key = r.get(key_fields[0])
             rank = ranks_by_key.get(key)
-        update_row = {key_fields[0]: r[key_fields[0]]}
-        if len(key_fields) == 2:
-            update_row[key_fields[1]] = r[key_fields[1]]
-        update_row["rank"] = rank
-
+            update_row = {key_fields[0]: r[key_fields[0]], "rank": rank}
         batch.append(update_row)
         if len(batch) >= batch_size:
             client.table(table).upsert(batch, on_conflict=",".join(key_fields)).execute()
-            updated += len(batch)
-            batch = []
-
+            updated += len(batch); batch = []
     if batch:
         client.table(table).upsert(batch, on_conflict=",".join(key_fields)).execute()
         updated += len(batch)
@@ -171,10 +195,7 @@ def main():
 
     print("\n[2/2] Updating member_metrics.rank...")
     updated = update_ranks(
-        client,
-        "member_metrics",
-        members,
-        member_ranks,
+        client, "member_metrics", members, member_ranks,
         key_fields=["member_id", "member_type"],
     )
     print(f"  Updated {updated} member rows")
@@ -184,18 +205,15 @@ def main():
     states = fetch_all(
         client,
         "state_metrics",
-        "state_id, total_works, completed_works, sanctioned_works, fund_utilization_pct",
+        "state_id, total_works, sanctioned_works, completion_rate_pct, fund_utilization_pct",
     )
     print(f"  Fetched {len(states)} state rows")
-    state_ranks = compute_state_ranks(states)
-    print(f"  Computed {len(state_ranks)} state ranks (all 36 states/UTs)")
+    state_ranks = compute_state_ranks_eb(states)
+    print(f"  Computed {sum(1 for v in state_ranks.values() if v is not None)} state ranks")
 
     print("\n[4/4] Updating state_metrics.rank...")
     updated = update_ranks(
-        client,
-        "state_metrics",
-        states,
-        state_ranks,
+        client, "state_metrics", states, state_ranks,
         key_fields=["state_id"],
     )
     print(f"  Updated {updated} state rows")
