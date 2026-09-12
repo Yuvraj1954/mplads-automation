@@ -6,6 +6,7 @@ import subprocess
 import time
 import threading
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -526,6 +527,35 @@ def _ensure_complete_json(snapshot_dir):
     return data
 
 
+def _update_data_updated(status="complete"):
+    """Upsert DB1 `public.data_updated` (id=1) so the frontend reflects this run.
+
+    The frontend's `/api/data-updated` endpoint reads this row from DB1
+    (see app/database.py:get_pool). Without this, the UI stays frozen
+    even when the pipeline runs successfully.
+
+    Uses the module-level `sb` Supabase client (DB1, initialized from
+    SUPABASE_URL / SUPABASE_SECRET_KEY at the top of this file).
+    Failures are logged but never raised, so a hiccup cannot fail an
+    otherwise-successful pipeline run.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    body = {
+        "id": 1,
+        "completed_at": now_iso,
+        "status": status,
+        "updated_at": now_iso,
+    }
+
+    try:
+        sb.table("data_updated").upsert(body, on_conflict="id").execute()
+        print(f"  data_updated upserted (DB1): {now_iso} status={status}")
+        return True
+    except Exception as exc:
+        print(f"  WARNING: data_updated upsert failed: {exc}")
+        return False
+
+
 def _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir):
     """Copy the fetched snapshot into the cache current/ directory.
 
@@ -687,6 +717,7 @@ def main():
             )
 
         print("\n=== BOOTSTRAP COMPLETE ===")
+        _update_data_updated(status="complete")
         _print_timing(timing, pipeline_start)
         return
 
@@ -856,6 +887,7 @@ def main():
         _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
         _cleanup_local_snapshot(local_snapshot_path)
         _write_pipeline_success(new_ts, cache_work_dir)
+        _update_data_updated(status="complete")
         timing["cleanup"] = _elapsed(t_cleanup)
         _print_timing(timing, pipeline_start)
         return
@@ -997,6 +1029,7 @@ def main():
     _preserve_fetched_snapshot(local_snapshot_path, new_ts, cache_work_dir)
     _cleanup_local_snapshot(local_snapshot_path)
     _write_pipeline_success(new_ts, cache_work_dir)
+    _update_data_updated(status="complete")
     timing["cleanup"] = _elapsed(t_cleanup)
 
     print("=== PIPELINE COMPLETE ===")
