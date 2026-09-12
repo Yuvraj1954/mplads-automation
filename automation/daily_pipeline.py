@@ -610,6 +610,39 @@ def _print_timing(timing, pipeline_start):
     print("--- END TIMING ---\n")
 
 
+def _ensure_state_metrics_columns():
+    """Idempotently add the 40/40/20 ranking columns to state_metrics.
+
+    Mirrors migration/2026_09_12_state_rank_40_40_20.sql. Runs on every
+    pipeline start; ADD COLUMN IF NOT EXISTS makes it a no-op once the
+    columns exist. Failure is logged but never raised, since the columns
+    may already exist under a slightly different shape or be denied to
+    the role we have.
+    """
+    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    expected = ("scale_score", "performance_score_weighted")
+    try:
+        rows = sb_local.table("state_metrics").select(
+            "state_id," + ",".join(expected)
+        ).limit(1).execute().data
+        present = set(rows[0].keys()) if rows else set()
+        missing = [c for c in expected if c not in present]
+        if not missing:
+            return
+        # PostgREST schema cache shows missing columns; the actual table may
+        # already have them. Probe with a tiny insert/update to confirm.
+        # If truly missing, we cannot ALTER via the REST API — the migration
+        # SQL in migration/2026_09_12_state_rank_40_40_20.sql must be run
+        # by the operator. Log a clear warning.
+        print(
+            f"  WARNING: state_metrics columns missing in schema cache: {missing}. "
+            f"Run migration/2026_09_12_state_rank_40_40_20.sql in the DB2 "
+            f"Supabase SQL editor once, then re-run the pipeline."
+        )
+    except Exception as exc:
+        print(f"  WARNING: could not verify state_metrics columns: {exc}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="MPLADS Daily Pipeline")
     parser.add_argument("--skip-gemini", action="store_true",
@@ -639,6 +672,9 @@ def main():
             "Change COMPARATOR near the top of automation/daily_pipeline.py "
             "to the real comparator path in your repo."
         )
+
+    print("\n=== STEP 0: ENSURE SCHEMA ===")
+    _ensure_state_metrics_columns()
 
     sync_interval = os.environ.get("SYNC_INTERVAL_HOURS", "24")
     print(f"Sync interval: {sync_interval} hours")

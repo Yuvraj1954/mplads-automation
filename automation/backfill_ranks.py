@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
-"""Backfill `rank` column in DB2 member_metrics and state_metrics.
+"""Backfill `rank`, `scale_score`, and `performance_score_weighted` columns
+in DB2 state_metrics.
 
-Member ranks:
-    raw completion% + utilization%, only ranking_qualified members.
+State ranking formula:
+    performance_score_weighted =
+          0.40 * completion_rate_pct
+        + 0.40 * fund_utilization_pct
+        + 0.20 * scale_score
+    scale_score = percentile rank (midrank, 0-100) of total_works across
+                  all qualifying states.
+    rank = by performance_score_weighted (descending, competition ranking).
 
-State ranks:
-    Empirical-Bayes shrinkage with proper denominators:
-        completion%   uses total_works      as the sample-size measure
-        utilization%  uses sanctioned_works as the sample-size measure
-    K is derived from the data via MOM estimator (Morris, 1983). K adapts
-    to the actual data — no hard-coded thresholds.
-
-    Only the `rank` column is updated. Raw metrics
-    (completion_rate_pct, fund_utilization_pct, performance_score) are
-    preserved untouched, so PERFORMANCE / EVIDENCE / SCALE remain visible
-    on every row through the existing columns:
-        PERFORMANCE: completion_rate_pct + fund_utilization_pct
-        EVIDENCE:    total_works (completion denom) + sanctioned_works (util denom)
-        SCALE:       active_members + sanctioned_amount + expenditure_amount
+Member ranks remain raw completion + utilization, only for ranking_qualified.
 
 Usage:
     python automation/backfill_ranks.py
@@ -25,7 +19,6 @@ Usage:
 
 import os
 import sys
-import statistics
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -70,28 +63,7 @@ def perf_score(row):
         return 0.0
 
 
-def empirical_bayes_k(observed_rates, sample_sizes):
-    """Method-of-moments estimator for the prior pseudo-count K."""
-    if not observed_rates:
-        return 5
-    p_bar = statistics.fmean(observed_rates)
-    if not (0.0 < p_bar < 1.0):
-        return 5
-    sample_var = statistics.pvariance(observed_rates)
-    expected_within = p_bar * (1.0 - p_bar)
-    between = sample_var - expected_within * statistics.fmean(
-        1.0 / max(n, 1) for n in sample_sizes
-    )
-    if between <= 0:
-        return 5
-    k = expected_within / between
-    if k <= 0:
-        return 5
-    return int(round(min(k, 100)))
-
-
-def compute_ranks(records):
-    """Member ranks: raw completion + utilization, only for ranking_qualified."""
+def compute_member_ranks(records):
     qualified = [r for r in records if r.get("ranking_qualified")]
     qualified.sort(key=lambda r: -perf_score(r))
     ranks = {}
@@ -101,76 +73,94 @@ def compute_ranks(records):
     return ranks
 
 
-def compute_state_ranks_eb(records):
-    """State ranks via empirical-Bayes shrinkage.
+def compute_state_payload(records):
+    """Compute rank + scale_score + performance_score_weighted for each state.
 
-    Mirrors analysis/db2_analytics_persistence.compute_state_ranks.
-    Returns dict state_id -> rank (or None for zero-evidence states).
+    Mirrors analysis/db2_analytics_persistence.compute_state_ranks exactly.
+    Returns dict state_id -> {rank, scale_score, performance_score_weighted}.
     """
-    comp_rates, comp_n = [], []
-    util_rates, util_n = [], []
-    for r in records:
-        c = r.get("completion_rate_pct")
-        u = r.get("fund_utilization_pct")
-        if c is not None:
-            comp_rates.append(c / 100.0)
-            comp_n.append(max(1, int(r.get("total_works") or 0)))
-        if u is not None:
-            util_rates.append(u / 100.0)
-            util_n.append(max(1, int(r.get("sanctioned_works") or 0)))
+    def _has_all_three(r):
+        return (
+            r.get("completion_rate_pct") is not None
+            and r.get("fund_utilization_pct") is not None
+            and r.get("total_works") is not None
+        )
 
-    comp_prior = statistics.fmean(comp_rates) if comp_rates else 0.0
-    util_prior = statistics.fmean(util_rates) if util_rates else 0.0
-    K_comp = empirical_bayes_k(comp_rates, comp_n)
-    K_util = empirical_bayes_k(util_rates, util_n)
+    qualifying = [r for r in records if _has_all_three(r)]
+    non_qualifying = [r for r in records if r not in qualifying]
 
-    enriched = []
-    for r in records:
-        n_c = int(r.get("total_works") or 0)
-        n_u = int(r.get("sanctioned_works") or 0)
-        c_raw = float(r.get("completion_rate_pct") or 0)
-        u_raw = float(r.get("fund_utilization_pct") or 0)
-        comp_adj = ((c_raw * n_c + comp_prior * 100.0 * K_comp) / (n_c + K_comp)) if n_c > 0 else comp_prior * 100.0
-        util_adj = ((u_raw * n_u + util_prior * 100.0 * K_util) / (n_u + K_util)) if n_u > 0 else util_prior * 100.0
-        eligible = n_c > 0 or n_u > 0
-        enriched.append((r["state_id"], comp_adj + util_adj, eligible))
+    payload = {r["state_id"]: {"rank": None, "scale_score": None, "performance_score_weighted": None}
+               for r in non_qualifying}
 
-    eligible = sorted(
-        [(sid, score) for sid, score, ok in enriched if ok],
-        key=lambda x: x[1], reverse=True,
+    if not qualifying:
+        return payload
+
+    n = len(qualifying)
+    tw_sorted = sorted(int(r.get("total_works") or 0) for r in qualifying)
+    for r in qualifying:
+        tw = int(r.get("total_works") or 0)
+        below = sum(1 for v in tw_sorted if v < tw)
+        at = sum(1 for v in tw_sorted if v == tw)
+        scale = round((below + 0.5 * at) / n * 100.0, 2)
+        comp = float(r.get("completion_rate_pct") or 0)
+        util = float(r.get("fund_utilization_pct") or 0)
+        score = round(comp * 0.40 + util * 0.40 + scale * 0.20, 2)
+        payload[r["state_id"]] = {
+            "scale_score": scale,
+            "performance_score_weighted": score,
+        }
+
+    sorted_q = sorted(
+        qualifying,
+        key=lambda r: (-payload[r["state_id"]]["performance_score_weighted"], r["state_id"]),
     )
-    ranks = {}
-    for i, (sid, _) in enumerate(eligible, 1):
-        ranks[sid] = i
-    for sid, _, ok in enriched:
-        if not ok:
-            ranks[sid] = None
-    return ranks
+    last_score = None
+    last_rank = 0
+    for i, r in enumerate(sorted_q, 1):
+        score = payload[r["state_id"]]["performance_score_weighted"]
+        if last_score is not None and score == last_score:
+            payload[r["state_id"]]["rank"] = last_rank
+        else:
+            payload[r["state_id"]]["rank"] = i
+            last_rank = i
+            last_score = score
+
+    return payload
 
 
-def update_ranks(client, table, records, ranks_by_key, key_fields):
+def update_member_ranks(client, table, records, ranks_by_key):
     updated = 0
     batch_size = 200
     batch = []
     for r in records:
-        if len(key_fields) == 2:
-            key = (r.get(key_fields[0]), r.get(key_fields[1]))
-            rank = ranks_by_key.get(key)
-            update_row = {
-                key_fields[0]: r[key_fields[0]],
-                key_fields[1]: r[key_fields[1]],
-                "rank": rank,
-            }
-        else:
-            key = r.get(key_fields[0])
-            rank = ranks_by_key.get(key)
-            update_row = {key_fields[0]: r[key_fields[0]], "rank": rank}
-        batch.append(update_row)
+        key = (r.get("member_id"), r.get("member_type"))
+        rank = ranks_by_key.get(key)
+        batch.append({
+            "member_id": r["member_id"],
+            "member_type": r["member_type"],
+            "rank": rank,
+        })
         if len(batch) >= batch_size:
-            client.table(table).upsert(batch, on_conflict=",".join(key_fields)).execute()
+            client.table(table).upsert(batch, on_conflict="member_id,member_type").execute()
             updated += len(batch); batch = []
     if batch:
-        client.table(table).upsert(batch, on_conflict=",".join(key_fields)).execute()
+        client.table(table).upsert(batch, on_conflict="member_id,member_type").execute()
+        updated += len(batch)
+    return updated
+
+
+def update_state_metrics(client, table, payload):
+    updated = 0
+    batch_size = 100
+    batch = []
+    for sid, fields in payload.items():
+        row = {"state_id": sid, **fields}
+        batch.append(row)
+        if len(batch) >= batch_size:
+            client.table(table).upsert(batch, on_conflict="state_id").execute()
+            updated += len(batch); batch = []
+    if batch:
+        client.table(table).upsert(batch, on_conflict="state_id").execute()
         updated += len(batch)
     return updated
 
@@ -183,39 +173,33 @@ def main():
     client = create_client(DB2_URL, DB2_KEY)
 
     # --- Member metrics ---
-    print("\n[1/2] Fetching member_metrics...")
+    print("\n[1/4] Fetching member_metrics...")
     members = fetch_all(
         client,
         "member_metrics",
         "member_id, member_type, completion_rate_pct, fund_utilization_pct, ranking_qualified",
     )
     print(f"  Fetched {len(members)} member rows")
-    member_ranks = compute_ranks(members)
+    member_ranks = compute_member_ranks(members)
     print(f"  Computed {len(member_ranks)} member ranks (ranking_qualified=True)")
 
-    print("\n[2/2] Updating member_metrics.rank...")
-    updated = update_ranks(
-        client, "member_metrics", members, member_ranks,
-        key_fields=["member_id", "member_type"],
-    )
+    print("\n[2/4] Updating member_metrics.rank...")
+    updated = update_member_ranks(client, "member_metrics", members, member_ranks)
     print(f"  Updated {updated} member rows")
 
-    # --- State metrics ---
+    # --- State metrics (with weighted score fields) ---
     print("\n[3/4] Fetching state_metrics...")
     states = fetch_all(
         client,
         "state_metrics",
-        "state_id, total_works, sanctioned_works, completion_rate_pct, fund_utilization_pct",
+        "state_id, total_works, completion_rate_pct, fund_utilization_pct",
     )
     print(f"  Fetched {len(states)} state rows")
-    state_ranks = compute_state_ranks_eb(states)
-    print(f"  Computed {sum(1 for v in state_ranks.values() if v is not None)} state ranks")
+    state_payload = compute_state_payload(states)
+    print(f"  Computed {sum(1 for v in state_payload.values() if v['rank'] is not None)} state ranks")
 
-    print("\n[4/4] Updating state_metrics.rank...")
-    updated = update_ranks(
-        client, "state_metrics", states, state_ranks,
-        key_fields=["state_id"],
-    )
+    print("\n[4/4] Updating state_metrics.rank + scale_score + performance_score_weighted...")
+    updated = update_state_metrics(client, "state_metrics", state_payload)
     print(f"  Updated {updated} state rows")
 
     print("\n" + "=" * 70)

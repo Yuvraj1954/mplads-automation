@@ -533,6 +533,8 @@ def _state_to_record(s, anomaly_map, state_member_counts, allocated_amount=0.0):
         "confidence_level": anomaly.confidence_level if anomaly else "LOW",
         "performance_classification": perf_class,
         "rank": None,
+        "scale_score": None,
+        "performance_score_weighted": None,
         "calculated_at": _now_iso(),
     }
 
@@ -700,91 +702,93 @@ def compute_member_ranks(member_records):
 
 
 def compute_state_ranks(state_records):
-    """Compute state rank using empirical-Bayes shrinkage with proper denominators.
+    """Compute state rank using a transparent weighted formula.
 
-    PERFORMANCE (drives rank)
-        Adjusted completion%   = EB-shrunk completion%   (work-count denominator)
-        Adjusted utilization%  = EB-shrunk utilization%  (sanctioned-works denominator)
-        Rank score = sum of the two adjusted metrics
+    Performance Score (drives rank):
+        performance_score_weighted =
+              0.40 * completion_rate_pct
+            + 0.40 * fund_utilization_pct
+            + 0.20 * scale_score
 
-    EVIDENCE  (how much underlying data supports the measurement — already
-               present as `total_works` and `sanctioned_works` on each record;
-               not written again to keep this change minimal)
+    scale_score is the percentile rank (0–100) of total_works across all
+    qualifying states, computed as:
+        scale_score = (count_below + 0.5 * count_equal) / n * 100
+    This handles ties via the standard "midrank" convention.
 
-    SCALE     (delivery volume — `active_members`, `sanctioned_amount`,
-               `expenditure_amount` — already present on each record, not
-               blended into the rank)
+    Raw metrics (`completion_rate_pct`, `fund_utilization_pct`,
+    `total_works`, `performance_score`) are NEVER overwritten. The new
+    fields `scale_score` and `performance_score_weighted` are written
+    alongside them so the ranking is fully explainable.
 
-    Raw metrics (completion_rate_pct, fund_utilization_pct, performance_score)
-    are NEVER overwritten — they remain on every record for transparency and
-    backward compatibility with the frontend.
+    Qualifying states are those with all three components available
+    (non-NULL completion_rate_pct, fund_utilization_pct, and total_works).
+    No thresholds, no size assumptions. A state with zero total_works is
+    still qualifying but gets scale_score = 0.
 
-    Empirical-Bayes shrinkage blends sample-level evidence with a population-
-    level prior without hard-coded thresholds:
-        adjusted = (raw * n + national_mean * K) / (n + K)
-    where K is the method-of-moments estimator derived from the actual data
-    distribution (Morris, 1983). K adapts to the data — no magic constants.
-
-    Completion and utilization have INDEPENDENT priors, since each has its
-    own appropriate national baseline and sample-size measurement.
-
-    Workload/scale is intentionally NOT multiplied into the rank score.
-    A state with 100 works and 80% completion should not rank above a state
-    with 10,000 works and 79% completion purely because it has fewer works;
-    they should rank similarly because the rates are similar.
+    Tie-handling: standard "competition" ranking — tied states receive
+    the same rank; the next rank skips (1, 2, 2, 4). Deterministic
+    because the input sort is stable.
     """
-    # --- Collect raw inputs and their denominators ---
-    comp_rates = []   # completion_rate_pct as fractions in [0, 1]
-    comp_n = []       # total_works (denominator for completion)
-    util_rates = []   # fund_utilization_pct as fractions in [0, 1]
-    util_n = []       # sanctioned_works (denominator for utilization)
+    n_records = len(state_records)
 
-    for r in state_records:
-        c = _safe_float(r.get("completion_rate_pct"))
-        if c is not None:
-            comp_rates.append(c / 100.0)
-            comp_n.append(max(1, _safe_int(r.get("total_works"))))
-        u = _safe_float(r.get("fund_utilization_pct"))
-        if u is not None:
-            util_rates.append(u / 100.0)
-            util_n.append(max(1, _safe_int(r.get("sanctioned_works"))))
+    # --- Decide which records are qualifying (have all three components) ---
+    def _has_all_three(r):
+        return (
+            r.get("completion_rate_pct") is not None
+            and r.get("fund_utilization_pct") is not None
+            and r.get("total_works") is not None
+        )
 
-    # --- National baselines (priors) ---
-    comp_prior = _statistics.fmean(comp_rates) if comp_rates else 0.0
-    util_prior = _statistics.fmean(util_rates) if util_rates else 0.0
+    qualifying = [r for r in state_records if _has_all_three(r)]
+    non_qualifying = [r for r in state_records if r not in qualifying]
 
-    # --- Prior pseudo-counts (Morris 1983 MOM estimator) ---
-    K_comp = _empirical_bayes_k(comp_rates, comp_n)
-    K_util = _empirical_bayes_k(util_rates, util_n)
-
-    # --- Compute the EB-adjusted rank score per state (in-memory only) ---
-    scores = []
-    eligible_ids = set()
-    for r in state_records:
-        n_c = _safe_int(r.get("total_works"))
-        n_u = _safe_int(r.get("sanctioned_works"))
-        c_raw = _safe_float(r.get("completion_rate_pct"), 0.0) or 0.0
-        u_raw = _safe_float(r.get("fund_utilization_pct"), 0.0) or 0.0
-
-        if n_c > 0:
-            comp_adj = (c_raw * n_c + comp_prior * 100.0 * K_comp) / (n_c + K_comp)
-        else:
-            comp_adj = comp_prior * 100.0  # no evidence → fall back to prior
-
-        if n_u > 0:
-            util_adj = (u_raw * n_u + util_prior * 100.0 * K_util) / (n_u + K_util)
-        else:
-            util_adj = util_prior * 100.0
-
-        if n_c > 0 or n_u > 0:
-            eligible_ids.add(id(r))
-            scores.append((r, comp_adj + util_adj))
-
-    scores.sort(key=lambda x: x[1], reverse=True)
-    for i, (r, _) in enumerate(scores, 1):
-        r["rank"] = i
-    for r in state_records:
-        if id(r) not in eligible_ids:
+    if not qualifying:
+        for r in state_records:
             r["rank"] = None
+            r["scale_score"] = None
+            r["performance_score_weighted"] = None
+        return state_records
+
+    # --- Percentile rank of total_works across qualifying states ---
+    # Midrank: (count_below + 0.5 * count_equal) / n * 100
+    n_q = len(qualifying)
+    tw_values = [_safe_int(r.get("total_works")) for r in qualifying]
+    tw_sorted = sorted(tw_values)
+    for r in qualifying:
+        tw = _safe_int(r.get("total_works"))
+        below = sum(1 for v in tw_sorted if v < tw)
+        at = sum(1 for v in tw_sorted if v == tw)
+        r["scale_score"] = round((below + 0.5 * at) / n_q * 100.0, 2)
+
+    # --- Weighted performance score (40 / 40 / 20) ---
+    for r in qualifying:
+        comp = _safe_float(r.get("completion_rate_pct"), 0.0) or 0.0
+        util = _safe_float(r.get("fund_utilization_pct"), 0.0) or 0.0
+        scale = r.get("scale_score") or 0.0
+        r["performance_score_weighted"] = round(
+            comp * 0.40 + util * 0.40 + scale * 0.20, 2
+        )
+
+    # --- Rank by performance_score_weighted, descending (competition ranking) ---
+    # Stable sort so equal scores have deterministic ordering by state_id.
+    sorted_q = sorted(
+        qualifying,
+        key=lambda r: (-(r.get("performance_score_weighted") or 0), r.get("state_id")),
+    )
+    last_score = None
+    last_rank = 0
+    for i, r in enumerate(sorted_q, 1):
+        score = r.get("performance_score_weighted")
+        if last_score is not None and score == last_score:
+            r["rank"] = last_rank  # tie
+        else:
+            r["rank"] = i
+            last_rank = i
+            last_score = score
+
+    for r in non_qualifying:
+        r["rank"] = None
+        r["scale_score"] = None
+        r["performance_score_weighted"] = None
 
     return state_records
