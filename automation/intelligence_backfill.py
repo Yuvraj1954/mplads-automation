@@ -768,8 +768,8 @@ async def main():
         try:
             with open(args.scope) as f:
                 scope = json.load(f)
-            _step(f"Loaded affected scope: {scope.get('affected_work_count', 0)} works, "
-                  f"{scope.get('affected_member_count', 0)} members")
+            _step(f"Loaded affected scope: {scope.get('affected_works', 0)} works, "
+                  f"{scope.get('affected_members', 0)} members")
         except Exception as e:
             _step(f"WARNING: Could not load scope file: {e}, running full backfill")
             scope = None
@@ -785,6 +785,15 @@ async def main():
 
     timer = PipelineTimer(run_id="intelligence_backfill",
                           mode="incremental" if scope else "full")
+
+    # EARLY EXIT: If scope is provided but has 0 affected works/members,
+    # skip all DB work entirely. No pools needed, no stages to run.
+    if scope and scope.get("affected_works", 0) == 0 and scope.get("affected_members", 0) == 0:
+        print("\n==============================================================", flush=True)
+        print(" SKIPPING: scope has 0 affected works and 0 affected members", flush=True)
+        print(" No intelligence backfill needed.", flush=True)
+        print("==============================================================", flush=True)
+        return
 
     try:
         # Use shared pools from db_pool module

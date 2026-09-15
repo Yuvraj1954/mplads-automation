@@ -7,3 +7,4 @@ __pycache__/
 migration/
 automation_delta/
 *.egg-info/
+.DS_Store
