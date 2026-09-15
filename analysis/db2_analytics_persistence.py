@@ -42,6 +42,63 @@ def _safe_int(val, default=0):
 
 
 # ============================================================
+# AUTHORITATIVE PERFORMANCE FORMULAS (single source of truth)
+# ============================================================
+# These are the ONLY definitions of the performance score and the
+# performance classification in GovSense. They are pure functions so
+# they can be imported by the analysis layer, the remediation script,
+# and tests without any divergence.
+#
+# Concept separation (do NOT mix):
+#   * performance_score / performance_classification -> outcome quality
+#   * anomaly_score / anomaly_level                  -> statistical unusualness
+#   * risk_level / risk_flags                        -> concrete work conditions
+#
+# Definition of performance_score:
+#   performance_score = completion_rate_pct + fund_utilization_pct
+#
+# Rationale for retaining this formula: both components are direct,
+# auditable MPLADS outcome measures (how much of the portfolio is
+# complete; how much of sanctioned money has been disbursed). It is a
+# heuristic 0-200 outcome index, NOT a statistically normalised score;
+# normalisation is deferred (see audit Phase 15) rather than replaced
+# with an arbitrary new formula. It is computed and persisted by the
+# pipeline from current values, so it can never go stale.
+PERFORMER_MIN = 160.0
+AVERAGE_MIN = 120.0
+NEEDS_ATTENTION_MIN = 80.0
+MIN_WORKS_FOR_CLASSIFICATION = 5
+
+PERFORMANCE_CLASSES = (
+    "PERFORMER",
+    "AVERAGE",
+    "NEEDS_ATTENTION",
+    "UNDERPERFORMER",
+    "NO_DATA",
+    "INSUFFICIENT_DATA",
+)
+
+
+def compute_performance_score(completion_rate_pct, fund_utilization_pct):
+    """Authoritative 0-200 performance score. Missing inputs count as 0."""
+    comp = _safe_float(completion_rate_pct, 0.0) or 0.0
+    util = _safe_float(fund_utilization_pct, 0.0) or 0.0
+    return round(comp + util, 2)
+
+
+def classify_performance_from_score(score):
+    """Authoritative performance band. Pure outcome quality, no anomaly."""
+    score = _safe_float(score, 0.0) or 0.0
+    if score >= PERFORMER_MIN:
+        return "PERFORMER"
+    if score >= AVERAGE_MIN:
+        return "AVERAGE"
+    if score >= NEEDS_ATTENTION_MIN:
+        return "NEEDS_ATTENTION"
+    return "UNDERPERFORMER"
+
+
+# ============================================================
 # STATISTICAL HELPERS
 # ============================================================
 # Used by compute_state_ranks to produce a sample-size-adjusted
@@ -322,16 +379,21 @@ def _member_to_record(m, anomaly_map, master_ctx):
         tenure_start = master.get("tenure_start_date")
         tenure_end = master.get("tenure_end_date")
 
-    # Work cost
-    avg_work_cost = None
-    median_work_cost = None
-    if m.sanctioned_amount and m.sanctioned_works and m.sanctioned_works > 0:
+    # Work cost — per-work sanction statistics from the aggregation layer.
+    # Fall back to the member-level ratio only when the per-work fields are
+    # absent (e.g. records built before these fields existed). Never fake a 0.
+    avg_work_cost = _safe_float(getattr(m, "avg_work_cost", None))
+    median_work_cost = _safe_float(getattr(m, "median_work_cost", None))
+    if avg_work_cost is None and m.sanctioned_amount and m.sanctioned_works and m.sanctioned_works > 0:
         avg_work_cost = round(m.sanctioned_amount / m.sanctioned_works, 2)
 
     # Fund utilization
     fund_util = 0
     if m.sanctioned_amount and m.sanctioned_amount > 0:
         fund_util = round((m.expenditure_amount / m.sanctioned_amount) * 100, 2)
+
+    # Authoritative performance score (outcome quality only).
+    perf_score = compute_performance_score(m.completion_rate_pct, fund_util)
 
     # Expenditure rate
     exp_rate = 0
@@ -396,6 +458,7 @@ def _member_to_record(m, anomaly_map, master_ctx):
         "low_sample_member": m.low_sample_member,
         "ranking_qualified": m.ranking_qualified,
         "performance_classification": perf_class,
+        "performance_score": perf_score,
         "rank": rank,
         "scale_score": None,
         "performance_score_weighted": None,
@@ -403,45 +466,27 @@ def _member_to_record(m, anomaly_map, master_ctx):
     }
 
 
-def _classify_member_performance(m, anomaly):
-    """Classify member performance into one of the 6 real buckets.
+def _classify_member_performance(m, anomaly=None):
+    """Classify member PERFORMANCE (outcome quality) into the 6 buckets.
 
-    Every member MUST fall into one of:
-        NO_DATA            — zero works / zero_work_member flag
-        INSUFFICIENT_DATA  — low_sample_member flag or total_works below threshold
-        PERFORMER          — comp >= 60 AND util >= 60
-        AVERAGE            — comp >= 40 (and not PERFORMER)
-        NEEDS_ATTENTION    — anomaly MEDIUM, OR score 80–119.99
-        UNDERPERFORMER     — anomaly HIGH, OR score < 80, OR comp < 40
+    IMPORTANT (Phase 1 — concept separation): the anomaly level no longer
+    overwrites the performance classification. A statistically unusual but
+    high-performing member keeps their performance label; anomaly is
+    represented independently in `anomaly_score` / `anomaly_level`.
 
-    There is intentionally no UNCLASSIFIED bucket — every member has a
-    home. Mirrors the 200-point classification bands used by the
-    frontend (PERFORMER_MIN=160, AVERAGE_MIN=120, NEEDS_ATTENTION_MIN=80)
-    so the pipeline and the frontend agree.
+    The `anomaly` argument is accepted for backward compatibility and is
+    intentionally ignored.
     """
     total = m.total_works or 0
     if m.zero_work_member or total == 0:
         return "NO_DATA"
-    if m.low_sample_member or total < 5:
+    if m.low_sample_member or total < MIN_WORKS_FOR_CLASSIFICATION:
         return "INSUFFICIENT_DATA"
 
-    if anomaly:
-        if anomaly.anomaly_level == "HIGH":
-            return "UNDERPERFORMER"
-        if anomaly.anomaly_level == "MEDIUM":
-            return "NEEDS_ATTENTION"
-
-    comp = m.completion_rate_pct or 0
-    util = m.expenditure_sanction_utilization_pct or 0
-    score = comp + util
-
-    if score >= 160:
-        return "PERFORMER"
-    if score >= 120:
-        return "AVERAGE"
-    if score >= 80:
-        return "NEEDS_ATTENTION"
-    return "UNDERPERFORMER"
+    score = compute_performance_score(
+        m.completion_rate_pct, m.expenditure_sanction_utilization_pct
+    )
+    return classify_performance_from_score(score)
 
 
 # ============================================================
@@ -508,6 +553,7 @@ def _state_to_record(s, anomaly_map, state_member_counts, allocated_amount=0.0):
         exp_rate = round((s.expenditure_amount / s.recommended_amount) * 100, 2)
 
     perf_class = _classify_state_performance(s, anomaly)
+    perf_score = compute_performance_score(s.completion_rate_pct, fund_util)
 
     return {
         "state_id": s.state_id,
@@ -532,8 +578,8 @@ def _state_to_record(s, anomaly_map, state_member_counts, allocated_amount=0.0):
         "unspent_amount": _safe_float(s.sanctioned_amount - s.expenditure_amount, 0),
         "fund_utilization_pct": fund_util,
         "expenditure_rate_pct": exp_rate,
-        "avg_work_cost": None,
-        "median_work_cost": None,
+        "avg_work_cost": _safe_float(getattr(s, "avg_work_cost", None)),
+        "median_work_cost": _safe_float(getattr(s, "median_work_cost", None)),
         "avg_sanction_delay_days": s.avg_sanction_delay_days,
         "median_sanction_delay_days": s.median_sanction_delay_days,
         "avg_execution_days": s.avg_execution_days,
@@ -550,6 +596,7 @@ def _state_to_record(s, anomaly_map, state_member_counts, allocated_amount=0.0):
         "anomaly_level": anomaly.anomaly_level if anomaly else "NORMAL",
         "confidence_level": anomaly.confidence_level if anomaly else "LOW",
         "performance_classification": perf_class,
+        "performance_score": perf_score,
         "rank": None,
         "scale_score": None,
         "performance_score_weighted": None,
@@ -557,35 +604,20 @@ def _state_to_record(s, anomaly_map, state_member_counts, allocated_amount=0.0):
     }
 
 
-def _classify_state_performance(s, anomaly):
-    """Classify state performance into one of the real buckets.
+def _classify_state_performance(s, anomaly=None):
+    """Classify state PERFORMANCE (outcome quality).
 
-    Every state MUST fall into one of: PERFORMER, AVERAGE,
-    NEEDS_ATTENTION, UNDERPERFORMER, or INSUFFICIENT_DATA.
-
-    Mirrors the 200-point bands (160/120/80) used by the frontend
-    classify_from_score so pipeline and frontend agree.
+    Phase 1 — the anomaly level does NOT overwrite the performance label.
+    The `anomaly` argument is accepted for backward compatibility and
+    intentionally ignored.
     """
     if not s.ranking_qualified:
         return "INSUFFICIENT_DATA"
 
-    if anomaly:
-        if anomaly.anomaly_level == "HIGH":
-            return "UNDERPERFORMER"
-        if anomaly.anomaly_level == "MEDIUM":
-            return "NEEDS_ATTENTION"
-
-    comp = s.completion_rate_pct or 0
-    util = s.expenditure_utilization_pct or 0
-    score = comp + util
-
-    if score >= 160:
-        return "PERFORMER"
-    if score >= 120:
-        return "AVERAGE"
-    if score >= 80:
-        return "NEEDS_ATTENTION"
-    return "UNDERPERFORMER"
+    score = compute_performance_score(
+        s.completion_rate_pct, s.expenditure_utilization_pct
+    )
+    return classify_performance_from_score(score)
 
 
 # ============================================================
@@ -731,27 +763,49 @@ def compute_member_ranks(member_records):
     the same rank; the next rank skips (1, 2, 2, 4). Deterministic via
     stable secondary sort on (member_id, member_type).
     """
+    # Phase 2 — rank within member_type. Lok Sabha (MP) and Rajya Sabha (MLA,
+    # the pipeline's internal name) are different representative bodies and
+    # must not share a ranking population. Previously the populations were
+    # mixed, so no MP could ever hold rank 1 and an MP's "national rank"
+    # depended on Rajya Sabha scores.
     qualified = [r for r in member_records if r.get("ranking_qualified")]
     non_qualified = [r for r in member_records if not r.get("ranking_qualified")]
 
-    if not qualified:
-        for r in member_records:
-            r["rank"] = None
-            r["scale_score"] = None
-            r["performance_score_weighted"] = None
-        return member_records
+    for r in non_qualified:
+        r["rank"] = None
+        r["scale_score"] = None
+        r["performance_score_weighted"] = None
 
-    # --- Percentile rank of total_works across qualified members ---
-    n_q = len(qualified)
-    tw_sorted = sorted(_safe_int(r.get("total_works")) for r in qualified)
+    groups = {}
     for r in qualified:
+        groups.setdefault(r.get("member_type") or "UNKNOWN", []).append(r)
+
+    for group in groups.values():
+        _rank_within_group(group, id_key="member_id")
+
+    return member_records
+
+
+def _rank_within_group(group, id_key):
+    """Assign scale_score, performance_score_weighted and competition rank
+    within a single population (one member_type, or all states).
+
+    Invariant enforced by construction: if weighted(A) > weighted(B) then
+    rank(A) is not worse than rank(B). Ties share a rank and the next rank
+    skips (1, 2, 2, 4), so rank ordering is always consistent with the
+    weighted score ordering.
+    """
+    n_q = len(group)
+    if n_q == 0:
+        return
+    tw_sorted = sorted(_safe_int(r.get("total_works")) for r in group)
+    for r in group:
         tw = _safe_int(r.get("total_works"))
         below = sum(1 for v in tw_sorted if v < tw)
         at = sum(1 for v in tw_sorted if v == tw)
         r["scale_score"] = round((below + 0.5 * at) / n_q * 100.0, 2)
 
-    # --- Weighted performance score (40 / 40 / 20) ---
-    for r in qualified:
+    for r in group:
         comp = _safe_float(r.get("completion_rate_pct"), 0.0) or 0.0
         util = _safe_float(r.get("fund_utilization_pct"), 0.0) or 0.0
         scale = r.get("scale_score") or 0.0
@@ -759,14 +813,9 @@ def compute_member_ranks(member_records):
             comp * 0.40 + util * 0.40 + scale * 0.20, 2
         )
 
-    # --- Rank by performance_score_weighted, descending (competition ranking) ---
     sorted_q = sorted(
-        qualified,
-        key=lambda r: (
-            -(r.get("performance_score_weighted") or 0),
-            r.get("member_type") or "",
-            r.get("member_id") or 0,
-        ),
+        group,
+        key=lambda r: (-(r.get("performance_score_weighted") or 0), r.get(id_key) or 0),
     )
     last_score = None
     last_rank = 0
@@ -778,13 +827,6 @@ def compute_member_ranks(member_records):
             r["rank"] = i
             last_rank = i
             last_score = score
-
-    for r in non_qualified:
-        r["rank"] = None
-        r["scale_score"] = None
-        r["performance_score_weighted"] = None
-
-    return member_records
 
 
 def compute_state_ranks(state_records):
@@ -828,53 +870,12 @@ def compute_state_ranks(state_records):
     qualifying = [r for r in state_records if _has_all_three(r)]
     non_qualifying = [r for r in state_records if r not in qualifying]
 
-    if not qualifying:
-        for r in state_records:
-            r["rank"] = None
-            r["scale_score"] = None
-            r["performance_score_weighted"] = None
-        return state_records
-
-    # --- Percentile rank of total_works across qualifying states ---
-    # Midrank: (count_below + 0.5 * count_equal) / n * 100
-    n_q = len(qualifying)
-    tw_values = [_safe_int(r.get("total_works")) for r in qualifying]
-    tw_sorted = sorted(tw_values)
-    for r in qualifying:
-        tw = _safe_int(r.get("total_works"))
-        below = sum(1 for v in tw_sorted if v < tw)
-        at = sum(1 for v in tw_sorted if v == tw)
-        r["scale_score"] = round((below + 0.5 * at) / n_q * 100.0, 2)
-
-    # --- Weighted performance score (40 / 40 / 20) ---
-    for r in qualifying:
-        comp = _safe_float(r.get("completion_rate_pct"), 0.0) or 0.0
-        util = _safe_float(r.get("fund_utilization_pct"), 0.0) or 0.0
-        scale = r.get("scale_score") or 0.0
-        r["performance_score_weighted"] = round(
-            comp * 0.40 + util * 0.40 + scale * 0.20, 2
-        )
-
-    # --- Rank by performance_score_weighted, descending (competition ranking) ---
-    # Stable sort so equal scores have deterministic ordering by state_id.
-    sorted_q = sorted(
-        qualifying,
-        key=lambda r: (-(r.get("performance_score_weighted") or 0), r.get("state_id")),
-    )
-    last_score = None
-    last_rank = 0
-    for i, r in enumerate(sorted_q, 1):
-        score = r.get("performance_score_weighted")
-        if last_score is not None and score == last_score:
-            r["rank"] = last_rank  # tie
-        else:
-            r["rank"] = i
-            last_rank = i
-            last_score = score
-
     for r in non_qualifying:
         r["rank"] = None
         r["scale_score"] = None
         r["performance_score_weighted"] = None
+
+    if qualifying:
+        _rank_within_group(qualifying, id_key="state_id")
 
     return state_records

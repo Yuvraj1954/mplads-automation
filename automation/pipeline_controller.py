@@ -27,6 +27,7 @@ Design principles:
     - Python bridges DB1 read → calculation → DB2 write
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -163,6 +164,180 @@ def load_table(url, key, table, select="*", filters=None):
             break
         offset += 1000
     return all_rows
+
+
+def recompute_all_ranks(db2_url, db2_key):
+    """Recompute rank/scale_score/performance_score_weighted for the WHOLE
+    member_metrics and state_metrics tables.
+
+    Phase 2 optimized: Uses SQL window functions when asyncpg is available,
+    falls back to Python computation otherwise.
+
+    The SQL approach:
+    - Computes RANK() and PERCENT_RANK() in a single pass per member_type
+    - No data transfer to Python — all computation in Postgres
+    - Writes only the 3 ranking columns via UPDATE ... FROM subquery
+
+    Only the three ranking columns are written; raw metrics are untouched.
+    """
+    try:
+        import asyncpg
+        import os
+        return _recompute_all_ranks_sql(db2_url)
+    except (ImportError, Exception) as e:
+        print(f"  SQL ranking unavailable ({e}), falling back to Python")
+        return _recompute_all_ranks_python(db2_url, db2_key)
+
+
+def _recompute_all_ranks_sql(db2_url):
+    """SQL-based ranking using Postgres window functions.
+
+    Single SQL pass per member_type for members, single pass for states.
+    No data transfer to Python — all computation in Postgres.
+    """
+    import asyncio
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=db2_url, min_size=1, max_size=2,
+                                          statement_cache_size=0, command_timeout=120)
+        try:
+            async with pool.acquire() as conn:
+                # Member ranking: RANK() + PERCENT_RANK() within each member_type
+                # scale_score = 40 * completion_rate_pct/100 + 40 * fund_utilization_pct/100 + 20 * rank_pct
+                await conn.execute("""
+                    WITH ranked AS (
+                        SELECT
+                            member_id,
+                            member_type,
+                            RANK() OVER (
+                                PARTITION BY member_type
+                                ORDER BY performance_score_weighted DESC NULLS LAST
+                            ) AS new_rank,
+                            PERCENT_RANK() OVER (
+                                PARTITION BY member_type
+                                ORDER BY performance_score_weighted DESC NULLS LAST
+                            ) AS rank_pct
+                        FROM member_metrics
+                        WHERE performance_score_weighted IS NOT NULL
+                          AND ranking_qualified = true
+                    )
+                    UPDATE member_metrics m
+                    SET
+                        rank = r.new_rank,
+                        scale_score = ROUND(
+                            40.0 * COALESCE(m.completion_rate_pct, 0) / 100.0
+                            + 40.0 * COALESCE(m.fund_utilization_pct, 0) / 100.0
+                            + 20.0 * (1.0 - r.rank_pct),
+                            2
+                        )
+                    FROM ranked r
+                    WHERE m.member_id = r.member_id
+                      AND m.member_type = r.member_type
+                """)
+                member_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM member_metrics WHERE rank IS NOT NULL"
+                )
+                print(f"  SQL member ranking: {member_count} rows updated")
+
+                # State ranking
+                await conn.execute("""
+                    WITH ranked AS (
+                        SELECT
+                            state_id,
+                            RANK() OVER (
+                                ORDER BY performance_score_weighted DESC NULLS LAST
+                            ) AS new_rank,
+                            PERCENT_RANK() OVER (
+                                ORDER BY performance_score_weighted DESC NULLS LAST
+                            ) AS rank_pct
+                        FROM state_metrics
+                        WHERE performance_score_weighted IS NOT NULL
+                    )
+                    UPDATE state_metrics s
+                    SET
+                        rank = r.new_rank,
+                        scale_score = ROUND(
+                            40.0 * COALESCE(s.completion_rate_pct, 0) / 100.0
+                            + 40.0 * COALESCE(s.fund_utilization_pct, 0) / 100.0
+                            + 20.0 * (1.0 - r.rank_pct),
+                            2
+                        )
+                    FROM ranked r
+                    WHERE s.state_id = r.state_id
+                """)
+                state_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM state_metrics WHERE rank IS NOT NULL"
+                )
+                print(f"  SQL state ranking: {state_count} rows updated")
+
+        finally:
+            await pool.close()
+
+    try:
+        # Check if we're already inside an async context
+        try:
+            loop = asyncio.get_running_loop()
+            # We're inside an async function — run in a thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, _run())
+                future.result(timeout=120)
+        except RuntimeError:
+            # No running loop — safe to use asyncio.run directly
+            asyncio.run(_run())
+    except Exception as e:
+        print(f"  WARNING: SQL ranking failed ({e}), falling back to Python")
+        _recompute_all_ranks_python(db2_url, None)
+
+
+def _recompute_all_ranks_python(db2_url, db2_key):
+    """Python-based ranking fallback (original implementation)."""
+    from analysis.db2_analytics_persistence import (
+        compute_member_ranks,
+        compute_state_ranks,
+    )
+
+    member_cols = (
+        "member_id,member_type,total_works,completion_rate_pct,"
+        "fund_utilization_pct,ranking_qualified"
+    )
+    members = load_table(db2_url, db2_key, "member_metrics", select=member_cols)
+    if members:
+        compute_member_ranks(members)
+        payload = [
+            {
+                "member_id": r["member_id"],
+                "member_type": r["member_type"],
+                "rank": r.get("rank"),
+                "scale_score": r.get("scale_score"),
+                "performance_score_weighted": r.get("performance_score_weighted"),
+            }
+            for r in members
+        ]
+        for start in range(0, len(payload), 200):
+            sb_upsert(db2_url, db2_key, "member_metrics",
+                      payload[start:start + 200],
+                      conflict_cols=["member_id", "member_type"])
+        print(f"  Re-ranked {len(payload)} member rows across all populations")
+
+    state_cols = (
+        "state_id,total_works,completion_rate_pct,fund_utilization_pct"
+    )
+    states = load_table(db2_url, db2_key, "state_metrics", select=state_cols)
+    if states:
+        compute_state_ranks(states)
+        payload = [
+            {
+                "state_id": r["state_id"],
+                "rank": r.get("rank"),
+                "scale_score": r.get("scale_score"),
+                "performance_score_weighted": r.get("performance_score_weighted"),
+            }
+            for r in states
+        ]
+        sb_upsert(db2_url, db2_key, "state_metrics", payload,
+                  conflict_cols=["state_id"])
+        print(f"  Re-ranked {len(payload)} state rows")
 
 
 # ============================================================
@@ -443,14 +618,22 @@ def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
         if not m.state_name and m.state_id:
             m.state_name = state_name_map.get(m.state_id)
 
-    # APPENDED: attach authoritative master-population records (allocated_amount,
-    # state_name, house/tenure) to work-bearing members. The affected path skips
-    # zero-work injection, so without this allocation/identity would be 0/NULL.
+    # Phase 4: inject the authoritative zero-work master population in
+    # affected mode too, exactly as the full path does. Without this,
+    # pipeline.member_metrics only contains work-bearing members and
+    # build_overall_metrics would overwrite overall_metrics.total_members
+    # with the work-bearing count (the observed population mismatch).
     try:
-        from analysis.zero_work_members import attach_master_records
-        attach_master_records(pipeline.member_metrics, snapshot_dir)
+        from analysis.zero_work_members import inject_zero_work_members
+        pipeline.member_metrics = inject_zero_work_members(
+            pipeline.member_metrics,
+            snapshot_dir,
+            state_metrics_by_id={s.state_id: s for s in pipeline.state_metrics},
+            works=works,
+        )
+        print(f"  Total members (after injection): {len(pipeline.member_metrics)}")
     except Exception as _e:
-        print(f"  [warn] master record attach skipped: {_e}")
+        print(f"  [warn] zero-work injection skipped: {_e}")
 
     # Filter work_analyses to affected works only
     affected_work_ids = affected_result.get("affected_work_ids", set())
@@ -887,6 +1070,13 @@ def stage_analytics_persist(pipeline_result, anomaly_result):
               conflict_cols=["state_id"])
     written += len(states)
 
+    # Phase 2: re-rank the full tables from DB values so any rows not in the
+    # current in-memory population (e.g. legacy rows) are also consistent.
+    try:
+        recompute_all_ranks(db2_url, db2_key)
+    except Exception as _e:
+        print(f"  WARNING: full re-rank skipped: {_e}")
+
     # National statistics (delete old + insert new for each scope)
     for scope in ("BOTH", "MP", "MLA", None):
         scope_stats = [s for s in stats if s.get("scope") == scope]
@@ -1197,6 +1387,14 @@ def stage_analytics_persist_affected(pipeline_result, anomaly_result, affected_r
     sb_upsert(db2_url, db2_key, "state_metrics", states,
               conflict_cols=["state_id"])
     written += len(states)
+
+    # Phase 2: after writing the affected subset, re-rank the FULL tables so
+    # affected and untouched rows share one consistent ranking population.
+    # Fail-safe: a ranking refresh error must not abort the persist stage.
+    try:
+        recompute_all_ranks(db2_url, db2_key)
+    except Exception as _e:
+        print(f"  WARNING: full re-rank skipped: {_e}")
 
     for scope in ("BOTH", "MP", "MLA", None):
         scope_stats = [s for s in stats if s.get("scope") == scope]

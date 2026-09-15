@@ -1615,8 +1615,8 @@ class TestDB2AnalyticsPersistence:
         assert ranks_a == ranks_b
 
     def test_compute_member_ranks_ties(self):
-        """Two members with identical inputs get the same rank; next rank
-        skips (competition ranking)."""
+        """Ranking is per member_type (Phase 2). Within a population ties
+        share a rank and the next rank skips (competition ranking)."""
         from analysis.db2_analytics_persistence import compute_member_ranks
         records = [
             {"member_id": 1, "member_type": "MP", "ranking_qualified": True,
@@ -1631,9 +1631,36 @@ class TestDB2AnalyticsPersistence:
         ]
         compute_member_ranks(records)
         ranks = {r["member_id"]: r["rank"] for r in records}
+        # MP population: id1 rank 1, id3 rank 2. MLA population: id2 rank 1.
         assert ranks[1] == 1
         assert ranks[2] == 1
-        assert ranks[3] == 3
+        assert ranks[3] == 2
+
+    def test_compute_member_ranks_per_type_populations(self):
+        """Lok Sabha and Rajya Sabha are ranked independently."""
+        from analysis.db2_analytics_persistence import compute_member_ranks
+        records = [
+            {"member_id": 10, "member_type": "MP", "ranking_qualified": True,
+             "completion_rate_pct": 40.0, "fund_utilization_pct": 40.0, "total_works": 10},
+            {"member_id": 20, "member_type": "MLA", "ranking_qualified": True,
+             "completion_rate_pct": 99.0, "fund_utilization_pct": 99.0, "total_works": 500},
+        ]
+        compute_member_ranks(records)
+        assert records[0]["rank"] == 1  # best MP
+        assert records[1]["rank"] == 1  # best MLA
+
+    def test_classify_member_performance_ignores_anomaly(self):
+        """Anomaly must NOT overwrite the performance classification."""
+        from analysis.db2_analytics_persistence import _classify_member_performance
+        class _M:
+            total_works = 100
+            zero_work_member = False
+            low_sample_member = False
+            completion_rate_pct = 90.0
+            expenditure_sanction_utilization_pct = 90.0
+        class _A:
+            anomaly_level = "HIGH"
+        assert _classify_member_performance(_M(), _A()) == "PERFORMER"
 
     def test_classify_member_performance_no_unclassified(self):
         """Every member must fall into one of the 6 real buckets.

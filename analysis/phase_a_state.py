@@ -96,6 +96,13 @@ def _aggregate_state(state_id, works, member_metrics_by_id,
 
     m.risk_rate_pct = _pct(m.flagged_works, m.total_works)
 
+    # Per-work sanction cost statistics (see MemberMetrics). None when no
+    # work in the state has a positive sanction amount.
+    work_costs = [float(w.sanction_amount) for w in works
+                  if w.sanction_amount is not None and w.sanction_amount > 0]
+    m.avg_work_cost = _mean(work_costs)
+    m.median_work_cost = _median(work_costs)
+
     m.cost_anomaly_works = sum(
         1 for w in works
         if w.cost_status in ("VERY_HIGH", "HIGH")

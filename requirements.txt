@@ -2,3 +2,4 @@ requests
 python-dotenv
 supabase
 numpy
+asyncpg

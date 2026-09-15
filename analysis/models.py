@@ -197,6 +197,10 @@ class MemberMetrics:
     sanction_conversion_pct: float = 0
     expenditure_sanction_utilization_pct: float = 0
     expenditure_recommendation_pct: float = 0
+    # Per-work sanction cost statistics (populated from work_analysis,
+    # not from a member-level ratio). None when no work has a sanction amount.
+    avg_work_cost: Optional[float] = None
+    median_work_cost: Optional[float] = None
     zero_work_member: bool = False
     low_sample_member: bool = False
     ranking_qualified: bool = False
@@ -238,6 +242,9 @@ class StateMetrics:
     expenditure_over_recommendation_works: int = 0
     negative_execution_works: int = 0
     negative_sanction_delay_works: int = 0
+    # Per-work sanction cost statistics (see MemberMetrics).
+    avg_work_cost: Optional[float] = None
+    median_work_cost: Optional[float] = None
     ranking_qualified: bool = False
 
 

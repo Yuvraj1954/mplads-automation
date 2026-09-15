@@ -218,15 +218,18 @@ def inject_zero_work_members(member_metrics, snapshot_dir,
 
     # Build member name → (member_type, member_id) mapping from works
     # This allows matching master population members to work-derived metrics
-    work_member_names = {}  # name → (member_type, member_id)
+    # Keyed by (member_type, name) so an MP and a Rajya Sabha member with the
+    # same name can never collide (Phase 3 identity correctness).
+    work_member_names = {}  # (member_type, name) -> (member_type, member_id)
     if works:
         for w in works:
             mp_name = w.get("mp_name", "")
             if mp_name:
                 member_type = w.get("member_type", "MP")
                 member_id = w.get("member_id")
-                if mp_name not in work_member_names:
-                    work_member_names[mp_name] = (member_type, member_id)
+                key = (member_type, mp_name)
+                if key not in work_member_names:
+                    work_member_names[key] = (member_type, member_id)
 
     # Build existing member IDs set
     existing_ids = {(m.member_type, m.member_id) for m in member_metrics}
@@ -254,19 +257,29 @@ def inject_zero_work_members(member_metrics, snapshot_dir,
 
     # Build member name → ID mapping for zero-work members
     # Use existing IDs where members match by name
-    name_to_id = {}
-    next_id = max((m.member_id for m in member_metrics), default=0) + 1
+    # Separate id spaces per member_type so new zero-work MP ids never spill
+    # into the Rajya Sabha id space (>=100000) and vice versa.
+    def _max_id_for(mt):
+        return max((m.member_id for m in member_metrics
+                    if m.member_type == mt), default=0)
 
+    next_id = {
+        "MP": _max_id_for("MP") + 1,
+        "MLA": max(_max_id_for("MLA") + 1, 100000),
+    }
+
+    name_to_id = {}
     # First, map work-derived member names to their IDs
-    for name, (mt, mid) in work_member_names.items():
-        name_to_id[name] = mid
+    for (mt, name), (_mt, mid) in work_member_names.items():
+        name_to_id[(mt, name)] = mid
 
     # Then, assign new IDs to zero-work members not in works
     for record in master["all_records"]:
-        name = record["member_name"]
-        if name not in name_to_id:
-            name_to_id[name] = next_id
-            next_id += 1
+        mt = record["member_type"]
+        key = (mt, record["member_name"])
+        if key not in name_to_id:
+            name_to_id[key] = next_id[mt]
+            next_id[mt] += 1
 
     # Create zero-work MemberMetrics
     zero_work_members = []
@@ -277,13 +290,14 @@ def inject_zero_work_members(member_metrics, snapshot_dir,
 
         # Check if member already exists in work-derived metrics
         # Match by name -> work_member_names mapping
-        if member_name in work_member_names:
-            mapped_type, mapped_id = work_member_names[member_name]
+        wk_key = (member_type, member_name)
+        if wk_key in work_member_names:
+            mapped_type, mapped_id = work_member_names[wk_key]
             if (mapped_type, mapped_id) in existing_ids:
                 continue
 
-        # Assign member_id
-        member_id = name_to_id[member_name]
+        # Assign member_id (typed name map)
+        member_id = name_to_id[wk_key]
 
         # Get state_id
         state_name = record.get("state_name", "")

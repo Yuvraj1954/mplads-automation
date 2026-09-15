@@ -137,6 +137,14 @@ def _aggregate_member(member_id, member_type, works):
         and w.status != "Completed"
     )
 
+    # Per-work sanction cost statistics. Computed from individual works with a
+    # positive sanction amount — NOT from a member-level ratio. None when the
+    # member has no sanctioned work (so the DB stores NULL, not a fake 0).
+    work_costs = [float(w.sanction_amount) for w in works
+                  if w.sanction_amount is not None and w.sanction_amount > 0]
+    m.avg_work_cost = _mean(work_costs)
+    m.median_work_cost = _median(work_costs)
+
     cost_pcts = [w.cost_percentile for w in works
                  if w.cost_percentile is not None]
     m.avg_cost_percentile = _mean(cost_pcts)

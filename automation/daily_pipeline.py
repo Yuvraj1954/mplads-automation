@@ -17,6 +17,7 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parent.parent
 FETCHER = ROOT / "fetcher" / "fetcher.py"
 COMPARATOR = ROOT / "comparator" / "comparator_v2.py"
+INTELLIGENCE_BACKFILL = ROOT / "automation" / "intelligence_backfill.py"
 
 sys.path.insert(0, str(ROOT))
 from automation.snapshot_cache import (
@@ -30,6 +31,7 @@ from automation.snapshot_cache import (
     write_metadata,
     METADATA_FILE,
 )
+from automation.observability import PipelineTimer, StageMetrics
 
 BUCKET = "mplads-raw"
 DATASETS = [
@@ -683,6 +685,8 @@ def main():
                              "(skips comparator, processes full snapshot)")
     parser.add_argument("--local-only", action="store_true",
                         help="Fetch locally only, skip Supabase Storage upload")
+    parser.add_argument("--skip-intelligence", action="store_true",
+                        help="Skip the intelligence/ML backfill stage")
     args = parser.parse_args()
 
     pipeline_start = _timer()
@@ -1082,7 +1086,64 @@ def main():
             f"Analysis pipeline failed: {analysis_result.get('error', 'unknown')}"
         )
 
-    print("=== STEP 9: CLEANUP ===")
+    print("=== STEP 9: INTELLIGENCE BACKFILL ===")
+    t_intelligence = _timer()
+    if args.skip_intelligence:
+        print("Skipping intelligence backfill (--skip-intelligence)")
+        timing["intelligence"] = 0.0
+    else:
+        if not INTELLIGENCE_BACKFILL.exists():
+            raise RuntimeError(f"Intelligence backfill not found: {INTELLIGENCE_BACKFILL}")
+
+        # Build AffectedScope for intelligence stage
+        scope_file = None
+        if total_changes > 0 and workdir.exists():
+            try:
+                from analysis.affected_scope import build_affected_scope_from_delta
+                delta_records = []
+                for dataset_dir in workdir.iterdir():
+                    if not dataset_dir.is_dir():
+                        continue
+                    for part_file in dataset_dir.glob("*_part_*.ndjson"):
+                        with open(part_file) as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        rec = json.loads(line)
+                                        rec["_table"] = dataset_dir.name
+                                        delta_records.append(rec)
+                                    except json.JSONDecodeError:
+                                        pass
+                changed_tables = {r.get("_table") for r in delta_records if r.get("_table")}
+                scope = build_affected_scope_from_delta(delta_records, changed_tables)
+                scope_file = str(workdir / "affected_scope.json")
+                with open(scope_file, "w") as f:
+                    json.dump(scope.summary(), f)
+                print(f"  AffectedScope: {scope.affected_work_count} works, "
+                      f"{len(changed_tables)} tables changed")
+            except Exception as exc:
+                print(f"  WARNING: Could not build AffectedScope: {exc}")
+
+        intelligence_cmd = [sys.executable, str(INTELLIGENCE_BACKFILL), "--apply"]
+        if scope_file:
+            intelligence_cmd.extend(["--scope", scope_file])
+        try:
+            run(intelligence_cmd)
+            timing["intelligence"] = _elapsed(t_intelligence)
+            print(f"Intelligence backfill completed in {timing['intelligence']:.1f}s")
+        except Exception as exc:
+            # Fail-safe: ML stage must not undo a successful core pipeline run.
+            # Surface the error clearly so operators can retry/backfill manually,
+            # but preserve the freshly ingested source data and analytics.
+            elapsed = _elapsed(t_intelligence)
+            print(f"WARNING: Intelligence backfill failed after {elapsed:.1f}s: {exc}",
+                  file=sys.stderr)
+            print("Core pipeline succeeded. Intelligence fields may be stale until "
+                  "the backfill is re-run manually.", file=sys.stderr)
+            timing["intelligence"] = elapsed
+
+    print("=== STEP 10: CLEANUP ===")
     t_cleanup = _timer()
     delete_delta_run(run_id)
     delete_old_raw_snapshots([new_ts])
