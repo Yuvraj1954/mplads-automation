@@ -613,52 +613,61 @@ def _print_timing(timing, pipeline_start):
 
 
 def _ensure_state_metrics_columns():
-    """Idempotently add the 40/40/20 ranking columns to state_metrics.
+    """Verify state_metrics ranking columns exist on DB2 via Supabase REST.
 
-    Mirrors migration/2026_09_12_state_rank_40_40_20.sql. Runs on every
-    pipeline start; ADD COLUMN IF NOT EXISTS makes it a no-op once the
-    columns exist. Failure is logged but never raised, since the columns
-    may already exist under a slightly different shape or be denied to
-    the role we have.
+    state_metrics is a DB2 table. Uses DB2_URL / DB2_SERVICE_ROLE_KEY.
+    If the columns are missing, the operator must run the migration SQL
+    in the DB2 Supabase SQL Editor.
     """
-    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    db2_url = os.environ.get("DB2_URL", "")
+    db2_key = os.environ.get("DB2_SERVICE_ROLE_KEY", "") or os.environ.get("DB2_SECRET_KEY", "")
+    if not db2_url or not db2_key:
+        print("  state_metrics check: SKIPPED (no DB2_URL / DB2_SERVICE_ROLE_KEY)")
+        return
+    sb_db2 = create_client(db2_url, db2_key)
     expected = ("scale_score", "performance_score_weighted")
     try:
-        rows = sb_local.table("state_metrics").select(
+        rows = sb_db2.table("state_metrics").select(
             "state_id," + ",".join(expected)
         ).limit(1).execute().data
         present = set(rows[0].keys()) if rows else set()
         missing = [c for c in expected if c not in present]
         if not missing:
+            print("  state_metrics ranking columns: VERIFIED")
             return
-        # PostgREST schema cache shows missing columns; the actual table may
-        # already have them. Probe with a tiny insert/update to confirm.
-        # If truly missing, we cannot ALTER via the REST API — the migration
-        # SQL in migration/2026_09_12_state_rank_40_40_20.sql must be run
-        # by the operator. Log a clear warning.
         print(
             f"  WARNING: state_metrics columns missing in schema cache: {missing}. "
             f"Run migration/2026_09_12_state_rank_40_40_20.sql in the DB2 "
             f"Supabase SQL editor once, then re-run the pipeline."
         )
     except Exception as exc:
-        print(f"  WARNING: could not verify state_metrics columns: {exc}")
+        msg = str(exc)
+        if "PGRST205" in msg or "does not exist" in msg.lower():
+            print("  WARNING: state_metrics table not found on DB2 — run DB2 migration first")
+        else:
+            print(f"  WARNING: could not verify state_metrics columns: {exc}")
 
 
 def _ensure_member_metrics_columns():
-    """Idempotently add the 40/40/20 ranking columns to member_metrics.
+    """Verify member_metrics ranking columns exist on DB2 via Supabase REST.
 
-    Mirrors migration/2026_09_12_member_rank_40_40_20.sql.
+    member_metrics is a DB2 table. Uses DB2_URL / DB2_SERVICE_ROLE_KEY.
     """
-    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    db2_url = os.environ.get("DB2_URL", "")
+    db2_key = os.environ.get("DB2_SERVICE_ROLE_KEY", "") or os.environ.get("DB2_SECRET_KEY", "")
+    if not db2_url or not db2_key:
+        print("  member_metrics check: SKIPPED (no DB2_URL / DB2_SERVICE_ROLE_KEY)")
+        return
+    sb_db2 = create_client(db2_url, db2_key)
     expected = ("scale_score", "performance_score_weighted")
     try:
-        rows = sb_local.table("member_metrics").select(
+        rows = sb_db2.table("member_metrics").select(
             "member_id," + ",".join(expected)
         ).limit(1).execute().data
         present = set(rows[0].keys()) if rows else set()
         missing = [c for c in expected if c not in present]
         if not missing:
+            print("  member_metrics ranking columns: VERIFIED")
             return
         print(
             f"  WARNING: member_metrics columns missing in schema cache: {missing}. "
@@ -666,7 +675,11 @@ def _ensure_member_metrics_columns():
             f"Supabase SQL editor once, then re-run the pipeline."
         )
     except Exception as exc:
-        print(f"  WARNING: could not verify member_metrics columns: {exc}")
+        msg = str(exc)
+        if "PGRST205" in msg or "does not exist" in msg.lower():
+            print("  WARNING: member_metrics table not found on DB2 — run DB2 migration first")
+        else:
+            print(f"  WARNING: could not verify member_metrics columns: {exc}")
 
 
 _CREATE_WORK_ANALYSIS_SQL = """
@@ -1053,94 +1066,51 @@ ORDER BY fy_start, member_type;
 
 
 def _ensure_category_fy_views():
-    """Ensure category_metrics and fy_metrics SQL VIEWs exist in DB1.
+    """Verify category_metrics and fy_metrics VIEWs exist on DB1 via REST.
 
-    These are LIVE views over work_analysis + mla_work_analysis that
-    auto-update when the pipeline writes to underlying tables. They are
-    defined in migration/2026_09_14_category_fy_views.sql and must exist
-    for the frontend to query category and fiscal-year analytics.
+    These are DB1 VIEWs over work_analysis + mla_work_analysis that
+    auto-refresh. Schema DDL is handled by migrations (not the daily pipeline).
+    GitHub Actions runners cannot reach port 5432, so asyncpg DDL is not used.
     """
-    import asyncio, asyncpg
-
-    db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
-    if not db1_url:
-        print("  WARNING: cannot verify category_metrics/fy_views — no DATABASE_URL / NEW_DB1_URL")
-        return
-
-    async def _exec():
-        conn = await asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    for view_name in ("category_metrics", "fy_metrics"):
         try:
-            for view_name in ("category_metrics", "fy_metrics"):
-                exists = await conn.fetchval(
-                    "SELECT EXISTS(SELECT 1 FROM information_schema.views "
-                    "WHERE table_schema='public' AND table_name=$1)",
-                    view_name,
+            sb_local.table(view_name).select("*", count="exact").limit(0).execute()
+            print(f"  {view_name} view: ACCESSIBLE")
+        except Exception as exc:
+            msg = str(exc)
+            if "PGRST205" in msg or "does not exist" in msg.lower():
+                print(
+                    f"  WARNING: {view_name} view not found on DB1 — "
+                    f"run migration/2026_09_14_category_fy_views.sql manually"
                 )
-                if exists:
-                    print(f"  {view_name} view: EXISTS")
-                else:
-                    print(f"  {view_name} view: MISSING — creating now ...")
-                    await conn.execute(_CREATE_CATEGORY_FY_VIEWS_SQL)
-                    print(f"  {view_name} view: CREATED")
-                    break  # Both views created in one statement
-        finally:
-            await conn.close()
-
-    try:
-        asyncio.run(_exec())
-    except Exception as exc:
-        print(f"  WARNING: could not verify/create category_metrics/fy_views: {exc}")
-        print("  If this persists, run migration/2026_09_14_category_fy_views.sql manually")
+            else:
+                print(f"  WARNING: could not verify {view_name} view: {exc}")
 
 
 def _ensure_feature_fingerprint_column():
-    """Add feature_fingerprint column to work_analysis and mla_work_analysis.
+    """Verify feature_fingerprint column exists on work_analysis + mla_work_analysis.
 
-    This column stores a SHA-256 hash of the ML-relevant deterministic
-    features (Isolation Forest features). Stage 6b uses it to detect
-    whether ML predictions are still valid after a deterministic re-insert.
-    Idempotent (ALTER TABLE IF NOT EXISTS pattern via DO block).
+    This column stores a SHA-256 hash of ML-relevant deterministic features.
+    Stage 6b uses it to detect whether ML predictions are still valid.
+    Schema DDL is handled by migrations (not the daily pipeline).
+    GitHub Actions runners cannot reach port 5432, so asyncpg DDL is not used.
     """
-    import asyncio, asyncpg
-
-    db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
-    if not db1_url:
-        print("  WARNING: cannot verify feature_fingerprint column — no DATABASE_URL / NEW_DB1_URL")
-        return
-
-    alter_sql = """
-    DO $$
-    BEGIN
-        IF NOT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'work_analysis'
-            AND column_name = 'feature_fingerprint'
-        ) THEN
-            ALTER TABLE public.work_analysis ADD COLUMN feature_fingerprint text;
-        END IF;
-        IF NOT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'mla_work_analysis'
-            AND column_name = 'feature_fingerprint'
-        ) THEN
-            ALTER TABLE public.mla_work_analysis ADD COLUMN feature_fingerprint text;
-        END IF;
-    END$$;
-    """
-
-    async def _exec():
-        conn = await asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    for table_name in ("work_analysis", "mla_work_analysis"):
         try:
-            await conn.execute(alter_sql)
-            print("  feature_fingerprint column: VERIFIED (work_analysis + mla_work_analysis)")
-        finally:
-            await conn.close()
-
-    try:
-        asyncio.run(_exec())
-    except Exception as exc:
-        print(f"  WARNING: could not verify/create feature_fingerprint column: {exc}")
-        print("  ML fingerprint preservation will be unavailable until this column exists")
+            sb_local.table(table_name).select("feature_fingerprint", count="exact").limit(0).execute()
+            print(f"  {table_name}.feature_fingerprint: ACCESSIBLE")
+        except Exception as exc:
+            msg = str(exc)
+            if "PGRST205" in msg or "does not exist" in msg.lower():
+                print(
+                    f"  WARNING: {table_name}.feature_fingerprint not found — "
+                    f"the column may not exist yet. ML fingerprint preservation "
+                    f"will be unavailable until the column is added."
+                )
+            else:
+                print(f"  WARNING: could not verify {table_name}.feature_fingerprint: {exc}")
 
 
 def main():

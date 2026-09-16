@@ -194,11 +194,21 @@ def _recompute_all_ranks_sql(db2_url):
 
     Single SQL pass per member_type for members, single pass for states.
     No data transfer to Python — all computation in Postgres.
+
+    db2_url is the Supabase REST URL (for interface compatibility), but
+    asyncpg needs the direct PostgreSQL DSN. We read DB2_DATABASE_URL
+    from the environment for the actual connection.
     """
     import asyncio
+    import asyncpg
+    import os
+
+    pg_dsn = os.environ.get("DB2_DATABASE_URL", "")
+    if not pg_dsn:
+        raise RuntimeError("DB2_DATABASE_URL not set — cannot run SQL ranking")
 
     async def _run():
-        pool = await asyncpg.create_pool(dsn=db2_url, min_size=1, max_size=2,
+        pool = await asyncpg.create_pool(dsn=pg_dsn, min_size=1, max_size=2,
                                           statement_cache_size=0, command_timeout=120)
         try:
             async with pool.acquire() as conn:
