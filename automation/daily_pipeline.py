@@ -813,18 +813,17 @@ def _ensure_work_analysis_table():
     with the same schema as mla_work_analysis (member_type DEFAULT 'MP').
     Sends NOTIFY pgrst to force PostgREST schema cache refresh.
     """
-    import asyncpg
-    import time
+    import asyncio, asyncpg, time
 
     db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
     if not db1_url:
         print("  WARNING: cannot verify work_analysis — no DATABASE_URL / NEW_DB1_URL")
         return
 
-    try:
-        conn = asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+    async def _exec():
+        conn = await asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
         try:
-            exists = conn.fetchval(
+            exists = await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
                 "WHERE table_schema='public' AND table_name='work_analysis')"
             )
@@ -832,12 +831,15 @@ def _ensure_work_analysis_table():
                 print("  work_analysis table: EXISTS")
             else:
                 print("  work_analysis table: MISSING — creating now ...")
-                conn.execute(_CREATE_WORK_ANALYSIS_SQL)
-                conn.execute("NOTIFY pgrst, 'reload schema'")
+                await conn.execute(_CREATE_WORK_ANALYSIS_SQL)
+                await conn.execute("NOTIFY pgrst, 'reload schema'")
                 print("  work_analysis table: CREATED (with indexes, schema cache notified)")
-                time.sleep(2)
         finally:
-            conn.close()
+            await conn.close()
+
+    try:
+        asyncio.run(_exec())
+        time.sleep(2)
     except Exception as exc:
         print(f"  WARNING: could not verify/create work_analysis: {exc}")
 
@@ -850,18 +852,17 @@ def _ensure_mla_work_analysis_table():
     CREATE TABLE IF NOT EXISTS with the same schema as work_analysis.
     Sends NOTIFY pgrst to force PostgREST schema cache refresh.
     """
-    import asyncpg
-    import time
+    import asyncio, asyncpg, time
 
     db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
     if not db1_url:
         print("  WARNING: cannot verify mla_work_analysis — no DATABASE_URL / NEW_DB1_URL")
         return
 
-    try:
-        conn = asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+    async def _exec():
+        conn = await asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
         try:
-            exists = conn.fetchval(
+            exists = await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
                 "WHERE table_schema='public' AND table_name='mla_work_analysis')"
             )
@@ -869,12 +870,15 @@ def _ensure_mla_work_analysis_table():
                 print("  mla_work_analysis table: EXISTS")
             else:
                 print("  mla_work_analysis table: MISSING — creating now ...")
-                conn.execute(_CREATE_MLA_WORK_ANALYSIS_SQL)
-                conn.execute("NOTIFY pgrst, 'reload schema'")
+                await conn.execute(_CREATE_MLA_WORK_ANALYSIS_SQL)
+                await conn.execute("NOTIFY pgrst, 'reload schema'")
                 print("  mla_work_analysis table: CREATED (with indexes, schema cache notified)")
-                time.sleep(2)
         finally:
-            conn.close()
+            await conn.close()
+
+    try:
+        asyncio.run(_exec())
+        time.sleep(2)
     except Exception as exc:
         print(f"  WARNING: could not verify/create mla_work_analysis: {exc}")
         print("  If this persists, run migration/2026_09_16_create_mla_work_analysis.sql manually")
@@ -1084,18 +1088,18 @@ def _ensure_category_fy_views():
     defined in migration/2026_09_14_category_fy_views.sql and must exist
     for the frontend to query category and fiscal-year analytics.
     """
-    import asyncpg
+    import asyncio, asyncpg
 
     db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
     if not db1_url:
         print("  WARNING: cannot verify category_metrics/fy_views — no DATABASE_URL / NEW_DB1_URL")
         return
 
-    try:
-        conn = asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+    async def _exec():
+        conn = await asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
         try:
             for view_name in ("category_metrics", "fy_metrics"):
-                exists = conn.fetchval(
+                exists = await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM information_schema.views "
                     "WHERE table_schema='public' AND table_name=$1)",
                     view_name,
@@ -1104,11 +1108,14 @@ def _ensure_category_fy_views():
                     print(f"  {view_name} view: EXISTS")
                 else:
                     print(f"  {view_name} view: MISSING — creating now ...")
-                    conn.execute(_CREATE_CATEGORY_FY_VIEWS_SQL)
+                    await conn.execute(_CREATE_CATEGORY_FY_VIEWS_SQL)
                     print(f"  {view_name} view: CREATED")
                     break  # Both views created in one statement
         finally:
-            conn.close()
+            await conn.close()
+
+    try:
+        asyncio.run(_exec())
     except Exception as exc:
         print(f"  WARNING: could not verify/create category_metrics/fy_views: {exc}")
         print("  If this persists, run migration/2026_09_14_category_fy_views.sql manually")
@@ -1122,7 +1129,7 @@ def _ensure_feature_fingerprint_column():
     whether ML predictions are still valid after a deterministic re-insert.
     Idempotent (ALTER TABLE IF NOT EXISTS pattern via DO block).
     """
-    import asyncpg
+    import asyncio, asyncpg
 
     db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
     if not db1_url:
@@ -1149,13 +1156,16 @@ def _ensure_feature_fingerprint_column():
     END$$;
     """
 
-    try:
-        conn = asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+    async def _exec():
+        conn = await asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
         try:
-            conn.execute(alter_sql)
+            await conn.execute(alter_sql)
             print("  feature_fingerprint column: VERIFIED (work_analysis + mla_work_analysis)")
         finally:
-            conn.close()
+            await conn.close()
+
+    try:
+        asyncio.run(_exec())
     except Exception as exc:
         print(f"  WARNING: could not verify/create feature_fingerprint column: {exc}")
         print("  ML fingerprint preservation will be unavailable until this column exists")
