@@ -759,16 +759,27 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
         raw = "|".join(parts)
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    # Pre-check: verify both tables exist before attempting writes
+    # Pre-check: verify both tables exist before attempting writes.
+    # Retry once after 3s if PostgREST schema cache is stale (PGRST205).
+    import time as _time
     from supabase import create_client as _cc
     _probe = _cc(db1_url, db1_key)
     for tbl in ("work_analysis", "mla_work_analysis"):
-        try:
-            _probe.table(tbl).select("work_id", count="exact").limit(0).execute()
-        except Exception as e:
-            print(f"  FATAL: table '{tbl}' not accessible on DB1: {e}")
-            print(f"  Run: python -c \"import asyncpg; c=asyncpg.connect('{db1_url.split('@')[-1]}'); c.execute(open('migration/2026_09_16_create_mla_work_analysis.sql').read()); c.close()\"")
-            raise RuntimeError(f"Table '{tbl}' missing from DB1. See migration/2026_09_16_create_mla_work_analysis.sql")
+        ok = False
+        for attempt in range(2):
+            try:
+                _probe.table(tbl).select("work_id", count="exact").limit(0).execute()
+                ok = True
+                break
+            except Exception as e:
+                if attempt == 0:
+                    print(f"  WARNING: table '{tbl}' not visible in schema cache (attempt 1/2), retrying in 3s ...")
+                    _time.sleep(3)
+                else:
+                    print(f"  FATAL: table '{tbl}' not accessible on DB1: {e}")
+                    raise RuntimeError(f"Table '{tbl}' missing from DB1.")
+        if ok:
+            print(f"  table '{tbl}': ACCESSIBLE")
 
     # Separate MP and MLA
     mp_analyses = [wa for wa in work_analyses if wa.member_type == "MP"]

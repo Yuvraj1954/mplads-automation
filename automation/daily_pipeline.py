@@ -811,8 +811,10 @@ def _ensure_work_analysis_table():
     This table was lost during the DB1→DB2 redistribution. Without it,
     Stage 6b MP persistence fails. Uses asyncpg to CREATE TABLE IF NOT EXISTS
     with the same schema as mla_work_analysis (member_type DEFAULT 'MP').
+    Sends NOTIFY pgrst to force PostgREST schema cache refresh.
     """
     import asyncpg
+    import time
 
     db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
     if not db1_url:
@@ -831,7 +833,9 @@ def _ensure_work_analysis_table():
             else:
                 print("  work_analysis table: MISSING — creating now ...")
                 conn.execute(_CREATE_WORK_ANALYSIS_SQL)
-                print("  work_analysis table: CREATED (with indexes)")
+                conn.execute("NOTIFY pgrst, 'reload schema'")
+                print("  work_analysis table: CREATED (with indexes, schema cache notified)")
+                time.sleep(2)
         finally:
             conn.close()
     except Exception as exc:
@@ -844,8 +848,10 @@ def _ensure_mla_work_analysis_table():
     This table was lost during the DB1→DB2 redistribution. Without it,
     Stage 6b MLA persistence fails with PGRST205. Uses asyncpg to
     CREATE TABLE IF NOT EXISTS with the same schema as work_analysis.
+    Sends NOTIFY pgrst to force PostgREST schema cache refresh.
     """
     import asyncpg
+    import time
 
     db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
     if not db1_url:
@@ -864,7 +870,9 @@ def _ensure_mla_work_analysis_table():
             else:
                 print("  mla_work_analysis table: MISSING — creating now ...")
                 conn.execute(_CREATE_MLA_WORK_ANALYSIS_SQL)
-                print("  mla_work_analysis table: CREATED (with indexes)")
+                conn.execute("NOTIFY pgrst, 'reload schema'")
+                print("  mla_work_analysis table: CREATED (with indexes, schema cache notified)")
+                time.sleep(2)
         finally:
             conn.close()
     except Exception as exc:
