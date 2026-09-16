@@ -806,82 +806,54 @@ CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_activity_state ON public.mla_wo
 
 
 def _ensure_work_analysis_table():
-    """Ensure work_analysis table exists in DB1.
+    """Verify work_analysis table exists on DB1 via Supabase REST.
 
-    This table was lost during the DB1→DB2 redistribution. Without it,
-    Stage 6b MP persistence fails. Uses asyncpg to CREATE TABLE IF NOT EXISTS
-    with the same schema as mla_work_analysis (member_type DEFAULT 'MP').
-    Sends NOTIFY pgrst to force PostgREST schema cache refresh.
+    This table is required for Stage 6b MP persistence. If missing,
+    the pipeline cannot proceed and must fail immediately.
+
+    DDL is handled by explicit migrations (not the daily pipeline).
+    GitHub Actions runners cannot reach port 5432 (direct PostgreSQL),
+    so asyncpg DDL is not used here.
     """
-    import asyncio, asyncpg, time
-
-    db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
-    if not db1_url:
-        print("  WARNING: cannot verify work_analysis — no DATABASE_URL / NEW_DB1_URL")
-        return
-
-    async def _exec():
-        conn = await asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
-        try:
-            exists = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema='public' AND table_name='work_analysis')"
-            )
-            if exists:
-                print("  work_analysis table: EXISTS")
-            else:
-                print("  work_analysis table: MISSING — creating now ...")
-                await conn.execute(_CREATE_WORK_ANALYSIS_SQL)
-                await conn.execute("NOTIFY pgrst, 'reload schema'")
-                print("  work_analysis table: CREATED (with indexes, schema cache notified)")
-        finally:
-            await conn.close()
-
+    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
     try:
-        asyncio.run(_exec())
-        time.sleep(2)
+        sb_local.table("work_analysis").select("work_id", count="exact").limit(0).execute()
+        print("  work_analysis table: ACCESSIBLE")
     except Exception as exc:
-        print(f"  WARNING: could not verify/create work_analysis: {exc}")
+        msg = str(exc)
+        if "PGRST205" in msg or "does not exist" in msg.lower():
+            raise RuntimeError(
+                "FATAL: public.work_analysis table is missing from DB1. "
+                "Stage 6b requires this table. Run the migration SQL in the "
+                "Supabase SQL Editor before re-running the pipeline."
+            )
+        raise
 
 
 def _ensure_mla_work_analysis_table():
-    """Ensure mla_work_analysis table exists in DB1.
+    """Verify mla_work_analysis table exists on DB1 via Supabase REST.
 
-    This table was lost during the DB1→DB2 redistribution. Without it,
-    Stage 6b MLA persistence fails with PGRST205. Uses asyncpg to
-    CREATE TABLE IF NOT EXISTS with the same schema as work_analysis.
-    Sends NOTIFY pgrst to force PostgREST schema cache refresh.
+    This table is required for Stage 6b MLA persistence. If missing,
+    the pipeline cannot proceed and must fail immediately.
+
+    DDL is handled by explicit migrations (not the daily pipeline).
+    GitHub Actions runners cannot reach port 5432 (direct PostgreSQL),
+    so asyncpg DDL is not used here.
     """
-    import asyncio, asyncpg, time
-
-    db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
-    if not db1_url:
-        print("  WARNING: cannot verify mla_work_analysis — no DATABASE_URL / NEW_DB1_URL")
-        return
-
-    async def _exec():
-        conn = await asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
-        try:
-            exists = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema='public' AND table_name='mla_work_analysis')"
-            )
-            if exists:
-                print("  mla_work_analysis table: EXISTS")
-            else:
-                print("  mla_work_analysis table: MISSING — creating now ...")
-                await conn.execute(_CREATE_MLA_WORK_ANALYSIS_SQL)
-                await conn.execute("NOTIFY pgrst, 'reload schema'")
-                print("  mla_work_analysis table: CREATED (with indexes, schema cache notified)")
-        finally:
-            await conn.close()
-
+    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
     try:
-        asyncio.run(_exec())
-        time.sleep(2)
+        sb_local.table("mla_work_analysis").select("work_id", count="exact").limit(0).execute()
+        print("  mla_work_analysis table: ACCESSIBLE")
     except Exception as exc:
-        print(f"  WARNING: could not verify/create mla_work_analysis: {exc}")
-        print("  If this persists, run migration/2026_09_16_create_mla_work_analysis.sql manually")
+        msg = str(exc)
+        if "PGRST205" in msg or "does not exist" in msg.lower():
+            raise RuntimeError(
+                "FATAL: public.mla_work_analysis table is missing from DB1. "
+                "Stage 6b requires this table. Run "
+                "migration/2026_09_16_create_mla_work_analysis.sql in the "
+                "Supabase SQL Editor before re-running the pipeline."
+            )
+        raise
 
 
 _CREATE_CATEGORY_FY_VIEWS_SQL = """
