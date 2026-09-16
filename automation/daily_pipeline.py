@@ -669,6 +669,74 @@ def _ensure_member_metrics_columns():
         print(f"  WARNING: could not verify member_metrics columns: {exc}")
 
 
+_CREATE_WORK_ANALYSIS_SQL = """
+CREATE TABLE IF NOT EXISTS public.work_analysis (
+    work_id                                integer      PRIMARY KEY,
+    member_id                              integer      NOT NULL,
+    member_type                            text         NOT NULL DEFAULT 'MP',
+    constituency_id                        integer,
+    state_id                               integer,
+    state_name                             text         DEFAULT '',
+    work_category                          text         DEFAULT '',
+    activity_name                          text         DEFAULT '',
+    normalized_activity                    text,
+    work_description                       text         DEFAULT '',
+    status                                 text,
+    recommended_amount                     numeric,
+    sanction_amount                        numeric,
+    expenditure_amount                     numeric,
+    completion_amount                      numeric,
+    recommendation_date                    text,
+    sanction_date                          text,
+    first_expenditure_date                 text,
+    last_expenditure_date                  text,
+    completion_date                        text,
+    sanction_delay_days                    integer,
+    project_age_days                       integer,
+    execution_days                         integer,
+    pending_days                           integer,
+    expenditure_percentage                 numeric,
+    completion_percentage                  numeric,
+    benchmark_peer_group                   text,
+    benchmark_quality                      text,
+    benchmark_sample_size                  integer,
+    cost_p25                               numeric,
+    cost_p50                               numeric,
+    cost_p75                               numeric,
+    cost_p90                               numeric,
+    cost_p95                               numeric,
+    duration_p25                           numeric,
+    duration_p50                           numeric,
+    duration_p75                           numeric,
+    duration_p90                           numeric,
+    duration_p95                           numeric,
+    cost_percentile                        numeric,
+    duration_percentile                    numeric,
+    cost_status                            text,
+    duration_status                        text,
+    cost_deviation_from_median_percentage  numeric,
+    duration_deviation_from_median_percentage numeric,
+    risk_flags                             jsonb        DEFAULT '[]'::jsonb,
+    flag_count                             integer      DEFAULT 0,
+    risk_level                             text,
+    last_calculated                        text,
+    delay_probability                      numeric,
+    delay_risk_band                        text,
+    isolation_score                        numeric,
+    isolation_level                        text,
+    feature_fingerprint                    text
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_analysis_work_id        ON public.work_analysis (work_id);
+CREATE INDEX IF NOT EXISTS idx_work_analysis_member         ON public.work_analysis (member_id);
+CREATE INDEX IF NOT EXISTS idx_work_analysis_state          ON public.work_analysis (state_id);
+CREATE INDEX IF NOT EXISTS idx_work_analysis_status         ON public.work_analysis (status);
+CREATE INDEX IF NOT EXISTS idx_work_analysis_flags          ON public.work_analysis (risk_flags);
+CREATE INDEX IF NOT EXISTS idx_work_analysis_risk           ON public.work_analysis (risk_level);
+CREATE INDEX IF NOT EXISTS idx_work_analysis_activity_state ON public.work_analysis (normalized_activity, state_id);
+"""
+
+
 _CREATE_MLA_WORK_ANALYSIS_SQL = """
 CREATE TABLE IF NOT EXISTS public.mla_work_analysis (
     work_id                                integer      PRIMARY KEY,
@@ -735,6 +803,39 @@ CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_flags          ON public.mla_wo
 CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_risk           ON public.mla_work_analysis (risk_level);
 CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_activity_state ON public.mla_work_analysis (normalized_activity, state_id);
 """
+
+
+def _ensure_work_analysis_table():
+    """Ensure work_analysis table exists in DB1.
+
+    This table was lost during the DB1→DB2 redistribution. Without it,
+    Stage 6b MP persistence fails. Uses asyncpg to CREATE TABLE IF NOT EXISTS
+    with the same schema as mla_work_analysis (member_type DEFAULT 'MP').
+    """
+    import asyncpg
+
+    db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
+    if not db1_url:
+        print("  WARNING: cannot verify work_analysis — no DATABASE_URL / NEW_DB1_URL")
+        return
+
+    try:
+        conn = asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+        try:
+            exists = conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name='work_analysis')"
+            )
+            if exists:
+                print("  work_analysis table: EXISTS")
+            else:
+                print("  work_analysis table: MISSING — creating now ...")
+                conn.execute(_CREATE_WORK_ANALYSIS_SQL)
+                print("  work_analysis table: CREATED (with indexes)")
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"  WARNING: could not verify/create work_analysis: {exc}")
 
 
 def _ensure_mla_work_analysis_table():
@@ -1087,9 +1188,10 @@ def main():
     print("\n=== STEP 0: ENSURE SCHEMA ===")
     _ensure_state_metrics_columns()
     _ensure_member_metrics_columns()
+    _ensure_work_analysis_table()
     _ensure_mla_work_analysis_table()
-    _ensure_category_fy_views()
     _ensure_feature_fingerprint_column()
+    _ensure_category_fy_views()
 
     sync_interval = os.environ.get("SYNC_INTERVAL_HOURS", "24")
     print(f"Sync interval: {sync_interval} hours")
