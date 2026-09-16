@@ -589,10 +589,10 @@ async def stage_project_and_anomaly(db1, db2, apply):
                 else:
                     mp_pred = []; mla_pred = []
                 for label, rows, sql_template in [
-                    ("MP isolation", mp_iso, "UPDATE public.work_analysis SET isolation_score=$1, isolation_level=$2 WHERE work_id=$3"),
-                    ("MLA isolation", mla_iso, "UPDATE public.mla_work_analysis SET isolation_score=$1, isolation_level=$2 WHERE work_id=$3"),
-                    ("MP delay_pred", mp_pred, "UPDATE public.work_analysis SET delay_probability=$1, delay_risk_band=$2 WHERE work_id=$3"),
-                    ("MLA delay_pred", mla_pred, "UPDATE public.mla_work_analysis SET delay_probability=$1, delay_risk_band=$2 WHERE work_id=$3"),
+                    ("MP isolation", mp_iso, "UPDATE public.work_analysis SET isolation_score=$1, isolation_level=$2 WHERE work_id=$3 AND (isolation_score IS NULL OR isolation_level IS NULL)"),
+                    ("MLA isolation", mla_iso, "UPDATE public.mla_work_analysis SET isolation_score=$1, isolation_level=$2 WHERE work_id=$3 AND (isolation_score IS NULL OR isolation_level IS NULL)"),
+                    ("MP delay_pred", mp_pred, "UPDATE public.work_analysis SET delay_probability=$1, delay_risk_band=$2 WHERE work_id=$3 AND (delay_probability IS NULL OR delay_risk_band IS NULL)"),
+                    ("MLA delay_pred", mla_pred, "UPDATE public.mla_work_analysis SET delay_probability=$1, delay_risk_band=$2 WHERE work_id=$3 AND (delay_probability IS NULL OR delay_risk_band IS NULL)"),
                 ]:
                     if not rows:
                         continue

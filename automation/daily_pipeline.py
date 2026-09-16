@@ -669,6 +669,389 @@ def _ensure_member_metrics_columns():
         print(f"  WARNING: could not verify member_metrics columns: {exc}")
 
 
+_CREATE_MLA_WORK_ANALYSIS_SQL = """
+CREATE TABLE IF NOT EXISTS public.mla_work_analysis (
+    work_id                                integer      PRIMARY KEY,
+    member_id                              integer      NOT NULL,
+    member_type                            text         NOT NULL DEFAULT 'MLA',
+    constituency_id                        integer,
+    state_id                               integer,
+    state_name                             text         DEFAULT '',
+    work_category                          text         DEFAULT '',
+    activity_name                          text         DEFAULT '',
+    normalized_activity                    text,
+    work_description                       text         DEFAULT '',
+    status                                 text,
+    recommended_amount                     numeric,
+    sanction_amount                        numeric,
+    expenditure_amount                     numeric,
+    completion_amount                      numeric,
+    recommendation_date                    text,
+    sanction_date                          text,
+    first_expenditure_date                 text,
+    last_expenditure_date                  text,
+    completion_date                        text,
+    sanction_delay_days                    integer,
+    project_age_days                       integer,
+    execution_days                         integer,
+    pending_days                           integer,
+    expenditure_percentage                 numeric,
+    completion_percentage                  numeric,
+    benchmark_peer_group                   text,
+    benchmark_quality                      text,
+    benchmark_sample_size                  integer,
+    cost_p25                               numeric,
+    cost_p50                               numeric,
+    cost_p75                               numeric,
+    cost_p90                               numeric,
+    cost_p95                               numeric,
+    duration_p25                           numeric,
+    duration_p50                           numeric,
+    duration_p75                           numeric,
+    duration_p90                           numeric,
+    duration_p95                           numeric,
+    cost_percentile                        numeric,
+    duration_percentile                    numeric,
+    cost_status                            text,
+    duration_status                        text,
+    cost_deviation_from_median_percentage  numeric,
+    duration_deviation_from_median_percentage numeric,
+    risk_flags                             jsonb        DEFAULT '[]'::jsonb,
+    flag_count                             integer      DEFAULT 0,
+    risk_level                             text,
+    last_calculated                        text,
+    delay_probability                      numeric,
+    delay_risk_band                        text,
+    isolation_score                        numeric,
+    isolation_level                        text,
+    feature_fingerprint                    text
+);
+
+CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_work_id        ON public.mla_work_analysis (work_id);
+CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_member         ON public.mla_work_analysis (member_id);
+CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_state          ON public.mla_work_analysis (state_id);
+CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_status         ON public.mla_work_analysis (status);
+CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_flags          ON public.mla_work_analysis (risk_flags);
+CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_risk           ON public.mla_work_analysis (risk_level);
+CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_activity_state ON public.mla_work_analysis (normalized_activity, state_id);
+"""
+
+
+def _ensure_mla_work_analysis_table():
+    """Ensure mla_work_analysis table exists in DB1.
+
+    This table was lost during the DB1→DB2 redistribution. Without it,
+    Stage 6b MLA persistence fails with PGRST205. Uses asyncpg to
+    CREATE TABLE IF NOT EXISTS with the same schema as work_analysis.
+    """
+    import asyncpg
+
+    db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
+    if not db1_url:
+        print("  WARNING: cannot verify mla_work_analysis — no DATABASE_URL / NEW_DB1_URL")
+        return
+
+    try:
+        conn = asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+        try:
+            exists = conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name='mla_work_analysis')"
+            )
+            if exists:
+                print("  mla_work_analysis table: EXISTS")
+            else:
+                print("  mla_work_analysis table: MISSING — creating now ...")
+                conn.execute(_CREATE_MLA_WORK_ANALYSIS_SQL)
+                print("  mla_work_analysis table: CREATED (with indexes)")
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"  WARNING: could not verify/create mla_work_analysis: {exc}")
+        print("  If this persists, run migration/2026_09_16_create_mla_work_analysis.sql manually")
+
+
+_CREATE_CATEGORY_FY_VIEWS_SQL = """
+-- category_metrics: national + per-state category intelligence
+CREATE OR REPLACE VIEW public.category_metrics AS
+WITH works AS (
+    SELECT
+        COALESCE(NULLIF(TRIM(regexp_replace(normalized_activity, '^NA-', '', 'i')), ''), NULLIF(TRIM(work_category), ''), 'UNCLASSIFIED') AS category,
+        state_id, member_id, member_type, status, work_id,
+        recommended_amount, sanction_amount, expenditure_amount,
+        execution_days, project_age_days,
+        COALESCE(flag_count, 0) AS flag_count,
+        cost_status, duration_status
+    FROM public.work_analysis
+    UNION ALL
+    SELECT
+        COALESCE(NULLIF(TRIM(regexp_replace(normalized_activity, '^NA-', '', 'i')), ''), NULLIF(TRIM(work_category), ''), 'UNCLASSIFIED') AS category,
+        state_id, member_id, member_type, status, work_id,
+        recommended_amount, sanction_amount, expenditure_amount,
+        execution_days, project_age_days,
+        COALESCE(flag_count, 0) AS flag_count,
+        cost_status, duration_status
+    FROM public.mla_work_analysis
+),
+grouped AS (
+    SELECT
+        'NATIONAL'::text AS scope,
+        NULL::bigint AS state_id,
+        category,
+        COUNT(*) AS total_works,
+        COUNT(DISTINCT state_id) AS distinct_states,
+        COUNT(DISTINCT (member_type, member_id)) AS distinct_members,
+        COUNT(*) FILTER (WHERE LOWER(status) = 'completed') AS completed_works,
+        COUNT(*) FILTER (WHERE LOWER(status) = 'in progress') AS ongoing_works,
+        COUNT(*) FILTER (WHERE LOWER(status) = 'recommended') AS recommended_works,
+        COUNT(*) FILTER (WHERE sanction_amount > 0) AS sanctioned_works,
+        COALESCE(SUM(recommended_amount), 0) AS recommended_amount,
+        COALESCE(SUM(sanction_amount), 0) AS sanctioned_amount,
+        COALESCE(SUM(expenditure_amount), 0) AS expenditure_amount,
+        COUNT(*) FILTER (WHERE project_age_days > 365 AND LOWER(status) <> 'completed') AS overdue_works,
+        COUNT(*) FILTER (WHERE flag_count >= 1) AS flagged_works,
+        COUNT(*) FILTER (WHERE cost_status IN ('VERY_HIGH','HIGH')) AS cost_anomaly_works,
+        COUNT(*) FILTER (WHERE duration_status IN ('VERY_LONG','LONG')) AS duration_anomaly_works,
+        AVG(sanction_amount) FILTER (WHERE sanction_amount > 0) AS avg_work_cost,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sanction_amount) FILTER (WHERE sanction_amount > 0) AS median_work_cost,
+        AVG(execution_days) FILTER (WHERE execution_days IS NOT NULL) AS avg_execution_days,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY execution_days) FILTER (WHERE execution_days IS NOT NULL) AS median_execution_days
+    FROM works
+    GROUP BY category
+    UNION ALL
+    SELECT
+        'STATE'::text AS scope,
+        state_id,
+        category,
+        COUNT(*),
+        COUNT(DISTINCT state_id),
+        COUNT(DISTINCT (member_type, member_id)),
+        COUNT(*) FILTER (WHERE LOWER(status) = 'completed'),
+        COUNT(*) FILTER (WHERE LOWER(status) = 'in progress'),
+        COUNT(*) FILTER (WHERE LOWER(status) = 'recommended'),
+        COUNT(*) FILTER (WHERE sanction_amount > 0),
+        COALESCE(SUM(recommended_amount), 0),
+        COALESCE(SUM(sanction_amount), 0),
+        COALESCE(SUM(expenditure_amount), 0),
+        COUNT(*) FILTER (WHERE project_age_days > 365 AND LOWER(status) <> 'completed'),
+        COUNT(*) FILTER (WHERE flag_count >= 1),
+        COUNT(*) FILTER (WHERE cost_status IN ('VERY_HIGH','HIGH')),
+        COUNT(*) FILTER (WHERE duration_status IN ('VERY_LONG','LONG')),
+        AVG(sanction_amount) FILTER (WHERE sanction_amount > 0),
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sanction_amount) FILTER (WHERE sanction_amount > 0),
+        AVG(execution_days) FILTER (WHERE execution_days IS NOT NULL),
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY execution_days) FILTER (WHERE execution_days IS NOT NULL)
+    FROM works
+    WHERE state_id IS NOT NULL
+    GROUP BY state_id, category
+)
+SELECT
+    scope,
+    state_id,
+    category,
+    total_works AS sample_size,
+    distinct_states,
+    distinct_members,
+    completed_works,
+    ongoing_works,
+    recommended_works,
+    sanctioned_works,
+    recommended_amount,
+    sanctioned_amount,
+    expenditure_amount,
+    ROUND(completed_works::numeric / NULLIF(total_works, 0) * 100, 2) AS completion_rate_pct,
+    ROUND(sanctioned_works::numeric / NULLIF(total_works, 0) * 100, 2) AS sanction_rate_pct,
+    ROUND(expenditure_amount / NULLIF(sanctioned_amount, 0) * 100, 2) AS utilization_pct,
+    ROUND(avg_work_cost::numeric, 2) AS avg_work_cost,
+    ROUND(median_work_cost::numeric, 2) AS median_work_cost,
+    ROUND(avg_execution_days::numeric, 2) AS avg_execution_days,
+    ROUND(median_execution_days::numeric, 2) AS median_execution_days,
+    ROUND(overdue_works::numeric / NULLIF(total_works, 0) * 100, 2) AS overdue_rate_pct,
+    ROUND(flagged_works::numeric / NULLIF(total_works, 0) * 100, 2) AS risk_rate_pct,
+    ROUND(cost_anomaly_works::numeric / NULLIF(total_works, 0) * 100, 2) AS cost_anomaly_rate_pct,
+    ROUND(duration_anomaly_works::numeric / NULLIF(total_works, 0) * 100, 2) AS duration_anomaly_rate_pct,
+    CASE WHEN total_works >= 100 THEN 'HIGH'
+         WHEN total_works >= 20 THEN 'MEDIUM'
+         WHEN total_works >= 5 THEN 'LOW'
+         ELSE 'INSUFFICIENT' END AS confidence
+FROM grouped;
+
+-- fy_metrics: real fiscal-year analytics (MPLADS FY = April–March)
+CREATE OR REPLACE VIEW public.fy_metrics AS
+WITH
+rec AS (
+    SELECT
+        CASE WHEN EXTRACT(MONTH FROM recommendation_date) >= 4
+             THEN EXTRACT(YEAR FROM recommendation_date)
+             ELSE EXTRACT(YEAR FROM recommendation_date) - 1 END::int AS fy_start,
+        member_type,
+        COUNT(*) AS works,
+        COALESCE(SUM(recommended_amount), 0) AS amount
+    FROM public.work_analysis WHERE recommendation_date IS NOT NULL GROUP BY 1, member_type
+    UNION ALL
+    SELECT
+        CASE WHEN EXTRACT(MONTH FROM recommendation_date) >= 4
+             THEN EXTRACT(YEAR FROM recommendation_date)
+             ELSE EXTRACT(YEAR FROM recommendation_date) - 1 END::int,
+        member_type, COUNT(*), COALESCE(SUM(recommended_amount), 0)
+    FROM public.mla_work_analysis WHERE recommendation_date IS NOT NULL GROUP BY 1, member_type
+),
+san AS (
+    SELECT
+        CASE WHEN EXTRACT(MONTH FROM sanction_date) >= 4
+             THEN EXTRACT(YEAR FROM sanction_date)
+             ELSE EXTRACT(YEAR FROM sanction_date) - 1 END::int AS fy_start,
+        member_type, COUNT(*) AS works, COALESCE(SUM(sanction_amount), 0) AS amount
+    FROM public.work_analysis WHERE sanction_date IS NOT NULL GROUP BY 1, member_type
+    UNION ALL
+    SELECT
+        CASE WHEN EXTRACT(MONTH FROM sanction_date) >= 4
+             THEN EXTRACT(YEAR FROM sanction_date)
+             ELSE EXTRACT(YEAR FROM sanction_date) - 1 END::int,
+        member_type, COUNT(*), COALESCE(SUM(sanction_amount), 0)
+    FROM public.mla_work_analysis WHERE sanction_date IS NOT NULL GROUP BY 1, member_type
+),
+comp AS (
+    SELECT
+        CASE WHEN EXTRACT(MONTH FROM completion_date) >= 4
+             THEN EXTRACT(YEAR FROM completion_date)
+             ELSE EXTRACT(YEAR FROM completion_date) - 1 END::int AS fy_start,
+        member_type, COUNT(*) AS works, COALESCE(SUM(completion_amount), 0) AS amount
+    FROM public.work_analysis WHERE completion_date IS NOT NULL GROUP BY 1, member_type
+    UNION ALL
+    SELECT
+        CASE WHEN EXTRACT(MONTH FROM completion_date) >= 4
+             THEN EXTRACT(YEAR FROM completion_date)
+             ELSE EXTRACT(YEAR FROM completion_date) - 1 END::int,
+        member_type, COUNT(*), COALESCE(SUM(completion_amount), 0)
+    FROM public.mla_work_analysis WHERE completion_date IS NOT NULL GROUP BY 1, member_type
+),
+exp AS (
+    SELECT
+        CASE WHEN EXTRACT(MONTH FROM we.expenditure_date) >= 4
+             THEN EXTRACT(YEAR FROM we.expenditure_date)
+             ELSE EXTRACT(YEAR FROM we.expenditure_date) - 1 END::int AS fy_start,
+        wa.member_type, COUNT(*) AS works,
+        COALESCE(SUM(we.fund_disbursed_amount), 0) AS amount
+    FROM public.work_expenditures we
+    JOIN public.work_analysis wa ON wa.work_id = we.work_id
+    WHERE we.expenditure_date IS NOT NULL GROUP BY 1, wa.member_type
+    UNION ALL
+    SELECT
+        CASE WHEN EXTRACT(MONTH FROM me.expenditure_date) >= 4
+             THEN EXTRACT(YEAR FROM me.expenditure_date)
+             ELSE EXTRACT(YEAR FROM me.expenditure_date) - 1 END::int,
+        mwa.member_type, COUNT(*), COALESCE(SUM(me.fund_disbursed_amount), 0)
+    FROM public.mla_work_expenditures me
+    JOIN public.mla_work_analysis mwa ON mwa.work_id = me.work_id
+    WHERE me.expenditure_date IS NOT NULL GROUP BY 1, mwa.member_type
+)
+SELECT
+    COALESCE(r.fy_start, s.fy_start, c.fy_start, e.fy_start) AS fy_start,
+    (COALESCE(r.fy_start, s.fy_start, c.fy_start, e.fy_start)::text || '-' ||
+     LPAD(((COALESCE(r.fy_start, s.fy_start, c.fy_start, e.fy_start) + 1) % 100)::text, 2, '0')) AS fy_label,
+    COALESCE(r.member_type, s.member_type, c.member_type, e.member_type) AS member_type,
+    COALESCE(r.works, 0) AS recommended_works,
+    COALESCE(s.works, 0) AS sanctioned_works,
+    COALESCE(c.works, 0) AS completed_works,
+    COALESCE(e.works, 0) AS expenditure_count,
+    COALESCE(r.amount, 0) AS recommended_amount,
+    COALESCE(s.amount, 0) AS sanctioned_amount,
+    COALESCE(c.amount, 0) AS completion_amount,
+    COALESCE(e.amount, 0) AS expenditure_amount
+FROM rec r
+FULL OUTER JOIN san s ON s.fy_start = r.fy_start AND s.member_type = r.member_type
+FULL OUTER JOIN comp c ON c.fy_start = COALESCE(r.fy_start, s.fy_start) AND c.member_type = COALESCE(r.member_type, s.member_type)
+FULL OUTER JOIN exp e ON e.fy_start = COALESCE(r.fy_start, s.fy_start, c.fy_start) AND e.member_type = COALESCE(r.member_type, s.member_type, c.member_type)
+ORDER BY fy_start, member_type;
+"""
+
+
+def _ensure_category_fy_views():
+    """Ensure category_metrics and fy_metrics SQL VIEWs exist in DB1.
+
+    These are LIVE views over work_analysis + mla_work_analysis that
+    auto-update when the pipeline writes to underlying tables. They are
+    defined in migration/2026_09_14_category_fy_views.sql and must exist
+    for the frontend to query category and fiscal-year analytics.
+    """
+    import asyncpg
+
+    db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
+    if not db1_url:
+        print("  WARNING: cannot verify category_metrics/fy_views — no DATABASE_URL / NEW_DB1_URL")
+        return
+
+    try:
+        conn = asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+        try:
+            for view_name in ("category_metrics", "fy_metrics"):
+                exists = conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM information_schema.views "
+                    "WHERE table_schema='public' AND table_name=$1)",
+                    view_name,
+                )
+                if exists:
+                    print(f"  {view_name} view: EXISTS")
+                else:
+                    print(f"  {view_name} view: MISSING — creating now ...")
+                    conn.execute(_CREATE_CATEGORY_FY_VIEWS_SQL)
+                    print(f"  {view_name} view: CREATED")
+                    break  # Both views created in one statement
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"  WARNING: could not verify/create category_metrics/fy_views: {exc}")
+        print("  If this persists, run migration/2026_09_14_category_fy_views.sql manually")
+
+
+def _ensure_feature_fingerprint_column():
+    """Add feature_fingerprint column to work_analysis and mla_work_analysis.
+
+    This column stores a SHA-256 hash of the ML-relevant deterministic
+    features (Isolation Forest features). Stage 6b uses it to detect
+    whether ML predictions are still valid after a deterministic re-insert.
+    Idempotent (ALTER TABLE IF NOT EXISTS pattern via DO block).
+    """
+    import asyncpg
+
+    db1_url = os.environ.get("DATABASE_URL") or os.environ.get("NEW_DB1_URL", "")
+    if not db1_url:
+        print("  WARNING: cannot verify feature_fingerprint column — no DATABASE_URL / NEW_DB1_URL")
+        return
+
+    alter_sql = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'work_analysis'
+            AND column_name = 'feature_fingerprint'
+        ) THEN
+            ALTER TABLE public.work_analysis ADD COLUMN feature_fingerprint text;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'mla_work_analysis'
+            AND column_name = 'feature_fingerprint'
+        ) THEN
+            ALTER TABLE public.mla_work_analysis ADD COLUMN feature_fingerprint text;
+        END IF;
+    END$$;
+    """
+
+    try:
+        conn = asyncpg.connect(dsn=db1_url, timeout=15, command_timeout=30)
+        try:
+            conn.execute(alter_sql)
+            print("  feature_fingerprint column: VERIFIED (work_analysis + mla_work_analysis)")
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"  WARNING: could not verify/create feature_fingerprint column: {exc}")
+        print("  ML fingerprint preservation will be unavailable until this column exists")
+
+
 def main():
     parser = argparse.ArgumentParser(description="MPLADS Daily Pipeline")
     parser.add_argument("--skip-gemini", action="store_true",
@@ -704,6 +1087,9 @@ def main():
     print("\n=== STEP 0: ENSURE SCHEMA ===")
     _ensure_state_metrics_columns()
     _ensure_member_metrics_columns()
+    _ensure_mla_work_analysis_table()
+    _ensure_category_fy_views()
+    _ensure_feature_fingerprint_column()
 
     sync_interval = os.environ.get("SYNC_INTERVAL_HOURS", "24")
     print(f"Sync interval: {sync_interval} hours")
@@ -776,7 +1162,7 @@ def main():
         )
         timing["bootstrap_analysis"] = _elapsed(t_bootstrap)
 
-        if analysis_result.get("status") not in ("SUCCESS", "DRY_RUN"):
+        if analysis_result.get("status") not in ("SUCCESS", "DRY_RUN", "SUCCESS_WITH_WARNINGS"):
             raise RuntimeError(
                 f"Bootstrap analysis failed: {analysis_result.get('error', 'unknown')}"
             )
@@ -1081,7 +1467,7 @@ def main():
     )
     timing["analysis"] = _elapsed(t_analysis)
 
-    if analysis_result.get("status") not in ("SUCCESS", "DRY_RUN"):
+    if analysis_result.get("status") not in ("SUCCESS", "DRY_RUN", "SUCCESS_WITH_WARNINGS"):
         raise RuntimeError(
             f"Analysis pipeline failed: {analysis_result.get('error', 'unknown')}"
         )

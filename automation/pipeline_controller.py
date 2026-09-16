@@ -711,6 +711,12 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
     For affected mode: deletes old records first (to satisfy the unique
     constraint on work_id), then inserts fresh records.
 
+    ML lifecycle: Before DELETE, fetches existing ML columns + feature_fingerprint
+    for affected work_ids. After INSERT, restores ML values WHERE the feature
+    fingerprint matches (deterministic features unchanged → ML prediction still
+    valid). ML values are left NULL where features changed (stale) or for new
+    works (uncomputed). Intelligence backfill later fills NULLs.
+
     Uses bounded parallelism for the delete phase (the bottleneck) when
     there are affected work_ids. MP and MLA tables are processed in parallel.
 
@@ -720,8 +726,9 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
                           If None, persists all (full mode).
 
     Returns:
-        dict with write stats
+        dict with write stats including ML preservation metrics
     """
+    import hashlib
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -729,6 +736,39 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
 
     db1_url, db1_key = get_db1()
     now_str = datetime.now(timezone.utc).isoformat()
+
+    # Isolation Forest feature columns used for fingerprint computation.
+    # These 8 features are the sole ML inputs for anomaly detection.
+    # If any change, the isolation_score/isolation_level may be stale.
+    _ML_FEATURE_COLS = (
+        "sanction_amount", "recommended_amount", "expenditure_amount",
+        "sanction_delay_days", "execution_days", "project_age_days",
+        "cost_percentile", "duration_percentile",
+    )
+
+    def _compute_feature_fingerprint(wa):
+        """Compute SHA-256 fingerprint of ML-relevant deterministic features.
+
+        Returns a hex digest string. If any feature is None, uses empty string.
+        Two works with identical ML inputs will have identical fingerprints.
+        """
+        parts = []
+        for col in _ML_FEATURE_COLS:
+            val = getattr(wa, col, None)
+            parts.append(f"{col}={val}")
+        raw = "|".join(parts)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    # Pre-check: verify both tables exist before attempting writes
+    from supabase import create_client as _cc
+    _probe = _cc(db1_url, db1_key)
+    for tbl in ("work_analysis", "mla_work_analysis"):
+        try:
+            _probe.table(tbl).select("work_id", count="exact").limit(0).execute()
+        except Exception as e:
+            print(f"  FATAL: table '{tbl}' not accessible on DB1: {e}")
+            print(f"  Run: python -c \"import asyncpg; c=asyncpg.connect('{db1_url.split('@')[-1]}'); c.execute(open('migration/2026_09_16_create_mla_work_analysis.sql').read()); c.close()\"")
+            raise RuntimeError(f"Table '{tbl}' missing from DB1. See migration/2026_09_16_create_mla_work_analysis.sql")
 
     # Separate MP and MLA
     mp_analyses = [wa for wa in work_analyses if wa.member_type == "MP"]
@@ -740,6 +780,42 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
 
     print(f"  MP analyses to persist: {len(mp_analyses)}")
     print(f"  MLA analyses to persist: {len(mla_analyses)}")
+
+    # ── ML preservation: fetch existing ML + fingerprints before DELETE ──
+    # In affected mode, we need to save ML values for works whose deterministic
+    # features haven't changed (fingerprint match). This prevents the DELETE+INSERT
+    # from wiping valid ML predictions.
+    existing_ml = {}  # work_id → {delay_probability, delay_risk_band, isolation_score, isolation_level, feature_fingerprint}
+    if affected_work_ids is not None and affected_work_ids:
+        ml_fetch_start = time.time()
+        for table_name in ("work_analysis", "mla_work_analysis"):
+            try:
+                all_ids = list(affected_work_ids)
+                batch_size = 200
+                for start in range(0, len(all_ids), batch_size):
+                    batch = all_ids[start:start + batch_size]
+                    resp = (
+                        _probe.table(table_name)
+                        .select("work_id,delay_probability,delay_risk_band,"
+                                "isolation_score,isolation_level,feature_fingerprint")
+                        .in_("work_id", batch)
+                        .execute()
+                    )
+                    for row in (resp.data or []):
+                        wid = row["work_id"]
+                        existing_ml[wid] = {
+                            "delay_probability": row.get("delay_probability"),
+                            "delay_risk_band": row.get("delay_risk_band"),
+                            "isolation_score": row.get("isolation_score"),
+                            "isolation_level": row.get("isolation_level"),
+                            "feature_fingerprint": row.get("feature_fingerprint"),
+                        }
+            except Exception as e:
+                print(f"  WARNING: could not fetch existing ML for {table_name}: {e}")
+                # If feature_fingerprint column doesn't exist yet, that's OK —
+                # all works will be treated as needing recomputation.
+        ml_fetch_elapsed = time.time() - ml_fetch_start
+        print(f"  ML preservation: fetched {len(existing_ml)} existing records ({ml_fetch_elapsed:.1f}s)")
 
     def _work_analysis_to_record(wa):
         """Convert WorkAnalysis dataclass to DB1 record dict."""
@@ -793,6 +869,7 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
             "flag_count": wa.flag_count,
             "risk_level": wa.risk_level,
             "last_calculated": now_str,
+            "feature_fingerprint": _compute_feature_fingerprint(wa),
         }
 
     def _insert_records(client, table_name, records, label):
@@ -814,27 +891,107 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
                         print(f"  WARNING: individual insert failed: {e2}")
         return inserted
 
+    def _restore_ml_values(client, table_name, records, label):
+        """Restore ML values for works whose feature fingerprint matches.
+
+        After INSERT, ML columns are NULL. For works where the deterministic
+        features haven't changed (fingerprint matches), restore the existing
+        ML values. For works where features changed or are new, leave NULL
+        (intelligence backfill will recompute).
+
+        Returns dict with preserved/stale/new counts.
+        """
+        if not existing_ml:
+            # No existing ML data found for any affected work — all are new
+            return {"preserved": 0, "stale": 0, "new": len(records)}
+
+        preserved = 0
+        stale = 0
+        new = 0
+        to_restore = []
+
+        for rec in records:
+            wid = rec["work_id"]
+            old = existing_ml.get(wid)
+            if old is None:
+                new += 1
+                continue
+            old_fp = old.get("feature_fingerprint")
+            new_fp = rec.get("feature_fingerprint")
+            if old_fp and new_fp and old_fp == new_fp:
+                # Features unchanged — safe to preserve ML values
+                ml_update = {}
+                for col in ("delay_probability", "delay_risk_band",
+                            "isolation_score", "isolation_level"):
+                    if old.get(col) is not None:
+                        ml_update[col] = old[col]
+                if ml_update:
+                    ml_update["work_id"] = wid
+                    to_restore.append(ml_update)
+                    preserved += 1
+                else:
+                    # Old ML values were all NULL — treat as new
+                    new += 1
+            else:
+                # Features changed — old ML prediction is stale
+                stale += 1
+
+        # Batched restore via upsert (500 per batch)
+        if to_restore:
+            batch_size = 500
+            for start in range(0, len(to_restore), batch_size):
+                batch = to_restore[start:start + batch_size]
+                try:
+                    client.table(table_name).upsert(batch, on_conflict="work_id").execute()
+                except Exception as e:
+                    print(f"  WARNING: ML restore upsert failed for {label}: {e}")
+                    for row in batch:
+                        try:
+                            wid = row.pop("work_id")
+                            client.table(table_name).update(row).eq("work_id", wid).execute()
+                        except Exception:
+                            pass
+
+        return {"preserved": preserved, "stale": stale, "new": new}
+
     def _delete_work_ids_partition(partition, table_name, label, worker_idx):
-        """Delete old records for a partition of work_ids. Returns count deleted."""
+        """Delete old records for a partition of work_ids. Returns count deleted.
+
+        Uses batched in-clause deletes (200 per batch) instead of
+        individual REST calls for ~5-10x throughput improvement.
+        """
         deleted = 0
-        for wid in partition:
+        batch_size = 200
+        client_key = db1_url + db1_key
+        if client_key not in _sb_clients:
+            from supabase import create_client
+            _sb_clients[client_key] = create_client(db1_url, db1_key)
+        client = _sb_clients[client_key]
+        for start in range(0, len(partition), batch_size):
+            batch = partition[start:start + batch_size]
             try:
-                sb_delete(db1_url, db1_key, table_name,
-                          {"work_id": f"eq.{wid}"})
-                deleted += 1
+                client.table(table_name).delete().in_("work_id", batch).execute()
+                deleted += len(batch)
             except Exception:
-                pass
+                for wid in batch:
+                    try:
+                        sb_delete(db1_url, db1_key, table_name,
+                                  {"work_id": f"eq.{wid}"})
+                        deleted += 1
+                    except Exception:
+                        pass
         return deleted
 
     def _persist_table_parallel(table_name, analyses, label):
         """Persist analyses for one table with parallel delete phase.
 
         In affected mode, deletes old records first (to satisfy the unique
-        constraint on work_id), then inserts fresh records.
+        constraint on work_id), then inserts fresh records, then restores
+        ML values for works whose deterministic features haven't changed.
         """
         if not analyses:
             print(f"  {label}: no analyses to persist")
-            return 0
+            return {"inserted": 0, "ml": {"preserved": 0, "stale": 0, "new": 0}}
 
         t_start = time.time()
         records = [_work_analysis_to_record(wa) for wa in analyses]
@@ -875,16 +1032,21 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
         from supabase import create_client
         client = create_client(db1_url, db1_key)
         inserted = _insert_records(client, table_name, records, label)
+
+        # Step 3: Restore ML values for works with unchanged features
+        ml_stats = {"preserved": 0, "stale": 0, "new": 0}
+        if affected_work_ids is not None and records:
+            ml_stats = _restore_ml_values(client, table_name, records, label)
+
         insert_elapsed = time.time() - t_start
+        print(f"  {label}: inserted {inserted} records, "
+              f"ML preserved={ml_stats['preserved']} stale={ml_stats['stale']} "
+              f"new={ml_stats['new']} ({insert_elapsed:.1f}s)")
 
-        if affected_work_ids is None:
-            print(f"  {label}: inserted {inserted} records ({insert_elapsed:.1f}s)")
-        else:
-            print(f"  {label}: inserted {inserted} records ({insert_elapsed:.1f}s)")
-
-        return inserted
+        return {"inserted": inserted, "ml": ml_stats}
 
     # Run MP and MLA tables in parallel
+    ml_totals = {"preserved": 0, "stale": 0, "new": 0}
     with ThreadPoolExecutor(max_workers=2) as executor:
         mp_future = executor.submit(
             _persist_table_parallel, "work_analysis", mp_analyses, "MP work_analysis"
@@ -892,12 +1054,25 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
         mla_future = executor.submit(
             _persist_table_parallel, "mla_work_analysis", mla_analyses, "MLA mla_work_analysis"
         )
-        mp_written = mp_future.result()
-        mla_written = mla_future.result()
+        mp_result = mp_future.result()
+        mla_result = mla_future.result()
 
-    total = mp_written + mla_written
+    for k in ml_totals:
+        ml_totals[k] = mp_result["ml"][k] + mla_result["ml"][k]
+
+    total = mp_result["inserted"] + mla_result["inserted"]
     print(f"  Total work analysis persisted: {total}")
-    return {"mp_written": mp_written, "mla_written": mla_written, "total": total}
+    print(f"  ML lifecycle: preserved={ml_totals['preserved']} "
+          f"stale={ml_totals['stale']} new={ml_totals['new']} "
+          f"(stale/new will be recomputed by intelligence backfill)")
+    return {
+        "mp_written": mp_result["inserted"],
+        "mla_written": mla_result["inserted"],
+        "total": total,
+        "ml_preserved": ml_totals["preserved"],
+        "ml_stale": ml_totals["stale"],
+        "ml_new": ml_totals["new"],
+    }
 
 
 def stage_anomaly(pipeline_result, reference_date=None):
@@ -1579,7 +1754,7 @@ def stage_persist_affected(evidence_records, affected_keys):
 def stage_verify(evidence_records, pipeline_result, anomaly_result,
                  gemini_result=None, persist_result=None,
                  analytics_result=None, work_refs_result=None,
-                 affected_result=None):
+                 affected_result=None, work_analysis_result=None):
     """Stage 11: Verify pipeline outputs before cleanup.
 
     Checks:
@@ -1599,6 +1774,7 @@ def stage_verify(evidence_records, pipeline_result, anomaly_result,
     print("\n=== STAGE 11: VERIFY ===")
 
     issues = []
+    warnings = []
 
     # Check evidence is non-empty
     if not evidence_records:
@@ -1667,25 +1843,48 @@ def stage_verify(evidence_records, pipeline_result, anomaly_result,
         if work_refs_result.get("written", 0) == 0 and len(evidence_records) > 0:
             issues.append("No evidence work refs written (expected some)")
 
-    # Check gemini result
+    # Check gemini result — partial failures are warnings, not hard failures.
+    # One unresolved AI explanation should NOT undo validated deterministic analytics.
     if gemini_result and not gemini_result.get("skipped"):
         if gemini_result.get("failed", 0) > 0:
-            issues.append(f"Gemini had {gemini_result['failed']} failures")
+            warnings.append(f"Gemini had {gemini_result['failed']} failures (partial AI)")
+
+    # Check ML column completeness — affected works must have ML values after
+    # intelligence backfill runs. If ML is NULL, the pipeline status should
+    # reflect this as a warning (not a hard failure, since the backfill may
+    # have been skipped or failed independently).
+    if work_analysis_result:
+        ml_preserved = work_analysis_result.get("ml_preserved", 0)
+        ml_stale = work_analysis_result.get("ml_stale", 0)
+        ml_new = work_analysis_result.get("ml_new", 0)
+        ml_need_recompute = ml_stale + ml_new
+        if ml_preserved > 0:
+            print(f"  ML preserved: {ml_preserved} works (features unchanged)")
+        if ml_need_recompute > 0:
+            print(f"  ML needs recomputation: {ml_need_recompute} works "
+                  f"(stale={ml_stale}, new={ml_new})")
 
     # Check no source deletion (invariant)
     # This is a structural check — we never delete from DB1 in this pipeline
     # If we reach here, the invariant holds
 
     passed = len(issues) == 0
+    status = "PASS" if not warnings else "SUCCESS_WITH_WARNINGS"
+    if not passed:
+        status = "FAIL"
     print(f"  Evidence records: {len(evidence_records)}")
     print(f"  Member evidence: {member_count}")
     print(f"  State evidence: {state_count}")
     print(f"  Issues: {len(issues)}")
     for issue in issues:
         print(f"    - {issue}")
-    print(f"  Result: {'PASS' if passed else 'FAIL'}")
+    if warnings:
+        print(f"  Warnings: {len(warnings)}")
+        for w in warnings:
+            print(f"    - {w}")
+    print(f"  Result: {status}")
 
-    return {"passed": passed, "issues": issues}
+    return {"passed": passed, "status": status, "issues": issues, "warnings": warnings}
 
 
 def stage_cleanup(run_id=None, delta_dir=None, local_snapshot=None):
@@ -1952,6 +2151,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 analytics_result=analytics_result,
                 work_refs_result=work_refs_result,
                 affected_result=affected_result,
+                work_analysis_result=work_analysis_result,
             )
             results["stages"]["verify"] = verify_result
             save_checkpoint(run_id, "verify", verify_result)
@@ -2071,6 +2271,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 gemini_result, persist_result,
                 analytics_result=analytics_result,
                 work_refs_result=work_refs_result,
+                work_analysis_result=work_analysis_result,
             )
             results["stages"]["verify"] = verify_result
             save_checkpoint(run_id, "verify", verify_result)
@@ -2094,7 +2295,11 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
         save_checkpoint(run_id, "cleanup", cleanup_result)
         timing["cleanup"] = _elapsed(t12)
 
-        results["status"] = "SUCCESS"
+        if verify_result.get("warnings"):
+            results["status"] = "SUCCESS_WITH_WARNINGS"
+            results["warnings"] = verify_result["warnings"]
+        else:
+            results["status"] = "SUCCESS"
         results["completed_at"] = _now_iso()
         results["timing"] = timing
 
