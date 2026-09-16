@@ -190,10 +190,10 @@ async def _fetch_with_timeout(pool, sql, label, timeout_s=600):
         return [dict(r) for r in rows]
 
 
-async def _load_works(db1):
+async def _load_works(db2):
     """Load the minimal works projection needed by the project model and
-    anomaly stages. Fetched in PARALLEL from two dedicated connections,
-    each with a raised statement_timeout so Supabase does not cancel."""
+    anomaly stages. Fetched from DB2 (canonical work_analysis) in PARALLEL.
+    Each with a raised statement_timeout so Supabase does not cancel."""
     cols = """work_id, member_id, member_type, state_id,
               recommended_amount, sanction_amount, expenditure_amount,
               cost_percentile, duration_percentile,
@@ -201,11 +201,11 @@ async def _load_works(db1):
               recommendation_date, sanction_date, completion_date,
               work_category, normalized_activity"""
     t0 = time.monotonic()
-    print(f"[{_now()}]    >> DB1: loading work_analysis + mla_work_analysis IN PARALLEL ...", flush=True)
+    print(f"[{_now()}]    >> DB2: loading work_analysis + mla_work_analysis IN PARALLEL ...", flush=True)
     mp_rows, mla_rows = await asyncio.gather(
-        _fetch_with_timeout(db1, f"SELECT {cols} FROM public.work_analysis",
+        _fetch_with_timeout(db2, f"SELECT {cols} FROM public.work_analysis",
                             "work_analysis (MP ~108k)"),
-        _fetch_with_timeout(db1, f"SELECT {cols} FROM public.mla_work_analysis",
+        _fetch_with_timeout(db2, f"SELECT {cols} FROM public.mla_work_analysis",
                             "mla_work_analysis (MLA ~25k)"),
     )
     combined = mp_rows + mla_rows
@@ -323,8 +323,8 @@ async def stage_allocation(db1, db2, apply):
                              "SELECT member_id, allocated_amount FROM public.member_metrics"
                              " WHERE allocated_amount > 0")}
             _step(f"re-fetched {len(mem_alloc)} non-zero allocations for state aggregation")
-        with _timed("DB1 load works->state map (DISTINCT, ~737 rows)"):
-            work_map = await db1.fetch(
+        with _timed("DB2 load works->state map (DISTINCT, ~737 rows)"):
+            work_map = await db2.fetch(
                 """SELECT DISTINCT member_id, member_type, state_id FROM public.work_analysis
                    UNION SELECT DISTINCT member_id, member_type, state_id FROM public.mla_work_analysis""",
                 timeout=500,
@@ -534,7 +534,7 @@ async def stage_project_and_anomaly(db1, db2, apply):
     TIMER.start(5, "Project delay model (XGBoost)")
     TIMER.start(6, "Isolation Forest anomaly")
     # We run both models in this stage (5 + 6).
-    works = [dict(w) for w in await _load_works(db1)]
+    works = [dict(w) for w in await _load_works(db2)]
 
     # XGBoost project model
     print(f"  >> XGBoost: training on {len(works)} works ...", flush=True)
@@ -561,20 +561,19 @@ async def stage_project_and_anomaly(db1, db2, apply):
           f"NORMAL={sum(1 for r in iso_results if r['isolation_level']=='NORMAL')}")
 
     if apply:
-        with _timed("DB1 UPDATE per-work ML outputs (batched)"):
+        with _timed("DB2 UPDATE per-work ML outputs (batched)"):
             # Health check the shared pool
             try:
-                async with db1.acquire() as c:
+                async with db2.acquire() as c:
                     await c.execute("SELECT 1")
-                _step("DB1 connection health check passed")
+                _step("DB2 connection health check passed")
             except Exception as e:
-                _step(f"DB1 connection health check failed: {e}")
-                # Reconnect via db_pool module
-                from automation.db_pool import db1_reconnect
-                await db1_reconnect()
-                db1 = get_db1_pool()
-                _step("DB1 pool reconnected via db_pool")
-            async with db1.acquire() as c:
+                _step(f"DB2 connection health check failed: {e}")
+                from automation.db_pool import db2_reconnect
+                await db2_reconnect()
+                db2 = get_db2_pool()
+                _step("DB2 pool reconnected via db_pool")
+            async with db2.acquire() as c:
                 # Separate MP and MLA rows, batch executemany in chunks of 500.
                 # Only write isolation fields (XGBoost NOT_READY = no predictions).
                 mp_iso = [(i["isolation_score"], i["isolation_level"], i["work_id"])
@@ -648,12 +647,12 @@ async def stage_risk(db1, db2, m_scores, s_scores, work_predictions, iso_results
     if works is not None:
         _step(f"reusing {len(works)} works already in memory for risk aggregation")
     else:
-        with _timed("DB1 load work->member,state mapping (parallel)"):
+        with _timed("DB2 load work->member,state mapping (parallel)"):
             mp_wm, mla_wm = await asyncio.gather(
-                _fetch_with_timeout(db1,
+                _fetch_with_timeout(db2,
                     "SELECT work_id, member_id, member_type, state_id FROM public.work_analysis",
                     "work_analysis member/state map (MP)"),
-                _fetch_with_timeout(db1,
+                _fetch_with_timeout(db2,
                     "SELECT work_id, member_id, member_type, state_id FROM public.mla_work_analysis",
                     "mla_work_analysis member/state map (MLA)"),
             )

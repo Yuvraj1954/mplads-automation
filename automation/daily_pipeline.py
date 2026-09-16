@@ -819,52 +819,61 @@ CREATE INDEX IF NOT EXISTS idx_mla_work_analysis_activity_state ON public.mla_wo
 
 
 def _ensure_work_analysis_table():
-    """Verify work_analysis table exists on DB1 via Supabase REST.
+    """Verify work_analysis table exists on DB2 via Supabase REST.
 
-    This table is required for Stage 6b MP persistence. If missing,
+    DB2 is the canonical destination for work_analysis. If missing,
     the pipeline cannot proceed and must fail immediately.
 
     DDL is handled by explicit migrations (not the daily pipeline).
     GitHub Actions runners cannot reach port 5432 (direct PostgreSQL),
     so asyncpg DDL is not used here.
     """
-    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    db2_url = os.environ.get("DB2_URL", "")
+    db2_key = os.environ.get("DB2_SERVICE_ROLE_KEY", "") or os.environ.get("DB2_SECRET_KEY", "")
+    if not db2_url or not db2_key:
+        print("  work_analysis check: SKIPPED (no DB2_URL / DB2_SERVICE_ROLE_KEY)")
+        return
+    sb_db2 = create_client(db2_url, db2_key)
     try:
-        sb_local.table("work_analysis").select("work_id", count="exact").limit(0).execute()
-        print("  work_analysis table: ACCESSIBLE")
+        sb_db2.table("work_analysis").select("work_id", count="exact").limit(0).execute()
+        print("  work_analysis table (DB2): ACCESSIBLE")
     except Exception as exc:
         msg = str(exc)
         if "PGRST205" in msg or "does not exist" in msg.lower():
             raise RuntimeError(
-                "FATAL: public.work_analysis table is missing from DB1. "
-                "Stage 6b requires this table. Run the migration SQL in the "
-                "Supabase SQL Editor before re-running the pipeline."
+                "FATAL: public.work_analysis table is missing from DB2. "
+                "Stage 6b requires this table on DB2. Run the migration SQL in the "
+                "DB2 Supabase SQL Editor before re-running the pipeline."
             )
         raise
 
 
 def _ensure_mla_work_analysis_table():
-    """Verify mla_work_analysis table exists on DB1 via Supabase REST.
+    """Verify mla_work_analysis table exists on DB2 via Supabase REST.
 
-    This table is required for Stage 6b MLA persistence. If missing,
+    DB2 is the canonical destination for mla_work_analysis. If missing,
     the pipeline cannot proceed and must fail immediately.
 
     DDL is handled by explicit migrations (not the daily pipeline).
     GitHub Actions runners cannot reach port 5432 (direct PostgreSQL),
     so asyncpg DDL is not used here.
     """
-    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    db2_url = os.environ.get("DB2_URL", "")
+    db2_key = os.environ.get("DB2_SERVICE_ROLE_KEY", "") or os.environ.get("DB2_SECRET_KEY", "")
+    if not db2_url or not db2_key:
+        print("  mla_work_analysis check: SKIPPED (no DB2_URL / DB2_SERVICE_ROLE_KEY)")
+        return
+    sb_db2 = create_client(db2_url, db2_key)
     try:
-        sb_local.table("mla_work_analysis").select("work_id", count="exact").limit(0).execute()
-        print("  mla_work_analysis table: ACCESSIBLE")
+        sb_db2.table("mla_work_analysis").select("work_id", count="exact").limit(0).execute()
+        print("  mla_work_analysis table (DB2): ACCESSIBLE")
     except Exception as exc:
         msg = str(exc)
         if "PGRST205" in msg or "does not exist" in msg.lower():
             raise RuntimeError(
-                "FATAL: public.mla_work_analysis table is missing from DB1. "
-                "Stage 6b requires this table. Run "
-                "migration/2026_09_16_create_mla_work_analysis.sql in the "
-                "Supabase SQL Editor before re-running the pipeline."
+                "FATAL: public.mla_work_analysis table is missing from DB2. "
+                "Stage 6b requires this table on DB2. Run "
+                "the migration SQL in the DB2 Supabase SQL Editor before re-running the pipeline."
             )
         raise
 
@@ -1089,18 +1098,23 @@ def _ensure_category_fy_views():
 
 
 def _ensure_feature_fingerprint_column():
-    """Verify feature_fingerprint column exists on work_analysis + mla_work_analysis.
+    """Verify feature_fingerprint column exists on DB2 work_analysis + mla_work_analysis.
 
     This column stores a SHA-256 hash of ML-relevant deterministic features.
     Stage 6b uses it to detect whether ML predictions are still valid.
     Schema DDL is handled by migrations (not the daily pipeline).
     GitHub Actions runners cannot reach port 5432, so asyncpg DDL is not used.
     """
-    sb_local = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    db2_url = os.environ.get("DB2_URL", "")
+    db2_key = os.environ.get("DB2_SERVICE_ROLE_KEY", "") or os.environ.get("DB2_SECRET_KEY", "")
+    if not db2_url or not db2_key:
+        print("  feature_fingerprint check: SKIPPED (no DB2_URL / DB2_SERVICE_ROLE_KEY)")
+        return
+    sb_db2 = create_client(db2_url, db2_key)
     for table_name in ("work_analysis", "mla_work_analysis"):
         try:
-            sb_local.table(table_name).select("feature_fingerprint", count="exact").limit(0).execute()
-            print(f"  {table_name}.feature_fingerprint: ACCESSIBLE")
+            sb_db2.table(table_name).select("feature_fingerprint", count="exact").limit(0).execute()
+            print(f"  {table_name}.feature_fingerprint (DB2): ACCESSIBLE")
         except Exception as exc:
             msg = str(exc)
             if "PGRST205" in msg or "does not exist" in msg.lower():

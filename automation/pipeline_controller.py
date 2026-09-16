@@ -716,7 +716,10 @@ def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
 
 
 def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
-    """Stage 6b: Persist work analysis to DB1.work_analysis / DB1.mla_work_analysis.
+    """Stage 6b: Persist work analysis to DB2.work_analysis / DB2.mla_work_analysis.
+
+    DB2 is the canonical destination for work_analysis. The backend reads
+    from DB2; DB1 is raw/source only.
 
     For affected mode: deletes old records first (to satisfy the unique
     constraint on work_id), then inserts fresh records.
@@ -742,9 +745,10 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    print("\n=== STAGE 6b: WORK ANALYSIS PERSIST ===")
+    print("\n=== STAGE 6b: WORK ANALYSIS PERSIST (DB2) ===")
 
-    db1_url, db1_key = get_db1()
+    db2_url, db2_key = get_db2()
+    now_str = datetime.now(timezone.utc).isoformat()
     now_str = datetime.now(timezone.utc).isoformat()
 
     # Isolation Forest feature columns used for fingerprint computation.
@@ -769,11 +773,11 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
         raw = "|".join(parts)
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    # Pre-check: verify both tables exist before attempting writes.
+    # Pre-check: verify both tables exist on DB2 before attempting writes.
     # Retry once after 3s if PostgREST schema cache is stale (PGRST205).
     import time as _time
     from supabase import create_client as _cc
-    _probe = _cc(db1_url, db1_key)
+    _probe = _cc(db2_url, db2_key)
     for tbl in ("work_analysis", "mla_work_analysis"):
         ok = False
         for attempt in range(2):
@@ -786,8 +790,8 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
                     print(f"  WARNING: table '{tbl}' not visible in schema cache (attempt 1/2), retrying in 3s ...")
                     _time.sleep(3)
                 else:
-                    print(f"  FATAL: table '{tbl}' not accessible on DB1: {e}")
-                    raise RuntimeError(f"Table '{tbl}' missing from DB1.")
+                    print(f"  FATAL: table '{tbl}' not accessible on DB2: {e}")
+                    raise RuntimeError(f"Table '{tbl}' missing from DB2.")
         if ok:
             print(f"  table '{tbl}': ACCESSIBLE")
 
@@ -839,7 +843,7 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
         print(f"  ML preservation: fetched {len(existing_ml)} existing records ({ml_fetch_elapsed:.1f}s)")
 
     def _work_analysis_to_record(wa):
-        """Convert WorkAnalysis dataclass to DB1 record dict."""
+        """Convert WorkAnalysis dataclass to DB2 record dict."""
         return {
             "work_id": wa.work_id,
             "member_id": wa.member_id,
@@ -983,10 +987,10 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
         """
         deleted = 0
         batch_size = 200
-        client_key = db1_url + db1_key
+        client_key = db2_url + db2_key
         if client_key not in _sb_clients:
             from supabase import create_client
-            _sb_clients[client_key] = create_client(db1_url, db1_key)
+            _sb_clients[client_key] = create_client(db2_url, db2_key)
         client = _sb_clients[client_key]
         for start in range(0, len(partition), batch_size):
             batch = partition[start:start + batch_size]
@@ -996,7 +1000,7 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
             except Exception:
                 for wid in batch:
                     try:
-                        sb_delete(db1_url, db1_key, table_name,
+                        sb_delete(db2_url, db2_key, table_name,
                                   {"work_id": f"eq.{wid}"})
                         deleted += 1
                     except Exception:
@@ -1051,7 +1055,7 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
 
         # Step 2: Insert fresh records (sequential, already batched)
         from supabase import create_client
-        client = create_client(db1_url, db1_key)
+        client = create_client(db2_url, db2_key)
         inserted = _insert_records(client, table_name, records, label)
 
         # Step 3: Restore ML values for works with unchanged features
@@ -2100,7 +2104,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 results["timing"] = timing
                 return results
 
-            # Stage 6b: Persist affected work analysis to DB1
+            # Stage 6b: Persist affected work analysis to DB2
             t6b = _timer()
             work_analysis_result = stage_work_analysis_persist(
                 analysis_result["work_analyses"],
@@ -2231,7 +2235,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 results["timing"] = timing
                 return results
 
-            # Stage 6b: Persist all work analysis to DB1 (full mode)
+            # Stage 6b: Persist all work analysis to DB2 (full mode)
             t6b = _timer()
             work_analysis_result = stage_work_analysis_persist(
                 analysis_result["work_analyses"],

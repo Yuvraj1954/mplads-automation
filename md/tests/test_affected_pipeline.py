@@ -1060,7 +1060,7 @@ class TestFullModeRegression:
                 }) + "\n")
 
             with patch("automation.pipeline_controller.load_config") as mock_cfg, \
-                 patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
+                 patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")):
                 mock_cfg.return_value = MagicMock(
                     db1_url="http://fake", db1_key="fake-key",
                     db2_url="http://fake2", db2_key="fake-key2",
@@ -1176,7 +1176,7 @@ class TestFullModeRegression:
             delta_dir.mkdir()
 
             with patch("automation.pipeline_controller.load_config") as mock_cfg, \
-                 patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
+                 patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")):
                 mock_cfg.return_value = MagicMock(
                     db1_url="http://fake", db1_key="fake-key",
                     db2_url="http://fake2", db2_key="fake-key2",
@@ -1337,7 +1337,7 @@ class TestEdgeCases:
                 f.write(json.dumps({"WORK_RECOMMENDATION_DTL_ID": 12345}) + "\n")
 
             with patch("automation.pipeline_controller.load_config"):
-                with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
+                with patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")):
                     with patch("automation.pipeline_controller.sb_get", return_value=[{
                         "work_id": 100,
                         "member_type": "MP",
@@ -1465,7 +1465,7 @@ class TestWorkAnalysisPersist:
             risk_level="HIGH",
         )
 
-        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+        with patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")), \
              patch("automation.pipeline_controller.sb_delete", return_value=200), \
              patch("supabase.create_client") as mock_create:
             mock_client = MagicMock()
@@ -1482,7 +1482,8 @@ class TestWorkAnalysisPersist:
         """Empty analysis list writes nothing."""
         from automation.pipeline_controller import stage_work_analysis_persist
 
-        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")):
+        with patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")), \
+             patch("supabase.create_client"):
             result = stage_work_analysis_persist([], affected_work_ids=set())
         assert result["total"] == 0
 
@@ -1500,7 +1501,7 @@ class TestWorkAnalysisPersist:
             status="Sanctioned", risk_level="LOW",
         )
 
-        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+        with patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")), \
              patch("automation.pipeline_controller.sb_delete", return_value=200), \
              patch("supabase.create_client") as mock_create:
             mock_client = MagicMock()
@@ -1528,7 +1529,7 @@ class TestWorkAnalysisPersist:
             status="Completed", risk_level="LOW",
         )
 
-        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+        with patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")), \
              patch("automation.pipeline_controller.sb_delete", return_value=200), \
              patch("supabase.create_client") as mock_create:
             mock_client = MagicMock()
@@ -1553,7 +1554,7 @@ class TestWorkAnalysisPersist:
             for i in range(10)
         ]
 
-        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+        with patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")), \
              patch("automation.pipeline_controller.sb_delete", return_value=200), \
              patch("supabase.create_client") as mock_create:
             mock_client = MagicMock()
@@ -1576,7 +1577,7 @@ class TestWorkAnalysisPersist:
             flag_count=2,
         )
 
-        with patch("automation.pipeline_controller.get_db1", return_value=("http://fake", "fake-key")), \
+        with patch("automation.pipeline_controller.get_db2", return_value=("http://fake", "fake-key")), \
              patch("automation.pipeline_controller.sb_delete", return_value=200), \
              patch("supabase.create_client") as mock_create:
             mock_client = MagicMock()

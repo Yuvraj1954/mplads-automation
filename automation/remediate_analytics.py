@@ -67,11 +67,11 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-async def _work_cost_by_member(db1):
+async def _work_cost_by_member(db2):
     """(member_type, member_id) -> (avg, median) sanction cost per work."""
     acc = {}
     for table, mt in (("work_analysis", "MP"), ("mla_work_analysis", "MLA")):
-        rows = await db1.fetch(
+        rows = await db2.fetch(
             f"SELECT member_id, sanction_amount FROM public.{table} "
             f"WHERE sanction_amount IS NOT NULL AND sanction_amount > 0"
         )
@@ -83,10 +83,10 @@ async def _work_cost_by_member(db1):
     return out
 
 
-async def _work_cost_by_state(db1):
+async def _work_cost_by_state(db2):
     acc = {}
     for table in ("work_analysis", "mla_work_analysis"):
-        rows = await db1.fetch(
+        rows = await db2.fetch(
             f"SELECT state_id, sanction_amount FROM public.{table} "
             f"WHERE sanction_amount IS NOT NULL AND sanction_amount > 0"
         )
@@ -201,7 +201,7 @@ async def main():
         print(f"  Deleted {total_orphans} orphan metric rows and their AI rows")
 
     # ---------------- Phase 1/2: members ----------------
-    costs = await _work_cost_by_member(db1)
+    costs = await _work_cost_by_member(db2)
     members = await db2.fetch(
         """SELECT member_id, member_type, total_works, completion_rate_pct,
                   fund_utilization_pct, zero_work_member, low_sample_member,
@@ -250,7 +250,7 @@ async def main():
         print("  members updated")
 
     # ---------------- Phase 1/2: states ----------------
-    scosts = await _work_cost_by_state(db1)
+    scosts = await _work_cost_by_state(db2)
     states = await db2.fetch(
         """SELECT state_id, total_works, completion_rate_pct, fund_utilization_pct
            FROM public.state_metrics"""

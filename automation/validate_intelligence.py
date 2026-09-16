@@ -276,9 +276,9 @@ async def main():
         # ------------------------------------------------------------------
         # 7. Per-work ML columns populated
         # ------------------------------------------------------------------
-        mp_iso = await db1.fetchval(
+        mp_iso = await db2.fetchval(
             "SELECT COUNT(*) FROM public.work_analysis WHERE isolation_score IS NOT NULL")
-        mla_iso = await db1.fetchval(
+        mla_iso = await db2.fetchval(
             "SELECT COUNT(*) FROM public.mla_work_analysis WHERE isolation_score IS NOT NULL")
         checks.append({
             "name": "per-work isolation scores populated",

@@ -88,14 +88,14 @@ def _compute_fp(sanction_amount=0, recommended_amount=0, expenditure_amount=0,
 class TestStage6bDeleteInsertOrder:
     """Tests for delete-before-insert ordering in stage_work_analysis_persist."""
 
-    @patch("automation.pipeline_controller.get_db1")
+    @patch("automation.pipeline_controller.get_db2")
     @patch("automation.pipeline_controller.sb_delete")
     @patch("supabase.create_client")
-    def test_rerun_existing_work_id_succeeds(self, mock_create_client, mock_sb_delete, mock_get_db1):
+    def test_rerun_existing_work_id_succeeds(self, mock_create_client, mock_sb_delete, mock_get_db2):
         """Rerunning a work_id that already exists should not error."""
         from automation.pipeline_controller import _sb_clients
         _sb_clients.clear()
-        mock_get_db1.return_value = ("http://test", "test-key")
+        mock_get_db2.return_value = ("http://test", "test-key")
         mock_client = MagicMock()
         mock_create_client.return_value = mock_client
         mock_sb_delete.return_value = 200
@@ -108,14 +108,14 @@ class TestStage6bDeleteInsertOrder:
         assert result["total"] == 1
         assert result["mp_written"] == 1
 
-    @patch("automation.pipeline_controller.get_db1")
+    @patch("automation.pipeline_controller.get_db2")
     @patch("automation.pipeline_controller.sb_delete")
     @patch("supabase.create_client")
-    def test_delete_runs_before_insert(self, mock_create_client, mock_sb_delete, mock_get_db1):
+    def test_delete_runs_before_insert(self, mock_create_client, mock_sb_delete, mock_get_db2):
         """Verify delete phase executes before insert phase."""
         from automation.pipeline_controller import _sb_clients
         _sb_clients.clear()
-        mock_get_db1.return_value = ("http://test", "test-key")
+        mock_get_db2.return_value = ("http://test", "test-key")
         mock_client = MagicMock()
         mock_create_client.return_value = mock_client
 
@@ -147,14 +147,14 @@ class TestStage6bDeleteInsertOrder:
         assert call_order.index("delete") < call_order.index("insert"), \
             f"Expected delete before insert, got: {call_order}"
 
-    @patch("automation.pipeline_controller.get_db1")
+    @patch("automation.pipeline_controller.get_db2")
     @patch("automation.pipeline_controller.sb_delete")
     @patch("supabase.create_client")
-    def test_mla_work_id_offset_handled(self, mock_create_client, mock_sb_delete, mock_get_db1):
+    def test_mla_work_id_offset_handled(self, mock_create_client, mock_sb_delete, mock_get_db2):
         """MLA work_ids with +1000000 offset are deleted correctly."""
         from automation.pipeline_controller import _sb_clients
         _sb_clients.clear()
-        mock_get_db1.return_value = ("http://test", "test-key")
+        mock_get_db2.return_value = ("http://test", "test-key")
         mock_client = MagicMock()
         mock_create_client.return_value = mock_client
         mock_sb_delete.return_value = 200
@@ -173,14 +173,14 @@ class TestStage6bDeleteInsertOrder:
         assert any("1159378" in c for c in all_delete_calls), \
             f"MLA work_id not deleted: in_={delete_calls_in}, sb_delete={delete_calls_sb}"
 
-    @patch("automation.pipeline_controller.get_db1")
+    @patch("automation.pipeline_controller.get_db2")
     @patch("automation.pipeline_controller.sb_delete")
     @patch("supabase.create_client")
-    def test_full_mode_no_delete(self, mock_create_client, mock_sb_delete, mock_get_db1):
+    def test_full_mode_no_delete(self, mock_create_client, mock_sb_delete, mock_get_db2):
         """Full mode (affected_work_ids=None) should only insert, no delete."""
         from automation.pipeline_controller import _sb_clients
         _sb_clients.clear()
-        mock_get_db1.return_value = ("http://test", "test-key")
+        mock_get_db2.return_value = ("http://test", "test-key")
         mock_client = MagicMock()
         mock_create_client.return_value = mock_client
 
@@ -196,14 +196,14 @@ class TestStage6bDeleteInsertOrder:
 class TestMLFingerprintPreservation:
     """TEST A/B/C: ML fingerprint preservation lifecycle."""
 
-    @patch("automation.pipeline_controller.get_db1")
+    @patch("automation.pipeline_controller.get_db2")
     @patch("automation.pipeline_controller.sb_delete")
     @patch("supabase.create_client")
-    def test_ml_preserved_when_features_unchanged(self, mock_create_client, mock_sb_delete, mock_get_db1):
+    def test_ml_preserved_when_features_unchanged(self, mock_create_client, mock_sb_delete, mock_get_db2):
         """TEST A (inverse): Features unchanged → fingerprint match → ML preserved."""
         from automation.pipeline_controller import _sb_clients
         _sb_clients.clear()
-        mock_get_db1.return_value = ("http://test", "test-key")
+        mock_get_db2.return_value = ("http://test", "test-key")
         mock_client = MagicMock()
         mock_create_client.return_value = mock_client
         mock_sb_delete.return_value = 200
@@ -247,14 +247,14 @@ class TestMLFingerprintPreservation:
         assert result["ml_stale"] == 0
         assert result["ml_new"] == 0
 
-    @patch("automation.pipeline_controller.get_db1")
+    @patch("automation.pipeline_controller.get_db2")
     @patch("automation.pipeline_controller.sb_delete")
     @patch("supabase.create_client")
-    def test_ml_stale_when_features_change(self, mock_create_client, mock_sb_delete, mock_get_db1):
+    def test_ml_stale_when_features_change(self, mock_create_client, mock_sb_delete, mock_get_db2):
         """TEST B: Features changed → fingerprint mismatch → ML stale (not preserved)."""
         from automation.pipeline_controller import _sb_clients
         _sb_clients.clear()
-        mock_get_db1.return_value = ("http://test", "test-key")
+        mock_get_db2.return_value = ("http://test", "test-key")
         mock_client = MagicMock()
         mock_create_client.return_value = mock_client
         mock_sb_delete.return_value = 200
@@ -297,14 +297,14 @@ class TestMLFingerprintPreservation:
         assert result["ml_stale"] == 1
         assert result["ml_new"] == 0
 
-    @patch("automation.pipeline_controller.get_db1")
+    @patch("automation.pipeline_controller.get_db2")
     @patch("automation.pipeline_controller.sb_delete")
     @patch("supabase.create_client")
-    def test_new_work_gets_null_ml(self, mock_create_client, mock_sb_delete, mock_get_db1):
+    def test_new_work_gets_null_ml(self, mock_create_client, mock_sb_delete, mock_get_db2):
         """TEST C (part 1): New work (no existing record) → ML left NULL → new count."""
         from automation.pipeline_controller import _sb_clients
         _sb_clients.clear()
-        mock_get_db1.return_value = ("http://test", "test-key")
+        mock_get_db2.return_value = ("http://test", "test-key")
         mock_client = MagicMock()
         mock_create_client.return_value = mock_client
         mock_sb_delete.return_value = 200
@@ -327,14 +327,14 @@ class TestMLFingerprintPreservation:
         assert result["ml_stale"] == 0
         assert result["ml_new"] == 1
 
-    @patch("automation.pipeline_controller.get_db1")
+    @patch("automation.pipeline_controller.get_db2")
     @patch("automation.pipeline_controller.sb_delete")
     @patch("supabase.create_client")
-    def test_feature_fingerprint_computed_in_record(self, mock_create_client, mock_sb_delete, mock_get_db1):
+    def test_feature_fingerprint_computed_in_record(self, mock_create_client, mock_sb_delete, mock_get_db2):
         """Verify feature_fingerprint is included in inserted records."""
         from automation.pipeline_controller import _sb_clients
         _sb_clients.clear()
-        mock_get_db1.return_value = ("http://test", "test-key")
+        mock_get_db2.return_value = ("http://test", "test-key")
         mock_client = MagicMock()
         mock_create_client.return_value = mock_client
         mock_sb_delete.return_value = 200

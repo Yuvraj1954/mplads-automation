@@ -92,9 +92,9 @@ async def main():
                FROM public.model_registry
                WHERE model_name = 'isolation_forest'
                ORDER BY training_date DESC LIMIT 1""")
-        mp_iso = await db1.fetchval(
+        mp_iso = await db2.fetchval(
             "SELECT COUNT(*) FROM public.work_analysis WHERE isolation_score IS NOT NULL")
-        mla_iso = await db1.fetchval(
+        mla_iso = await db2.fetchval(
             "SELECT COUNT(*) FROM public.mla_work_analysis WHERE isolation_score IS NOT NULL")
         if row and row["status"] == "READY" and mp_iso and mla_iso:
             verdict = "READY"
