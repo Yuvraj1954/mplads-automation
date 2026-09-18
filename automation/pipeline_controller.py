@@ -1416,6 +1416,10 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
     Processes evidence in parallel across multiple API keys and models
     with bounded concurrency and per-lane rate limiting.
 
+    Includes persistent retry backlog: failed Gemini entities are recorded
+    in the gemini_retry_backlog table in DB2 and automatically retried on
+    subsequent runs using fresh DB2 evidence.
+
     Args:
         evidence_records: list of evidence record dicts
         api_keys: list of API key strings (default: from config)
@@ -1427,6 +1431,11 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
     import os
     from analysis.gemini_scheduler import GeminiScheduler
     from analysis.gemini_processor import filter_affected
+    from automation.gemini_backlog import (
+        BACKLOG_TABLE, ensure_backlog_table, load_pending_backlog,
+        record_failure, record_success, merge_candidates,
+        fetch_evidence_for_backlog, backlog_summary, resolve_failures,
+    )
 
     print("\n=== STAGE 9: GEMINI (Parallel) ===")
 
@@ -1439,6 +1448,15 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
 
     db2_url, db2_key = get_db2()
 
+    # Ensure backlog table exists
+    ensure_backlog_table(db2_url, db2_key)
+
+    # Load pending backlog entries from DB2
+    pending_backlog = load_pending_backlog(db2_url, db2_key)
+    backlog_info = backlog_summary(pending_backlog)
+    print(f"  Pending backlog: {backlog_info['total']} entries"
+          + (f" (by_error: {backlog_info['by_error']})" if backlog_info['by_error'] else ""))
+
     # Load existing analyses from DB2 to determine affected set
     existing = load_table(db2_url, db2_key, "ai_analysis",
                           "entity_type,entity_id,evidence_hash,prompt_version")
@@ -1446,12 +1464,26 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
     affected = filter_affected(evidence_records, existing)
     print(f"  Total evidence: {len(evidence_records)}")
     print(f"  Already up-to-date: {len(evidence_records) - len(affected)}")
-    print(f"  Need processing: {len(affected)}")
+    print(f"  Need processing (affected): {len(affected)}")
 
-    if not affected:
+    # Merge affected candidates with pending backlog
+    merged, backlog_only = merge_candidates(affected, pending_backlog)
+
+    # Fetch fresh DB2 evidence for backlog-only entities
+    backlog_evidence = []
+    if backlog_only:
+        backlog_evidence = fetch_evidence_for_backlog(db2_url, db2_key, backlog_only)
+        print(f"  Backlog-only (fetched fresh evidence): {len(backlog_evidence)}")
+
+    # Final candidate set
+    all_candidates = merged
+    print(f"  Total candidates (affected + backlog deduplicated): {len(all_candidates)}")
+
+    if not all_candidates:
         print("  Nothing to process.")
         return {"processed": 0, "skipped": len(evidence_records),
-                "success": 0, "failed": 0}
+                "success": 0, "failed": 0, "backlog_resolved": 0,
+                "backlog_remaining": backlog_info['total']}
 
     if models is None:
         models_env = os.environ.get("GEMINI_MODELS")
@@ -1484,19 +1516,41 @@ def stage_gemini(evidence_records, api_keys=None, models=None):
             "analysis_text": result.to_analysis_text(),
             "generated_at": result.generated_at,
         }], conflict_cols=["entity_type", "entity_id"])
+        # Resolve backlog entry on success
+        record_success(db2_url, db2_key, result.entity_type, result.entity_id)
 
-    batch_result = scheduler.process(affected, on_success=on_success)
+    batch_result = scheduler.process(all_candidates, on_success=on_success)
+
+    # Record failures in persistent backlog
+    backlog_resolved = 0
+    if batch_result.get("failures"):
+        resolve_failures(db2_url, db2_key, batch_result["failures"])
+        # Count how many backlog items were resolved (succeeded) vs newly failed
+        failed_keys = {(f.get("entity_type"), f.get("entity_id"))
+                       for f in batch_result["failures"]}
+        backlog_resolved = sum(
+            1 for e in pending_backlog
+            if (e["entity_type"], e["entity_id"]) not in failed_keys
+        )
+
+    # Count remaining pending backlog
+    remaining_backlog = load_pending_backlog(db2_url, db2_key)
+    remaining_count = len(remaining_backlog)
 
     print(f"  Successful: {batch_result['success_count']}")
     print(f"  Failed: {batch_result['failure_count']}")
     print(f"  Retries: {batch_result.get('retries', 0)}")
+    print(f"  Backlog resolved: {backlog_resolved}")
+    print(f"  Backlog remaining: {remaining_count}")
 
     return {
-        "processed": len(affected),
+        "processed": len(all_candidates),
         "skipped": len(evidence_records) - len(affected),
         "success": batch_result["success_count"],
         "failed": batch_result["failure_count"],
         "failures": batch_result["failures"],
+        "backlog_resolved": backlog_resolved,
+        "backlog_remaining": remaining_count,
     }
 
 
@@ -1917,7 +1971,11 @@ def stage_verify(evidence_records, pipeline_result, anomaly_result,
     # One unresolved AI explanation should NOT undo validated deterministic analytics.
     if gemini_result and not gemini_result.get("skipped"):
         if gemini_result.get("failed", 0) > 0:
-            warnings.append(f"Gemini had {gemini_result['failed']} failures (partial AI)")
+            remaining = gemini_result.get("backlog_remaining", 0)
+            warnings.append(
+                f"Gemini had {gemini_result['failed']} failures (partial AI)"
+                + (f"; {remaining} pending retry backlog" if remaining else "")
+            )
 
     # Check ML column completeness — affected works must have ML values after
     # intelligence backfill runs. If ML is NULL, the pipeline status should
@@ -2190,6 +2248,8 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             save_checkpoint(run_id, "gemini", {
                 "processed": gemini_result.get("processed", 0),
                 "success": gemini_result.get("success", 0),
+                "failed": gemini_result.get("failed", 0),
+                "backlog_remaining": gemini_result.get("backlog_remaining", 0),
             })
             timing["gemini"] = _elapsed(t9)
 
@@ -2327,6 +2387,8 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             save_checkpoint(run_id, "gemini", {
                 "processed": gemini_result.get("processed", 0),
                 "success": gemini_result.get("success", 0),
+                "failed": gemini_result.get("failed", 0),
+                "backlog_remaining": gemini_result.get("backlog_remaining", 0),
             })
             timing["gemini"] = _elapsed(t9)
             print(f">>> STAGE 9 done: {_elapsed(t9)}", flush=True)
