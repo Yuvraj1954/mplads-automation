@@ -820,7 +820,13 @@ async def main():
 
     try:
         # Use shared pools from db_pool module
-        await init_pools(db1_url=db1_url, db2_url=db2_url)
+        try:
+            await init_pools(db1_url=db1_url, db2_url=db2_url)
+        except (RuntimeError, OSError) as exc:
+            print(f"\nFATAL: Database connection failed: {exc}", file=sys.stderr, flush=True)
+            print("Skipping intelligence backfill — core pipeline data is unaffected.",
+                  file=sys.stderr, flush=True)
+            sys.exit(1)
         db1 = get_db1_pool()
         db2 = get_db2_pool()
         _step("Shared DB1 + DB2 pools initialized")

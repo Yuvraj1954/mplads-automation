@@ -5,6 +5,7 @@ Eliminates per-module pool creation. All stages share pools from here.
 from __future__ import annotations
 
 import os
+import socket
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 
@@ -38,24 +39,44 @@ async def init_pools(
     db2_url = db2_url or os.environ.get("DB2_DATABASE_URL", "")
 
     if db1_url and _db1_pool is None:
-        _db1_pool = await asyncpg.create_pool(
-            dsn=db1_url,
-            min_size=db1_min,
-            max_size=db1_max,
-            statement_cache_size=0,
-            command_timeout=1200,
-            init=_init_db1_conn,
-        )
+        try:
+            _db1_pool = await asyncpg.create_pool(
+                dsn=db1_url,
+                min_size=db1_min,
+                max_size=db1_max,
+                statement_cache_size=0,
+                command_timeout=1200,
+                init=_init_db1_conn,
+                family=socket.AF_INET,
+            )
+        except OSError as exc:
+            host = db1_url.split("@")[-1].split("/")[0] if "@" in db1_url else db1_url
+            raise RuntimeError(
+                f"DB1 connection failed ({host}): {exc}\n"
+                f"Hint: ensure DATABASE_URL uses the Supabase pooler (port 6543), "
+                f"not the direct connection (port 5432). "
+                f"Find it in Supabase Dashboard → Settings → Database → Connection string."
+            ) from exc
 
     if db2_url and _db2_pool is None:
-        _db2_pool = await asyncpg.create_pool(
-            dsn=db2_url,
-            min_size=db2_min,
-            max_size=db2_max,
-            statement_cache_size=0,
-            command_timeout=300,
-            init=_init_db2_conn,
-        )
+        try:
+            _db2_pool = await asyncpg.create_pool(
+                dsn=db2_url,
+                min_size=db2_min,
+                max_size=db2_max,
+                statement_cache_size=0,
+                command_timeout=300,
+                init=_init_db2_conn,
+                family=socket.AF_INET,
+            )
+        except OSError as exc:
+            host = db2_url.split("@")[-1].split("/")[0] if "@" in db2_url else db2_url
+            raise RuntimeError(
+                f"DB2 connection failed ({host}): {exc}\n"
+                f"Hint: ensure DB2_DATABASE_URL uses the Supabase pooler (port 6543), "
+                f"not the direct connection (port 5432). "
+                f"Find it in Supabase Dashboard → Settings → Database → Connection string."
+            ) from exc
 
 
 async def close_pools() -> None:
@@ -134,6 +155,7 @@ async def db1_reconnect() -> None:
         statement_cache_size=0,
         command_timeout=1200,
         init=_init_db1_conn,
+        family=socket.AF_INET,
     )
 
 
@@ -150,4 +172,5 @@ async def db2_reconnect() -> None:
         statement_cache_size=0,
         command_timeout=300,
         init=_init_db2_conn,
+        family=socket.AF_INET,
     )
