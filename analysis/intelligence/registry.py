@@ -17,7 +17,7 @@ async def upsert_registry(db, name, version, model_type, training_date,
              training_observations, features, target, validation_method,
              metrics, threshold, calibration, status, data_version)
         VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13)
-        ON CONFLICT (model_name, model_version) DO UPDATE SET
+        ON CONFLICT (model_name) DO UPDATE SET
             model_type = EXCLUDED.model_type,
             training_date = EXCLUDED.training_date,
             training_observations = EXCLUDED.training_observations,
