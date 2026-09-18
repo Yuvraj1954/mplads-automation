@@ -72,7 +72,7 @@ MLA_DATASETS = {
     "works_completed": "Works Completed",
     "expenditure": "Expenditure on Completed and On-going Works as on Date",
     "calamity": "Amount consented for Calamity",
-    "allocated_limit": "Allocated Limit for Hon'ble MLAs",
+    "allocated_limit": "Allocated Limit for Hon'ble MPs",
 }
 
 # Combined datasets for backward compatibility
