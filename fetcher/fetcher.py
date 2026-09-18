@@ -47,11 +47,12 @@ MLA_COMBO = "0,0,0,1"
 # Number of records per NDJSON file
 CHUNK_SIZE = 2000
 
-# A failed dataset is retried only AFTER all 6 datasets
+# A failed dataset is retried only AFTER all 12 datasets
 # have had their first attempt.
-MAX_RETRIES = 2
+MAX_RETRIES = 3
 
-# Delay between retry attempts, in seconds.
+# Base delay between retry attempts, in seconds.
+# Actual delay = RETRY_DELAY_SECONDS * retry_number (exponential backoff).
 RETRY_DELAY_SECONDS = 5
 
 # MP datasets
@@ -789,10 +790,13 @@ def fetch_all_datasets_concurrently(
         def _worker():
             session = create_session()
             worker_supabase = create_supabase_client()
+            session_established = False
             try:
                 establish_session(session)
+                session_established = True
             except Exception as e:
-                print(f"  ✗ Worker session warning: {e}")
+                print(f"  ✗ Worker session establishment FAILED: {e}")
+                print(f"  ✗ Worker will fail all assigned datasets immediately")
 
             while True:
                 try:
@@ -803,6 +807,24 @@ def fetch_all_datasets_concurrently(
                 storage_name = job.get("storage_name") or job.get("name")
                 dataset_key = job.get("dataset_key") or job.get("key")
                 combo = job.get("combo")
+
+                if not session_established:
+                    error_msg = (
+                        f"Session establishment failed — cannot fetch {storage_name}"
+                    )
+                    print(f"✗ {storage_name} FAILED: {error_msg}")
+                    with failures_lock:
+                        failed_datasets.append({
+                            "name": storage_name,
+                            "key": dataset_key,
+                            "storage_name": storage_name,
+                            "dataset_key": dataset_key,
+                            "combo": combo,
+                            "member_type": job.get("member_type"),
+                            "error": error_msg,
+                        })
+                    work_queue.task_done()
+                    continue
 
                 try:
                     res = process_dataset(
@@ -873,7 +895,9 @@ def fetch_all_datasets_concurrently(
 
             print()
             print(f"--- Retry attempt {retry_number}/{MAX_RETRIES} ({len(to_retry)} datasets) ---")
-            time.sleep(RETRY_DELAY_SECONDS)
+            delay = RETRY_DELAY_SECONDS * retry_number
+            print(f"Waiting {delay} seconds before retry (exponential backoff)...")
+            time.sleep(delay)
             _execute_phase(to_retry, is_retry=True, retry_num=retry_number)
 
             expected_datasets = {j["storage_name"] for j in jobs}
@@ -912,6 +936,9 @@ def main():
     print(f"Retries after first pass: {MAX_RETRIES}")
     print(f"Local only: {local_only}")
     print("=" * 70)
+
+    # Emit timestamp EARLY so workflow cleanup can find it even if fetcher fails.
+    print(f"FETCH_TIMESTAMP={timestamp}")
 
     local_snapshot_dir = Path(
         tempfile.mkdtemp(prefix=f"mplads_local_{timestamp}_")

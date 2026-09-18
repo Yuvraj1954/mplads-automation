@@ -84,7 +84,7 @@ def run_fetcher(cmd):
         captured.append(line)
     proc.wait()
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=captured)
     return captured
 
 
@@ -1252,7 +1252,27 @@ def main():
         fetcher_cmd = [sys.executable, str(FETCHER)]
         if args.local_only:
             fetcher_cmd.append("--local-only")
-        fetcher_output = run_fetcher(fetcher_cmd)
+        try:
+            fetcher_output = run_fetcher(fetcher_cmd)
+        except subprocess.CalledProcessError as exc:
+            # Fetcher failed — extract timestamp from captured output
+            # so workflow cleanup can delete the partial snapshot from Supabase.
+            fetcher_output = exc.output or []
+            fetch_timestamp = None
+            for line in fetcher_output:
+                if line.startswith("FETCH_TIMESTAMP="):
+                    fetch_timestamp = line.split("=", 1)[1].strip()
+                    break
+            if fetch_timestamp and cache_work_dir:
+                ts_file = Path(cache_work_dir) / ".current_snapshot_ts"
+                try:
+                    ts_file.parent.mkdir(parents=True, exist_ok=True)
+                    ts_file.write_text(fetch_timestamp, encoding="utf-8")
+                    print(f"Fetcher failed — wrote .current_snapshot_ts={fetch_timestamp} for cleanup")
+                except Exception as write_exc:
+                    print(f"WARNING: Could not write .current_snapshot_ts: {write_exc}")
+            raise
+
         local_snapshot_path = None
         for line in fetcher_output:
             if line.startswith("LOCAL_SNAPSHOT_PATH="):
