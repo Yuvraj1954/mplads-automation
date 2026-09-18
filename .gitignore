@@ -2,9 +2,9 @@
 .DS_Store
 __pycache__/
 *.pyc
-.DS_Store
 .pipeline_checkpoints/
-migration/
+.pipeline_state/
+.pytest_cache/
+.ruff_cache/
 automation_delta/
 *.egg-info/
-.DS_Store

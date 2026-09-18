@@ -41,9 +41,6 @@ def _safe_int(val, default=0):
         return default
 
 
-# ============================================================
-# AUTHORITATIVE PERFORMANCE FORMULAS (single source of truth)
-# ============================================================
 # These are the ONLY definitions of the performance score and the
 # performance classification in GovSense. They are pure functions so
 # they can be imported by the analysis layer, the remediation script,
@@ -98,9 +95,35 @@ def classify_performance_from_score(score):
     return "UNDERPERFORMER"
 
 
-# ============================================================
-# STATISTICAL HELPERS
-# ============================================================
+def _classify_weighted(score, total_works):
+    """Classification from the authoritative weighted score (0-100).
+
+    Thresholds:
+        >=85  EXCEPTIONAL
+        >=70  PERFORMER
+        >=50  STABLE
+        >=35  NEEDS_ATTENTION
+        <35   UNDERPERFORMER
+        total_works == 0  NO_DATA
+        total_works < 5   INSUFFICIENT_DATA
+    """
+    tw = _safe_int(total_works) or 0
+    if tw == 0:
+        return "NO_DATA"
+    if tw < 5:
+        return "INSUFFICIENT_DATA"
+    s = _safe_float(score, 0.0) or 0.0
+    if s >= 85:
+        return "EXCEPTIONAL"
+    if s >= 70:
+        return "PERFORMER"
+    if s >= 50:
+        return "STABLE"
+    if s >= 35:
+        return "NEEDS_ATTENTION"
+    return "UNDERPERFORMER"
+
+
 # Used by compute_state_ranks to produce a sample-size-adjusted
 # performance ranking. Sample size is accounted for through the math
 # itself — no hard-coded thresholds, no work-count bonuses.
@@ -150,9 +173,6 @@ def _empirical_bayes_k(observed_rates, sample_sizes):
     return int(round(min(k, 100)))
 
 
-# ============================================================
-# OVERALL METRICS
-# ============================================================
 
 def build_overall_metrics(member_metrics_list, state_metrics_list,
                           member_anomalies=None):
@@ -308,9 +328,6 @@ def _median(values):
     return round(s[n // 2], 2)
 
 
-# ============================================================
-# MEMBER METRICS
-# ============================================================
 
 def build_member_metrics(member_metrics_list, member_anomalies=None,
                          master_population_context=None):
@@ -489,9 +506,6 @@ def _classify_member_performance(m, anomaly=None):
     return classify_performance_from_score(score)
 
 
-# ============================================================
-# STATE METRICS
-# ============================================================
 
 def build_state_metrics(state_metrics_list, state_anomalies=None,
                         member_metrics_list=None):
@@ -620,9 +634,6 @@ def _classify_state_performance(s, anomaly=None):
     return classify_performance_from_score(score)
 
 
-# ============================================================
-# NATIONAL STATISTICS
-# ============================================================
 
 def build_national_statistics(statistics_list):
     """Build national_statistics records.
@@ -655,9 +666,6 @@ def build_national_statistics(statistics_list):
     return records
 
 
-# ============================================================
-# TRENDS
-# ============================================================
 
 def build_trends(trends_list):
     """Build trends records.
@@ -732,9 +740,6 @@ def deduplicate_trends(trend_records):
     return deduplicated, stats
 
 
-# ============================================================
-# RANKING
-# ============================================================
 
 def compute_member_ranks(member_records):
     """Compute member rank using a transparent weighted formula.
@@ -775,6 +780,8 @@ def compute_member_ranks(member_records):
         r["rank"] = None
         r["scale_score"] = None
         r["performance_score_weighted"] = None
+        tw = _safe_int(r.get("total_works")) or 0
+        r["performance_classification"] = "NO_DATA" if tw == 0 else "INSUFFICIENT_DATA"
 
     groups = {}
     for r in qualified:
@@ -827,6 +834,8 @@ def _rank_within_group(group, id_key):
             r["rank"] = i
             last_rank = i
             last_score = score
+        # Authoritative classification from weighted score (0-100)
+        r["performance_classification"] = _classify_weighted(score, r.get("total_works"))
 
 
 def compute_state_ranks(state_records):
@@ -874,6 +883,8 @@ def compute_state_ranks(state_records):
         r["rank"] = None
         r["scale_score"] = None
         r["performance_score_weighted"] = None
+        tw = _safe_int(r.get("total_works")) or 0
+        r["performance_classification"] = "NO_DATA" if tw == 0 else "INSUFFICIENT_DATA"
 
     if qualifying:
         _rank_within_group(qualifying, id_key="state_id")

@@ -77,15 +77,26 @@ def analyze_works(works, reference_date=None):
     mla_benchmarks = compute_benchmarks_for_group(mla_works_list, "MLA")
     benchmarks.update(mla_benchmarks)
 
-    for wid, w in works_by_id.items():
+    items = list(works_by_id.items())
+
+    def _apply_risk(item):
+        wid, w = item
         bench = benchmarks.get(wid, {})
         w.update(bench)
-
         flags = compute_risk_flags(w, delay_dist, duration_p90)
         w["risk_flags"] = flags
         w["flag_count"] = len(flags)
         w["risk_level"] = classify_risk_level(flags)
         w["last_calculated"] = datetime.now(timezone.utc)
+
+    from concurrent.futures import ThreadPoolExecutor
+    if len(items) < 5000:
+        for item in items:
+            _apply_risk(item)
+    else:
+        num_workers = min(8, max(1, len(items) // 10000 + 1))
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            executor.map(_apply_risk, items)
 
     return works_by_id
 
@@ -113,10 +124,16 @@ def _compute_global_duration_p90(works_by_id):
 
 
 def compute_work_analyses(works, reference_date=None):
+    import time as _t
+    t0 = _t.time()
     analyzed = analyze_works(works, reference_date)
+    print(f"      [work_analysis] analyze_works: {_t.time()-t0:.1f}s", flush=True)
 
-    results = []
-    for wid, w in analyzed.items():
+    t1 = _t.time()
+    items = list(analyzed.items())
+
+    def _build_work_analysis(item):
+        wid, w = item
         days_since_exp = compute_days_since_last_expenditure(
             w.get("last_expenditure_date"),
             w.get("_reference_date"),
@@ -136,7 +153,7 @@ def compute_work_analyses(works, reference_date=None):
             w.get("_reference_date"),
             w.get("status"),
         )
-        results.append(WorkAnalysis(
+        return WorkAnalysis(
             work_id=w["work_id"],
             member_type=w.get("member_type", ""),
             member_id=w.get("member_id", 0),
@@ -193,6 +210,15 @@ def compute_work_analyses(works, reference_date=None):
                 w.get("risk_flags", []), w
             ),
             positive_signals=compute_positive_signals(w),
-        ))
+        )
+
+    from concurrent.futures import ThreadPoolExecutor
+    num_workers = min(8, max(1, len(items) // 10000 + 1))
+    if len(items) < 5000:
+        results = [_build_work_analysis(item) for item in items]
+    else:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            results = list(executor.map(_build_work_analysis, items))
+    print(f"      [work_analysis] build WorkAnalysis: {_t.time()-t1:.1f}s ({num_workers} workers)", flush=True)
 
     return results

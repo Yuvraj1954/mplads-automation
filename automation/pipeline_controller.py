@@ -44,11 +44,6 @@ sys.path.insert(0, str(ROOT))
 
 from automation.db_config import load_config, get_config, get_db1, get_db2, SSL_CTX
 
-
-# ============================================================
-# PIPELINE VERSION & CONSTANTS
-# ============================================================
-
 PIPELINE_VERSION = "pipeline_v2"
 STAGES = [
     "fetch", "compare", "delta", "ingest", "affected",
@@ -59,10 +54,6 @@ STAGES = [
 
 BUCKET = "mplads-raw"
 
-
-# ============================================================
-# HTTP HELPERS (database-agnostic)
-# ============================================================
 
 def sb_get(url, key, table, params=None):
     """Supabase REST GET."""
@@ -212,8 +203,9 @@ def _recompute_all_ranks_sql(db2_url):
                                           statement_cache_size=0, command_timeout=120)
         try:
             async with pool.acquire() as conn:
-                # Member ranking: RANK() + PERCENT_RANK() within each member_type
-                # scale_score = 40 * completion_rate_pct/100 + 40 * fund_utilization_pct/100 + 20 * rank_pct
+                # Member ranking: RANK() within each member_type
+                # scale_score is computed by db2_analytics_persistence.compute_member_ranks()
+                # and must NOT be overwritten here.
                 await conn.execute("""
                     WITH ranked AS (
                         SELECT
@@ -222,24 +214,14 @@ def _recompute_all_ranks_sql(db2_url):
                             RANK() OVER (
                                 PARTITION BY member_type
                                 ORDER BY performance_score_weighted DESC NULLS LAST
-                            ) AS new_rank,
-                            PERCENT_RANK() OVER (
-                                PARTITION BY member_type
-                                ORDER BY performance_score_weighted DESC NULLS LAST
-                            ) AS rank_pct
+                            ) AS new_rank
                         FROM member_metrics
                         WHERE performance_score_weighted IS NOT NULL
                           AND ranking_qualified = true
                     )
                     UPDATE member_metrics m
                     SET
-                        rank = r.new_rank,
-                        scale_score = ROUND(
-                            40.0 * COALESCE(m.completion_rate_pct, 0) / 100.0
-                            + 40.0 * COALESCE(m.fund_utilization_pct, 0) / 100.0
-                            + 20.0 * (1.0 - r.rank_pct),
-                            2
-                        )
+                        rank = r.new_rank
                     FROM ranked r
                     WHERE m.member_id = r.member_id
                       AND m.member_type = r.member_type
@@ -250,28 +232,21 @@ def _recompute_all_ranks_sql(db2_url):
                 print(f"  SQL member ranking: {member_count} rows updated")
 
                 # State ranking
+                # scale_score is computed by db2_analytics_persistence.compute_state_ranks()
+                # and must NOT be overwritten here.
                 await conn.execute("""
                     WITH ranked AS (
                         SELECT
                             state_id,
                             RANK() OVER (
                                 ORDER BY performance_score_weighted DESC NULLS LAST
-                            ) AS new_rank,
-                            PERCENT_RANK() OVER (
-                                ORDER BY performance_score_weighted DESC NULLS LAST
-                            ) AS rank_pct
+                            ) AS new_rank
                         FROM state_metrics
                         WHERE performance_score_weighted IS NOT NULL
                     )
                     UPDATE state_metrics s
                     SET
-                        rank = r.new_rank,
-                        scale_score = ROUND(
-                            40.0 * COALESCE(s.completion_rate_pct, 0) / 100.0
-                            + 40.0 * COALESCE(s.fund_utilization_pct, 0) / 100.0
-                            + 20.0 * (1.0 - r.rank_pct),
-                            2
-                        )
+                        rank = r.new_rank
                     FROM ranked r
                     WHERE s.state_id = r.state_id
                 """)
@@ -284,20 +259,16 @@ def _recompute_all_ranks_sql(db2_url):
             await pool.close()
 
     try:
-        # Check if we're already inside an async context
         try:
             loop = asyncio.get_running_loop()
-            # We're inside an async function — run in a thread
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(asyncio.run, _run())
                 future.result(timeout=120)
         except RuntimeError:
-            # No running loop — safe to use asyncio.run directly
             asyncio.run(_run())
     except Exception as e:
-        print(f"  WARNING: SQL ranking failed ({e}), falling back to Python")
-        _recompute_all_ranks_python(db2_url, None)
+        raise RuntimeError(f"SQL ranking failed: {e}") from e
 
 
 def _recompute_all_ranks_python(db2_url, db2_key):
@@ -349,11 +320,6 @@ def _recompute_all_ranks_python(db2_url, db2_key):
                   conflict_cols=["state_id"])
         print(f"  Re-ranked {len(payload)} state rows")
 
-
-# ============================================================
-# CHECKPOINT HELPERS
-# ============================================================
-
 def _checkpoint_path(run_id):
     """Return path to checkpoint file for a run."""
     return ROOT / ".pipeline_checkpoints" / f"{run_id}.json"
@@ -399,26 +365,15 @@ def next_stage_after(run_id, current_stage):
         pass
     return current_stage
 
-
-# ============================================================
-# STAGE IMPLEMENTATIONS
-# ============================================================
-
-# Stages 1-4 are handled by daily_pipeline.py (fetch, compare, delta, ingest).
-# Stages 5-12 are handled here (analysis through cleanup).
-
 def _timer():
-    """Return a monotonic start time."""
     return time.time()
 
 
 def _elapsed(start):
-    """Return elapsed seconds since start."""
     return time.time() - start
 
 
 def _print_timing(timing, label="STAGE"):
-    """Print timing for a stage."""
     for key, val in timing.items():
         print(f"  [{label}] {key}: {val:.1f}s")
 
@@ -500,7 +455,7 @@ def stage_analyze(snapshot_dir, reference_date=None):
         dict with analysis results
     """
     from analysis.pipeline import AnalysisPipeline
-    from analysis.snapshot_loader import load_all_data, build_work_records
+    from analysis.snapshot_loader import load_all_data, build_work_records, build_db1_member_map
     from analysis.entity_anomaly import compute_entity_anomalies, compute_state_anomalies
     from analysis.evidence_builder import (
         build_member_evidence, build_state_evidence,
@@ -508,21 +463,44 @@ def stage_analyze(snapshot_dir, reference_date=None):
     )
     from analysis.zero_work_members import inject_zero_work_members, get_master_population_context
 
-    print("\n=== STAGE 6: ANALYZE ===")
+    import time as _t
+    t_stage = _t.time()
+    print("\n=== STAGE 6: ANALYZE ===", flush=True)
+
+    # Build authoritative member ID mapping from DB1
+    print("  [1/7] Building DB1 member map...", end=" ", flush=True)
+    t0 = _t.time()
+    db1_url, db1_key = get_db1()
+    db1_member_map = build_db1_member_map(db1_url, db1_key)
+    print(f"OK ({len(db1_member_map)} members, {_t.time()-t0:.1f}s)", flush=True)
 
     # Load data directly from NDJSON snapshot files
+    print("  [2/7] Loading NDJSON snapshot...", end=" ", flush=True)
+    t0 = _t.time()
     data = load_all_data(snapshot_dir)
-    works, state_map, constituency_map, member_map = build_work_records(*data)
+    print(f"OK ({_t.time()-t0:.1f}s)", flush=True)
+
+    print("  [3/7] Building work records...", end=" ", flush=True)
+    t0 = _t.time()
+    works, state_map, constituency_map, member_map = build_work_records(
+        *data, db1_member_map=db1_member_map
+    )
+    print(f"OK ({len(works)} works, {_t.time()-t0:.1f}s)", flush=True)
 
     # Run pipeline on work-bearing members
+    print("  [4/7] Running AnalysisPipeline.run_full()...", end=" ", flush=True)
+    t0 = _t.time()
     pipeline = AnalysisPipeline(works)
     pipeline.run_full(reference_date)
+    print(f"OK ({len(pipeline.member_metrics)} members, {_t.time()-t0:.1f}s)", flush=True)
 
-    print(f"  Members analyzed (work-bearing): {len(pipeline.member_metrics)}")
-    print(f"  States analyzed: {len(pipeline.state_metrics)}")
-    print(f"  Work analyses: {len(pipeline.work_analyses)}")
+    print(f"  Members analyzed (work-bearing): {len(pipeline.member_metrics)}", flush=True)
+    print(f"  States analyzed: {len(pipeline.state_metrics)}", flush=True)
+    print(f"  Work analyses: {len(pipeline.work_analyses)}", flush=True)
 
     # Populate member_name on MemberMetrics from works data
+    print("  [5/7] Populating names/states...", end=" ", flush=True)
+    t0 = _t.time()
     member_name_map = {}
     for w in works:
         key = (w.get("member_type"), w.get("member_id"))
@@ -547,14 +525,18 @@ def stage_analyze(snapshot_dir, reference_date=None):
     for m in pipeline.member_metrics:
         if not m.state_name and m.state_id:
             m.state_name = state_name_map.get(m.state_id)
+    print(f"OK ({_t.time()-t0:.1f}s)", flush=True)
 
-    # Inject zero-work members from allocated_limit snapshots
+    # Inject zero-work members from DB1 canonical population
+    print("  [6/7] Injecting zero-work members...", end=" ", flush=True)
+    t0 = _t.time()
     pipeline.member_metrics = inject_zero_work_members(
         pipeline.member_metrics,
         snapshot_dir,
+        db1_member_map=db1_member_map,
         state_metrics_by_id={s.state_id: s for s in pipeline.state_metrics},
-        works=works,
     )
+    print(f"OK ({_t.time()-t0:.1f}s)", flush=True)
 
     # Update member_metrics_by_id to include zero-work members
     pipeline.member_metrics_by_id = {
@@ -563,9 +545,13 @@ def stage_analyze(snapshot_dir, reference_date=None):
     }
 
     # Get master population context for evidence building
+    print("  [7/7] Building master population context...", end=" ", flush=True)
+    t0 = _t.time()
     master_context = get_master_population_context(pipeline.member_metrics)
+    print(f"OK ({_t.time()-t0:.1f}s)", flush=True)
 
-    print(f"  Total members (after injection): {len(pipeline.member_metrics)}")
+    print(f"  Total members (after injection): {len(pipeline.member_metrics)}", flush=True)
+    print(f"  STAGE 6 TOTAL: {_t.time()-t_stage:.1f}s", flush=True)
 
     return {
         "pipeline": pipeline,
@@ -588,15 +574,21 @@ def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
         dict with analysis results (same structure as stage_analyze)
     """
     from analysis.pipeline import AnalysisPipeline
-    from analysis.snapshot_loader import load_all_data, build_work_records
+    from analysis.snapshot_loader import load_all_data, build_work_records, build_db1_member_map
 
     print("\n=== STAGE 6a: ANALYZE (AFFECTED ONLY) ===")
 
     affected_members = affected_result.get("affected_members", set())
     affected_states = affected_result.get("affected_states", set())
 
+    # Build authoritative member ID mapping from DB1
+    db1_url, db1_key = get_db1()
+    db1_member_map = build_db1_member_map(db1_url, db1_key)
+
     data = load_all_data(snapshot_dir)
-    works, state_map, constituency_map, member_map = build_work_records(*data)
+    works, state_map, constituency_map, member_map = build_work_records(
+        *data, db1_member_map=db1_member_map
+    )
 
     pipeline = AnalysisPipeline(works)
     pipeline.run_full(reference_date)
@@ -638,8 +630,8 @@ def stage_analyze_affected(snapshot_dir, affected_result, reference_date=None):
         pipeline.member_metrics = inject_zero_work_members(
             pipeline.member_metrics,
             snapshot_dir,
+            db1_member_map=db1_member_map,
             state_metrics_by_id={s.state_id: s for s in pipeline.state_metrics},
-            works=works,
         )
         print(f"  Total members (after injection): {len(pipeline.member_metrics)}")
     except Exception as _e:
@@ -748,7 +740,6 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
     print("\n=== STAGE 6b: WORK ANALYSIS PERSIST (DB2) ===")
 
     db2_url, db2_key = get_db2()
-    now_str = datetime.now(timezone.utc).isoformat()
     now_str = datetime.now(timezone.utc).isoformat()
 
     # Isolation Forest feature columns used for fingerprint computation.
@@ -898,22 +889,40 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
         }
 
     def _insert_records(client, table_name, records, label):
-        """Insert records in batches of 500. Returns count inserted."""
-        batch_size = 500
+        """Insert records in batches of 1000 with retry. Returns count inserted."""
+        import time as _t
+        batch_size = 1000
+        batches = [records[start:start + batch_size] for start in range(0, len(records), batch_size)]
         inserted = 0
-        for start in range(0, len(records), batch_size):
-            batch = records[start:start + batch_size]
-            try:
-                client.table(table_name).insert(batch).execute()
-                inserted += len(batch)
-            except Exception as e:
-                print(f"  WARNING: batch insert failed for {label}: {e}")
-                for row in batch:
-                    try:
-                        client.table(table_name).insert(row).execute()
-                        inserted += 1
-                    except Exception as e2:
-                        print(f"  WARNING: individual insert failed: {e2}")
+        t0 = time.time()
+
+        for i, batch in enumerate(batches):
+            for attempt in range(3):
+                try:
+                    client.table(table_name).insert(batch).execute()
+                    inserted += len(batch)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        wait = (attempt + 1) * 2
+                        print(f"  {label} batch {i+1}/{len(batches)} retry {attempt+1} in {wait}s: {e}", flush=True)
+                        _t.sleep(wait)
+                    else:
+                        print(f"  WARNING: batch {i+1}/{len(batches)} failed for {label}: {e}", flush=True)
+                        # Fallback: try up to 10 rows individually
+                        for row in batch[:10]:
+                            try:
+                                client.table(table_name).insert(row).execute()
+                                inserted += 1
+                            except Exception:
+                                pass
+            # Small delay between batches to avoid overwhelming the server
+            if i < len(batches) - 1:
+                _t.sleep(0.3)
+
+        elapsed = time.time() - t0
+        print(f"  {label}: inserted {inserted}/{len(records)} in {len(batches)} batches "
+              f"({elapsed:.1f}s)", flush=True)
         return inserted
 
     def _restore_ml_values(client, table_name, records, label):
@@ -961,21 +970,30 @@ def stage_work_analysis_persist(work_analyses, affected_work_ids=None):
                 # Features changed — old ML prediction is stale
                 stale += 1
 
-        # Batched restore via upsert (500 per batch)
+        # Batched restore via upsert (1000 per batch, sequential with retry)
         if to_restore:
-            batch_size = 500
-            for start in range(0, len(to_restore), batch_size):
-                batch = to_restore[start:start + batch_size]
-                try:
-                    client.table(table_name).upsert(batch, on_conflict="work_id").execute()
-                except Exception as e:
-                    print(f"  WARNING: ML restore upsert failed for {label}: {e}")
-                    for row in batch:
-                        try:
-                            wid = row.pop("work_id")
-                            client.table(table_name).update(row).eq("work_id", wid).execute()
-                        except Exception:
-                            pass
+            import time as _t
+            batch_size = 1000
+            batches = [to_restore[start:start + batch_size] for start in range(0, len(to_restore), batch_size)]
+
+            for i, batch in enumerate(batches):
+                for attempt in range(3):
+                    try:
+                        client.table(table_name).upsert(batch, on_conflict="work_id").execute()
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            _t.sleep((attempt + 1) * 2)
+                        else:
+                            print(f"  WARNING: ML restore batch {i+1} failed for {label}: {e}")
+                            for row in batch[:10]:
+                                try:
+                                    wid = row.pop("work_id")
+                                    client.table(table_name).update(row).eq("work_id", wid).execute()
+                                except Exception:
+                                    pass
+                if i < len(batches) - 1:
+                    _t.sleep(0.3)
 
         return {"preserved": preserved, "stale": stale, "new": new}
 
@@ -1242,10 +1260,6 @@ def stage_analytics_persist(pipeline_result, anomaly_result):
     # Upsert all records to DB2
     written = 0
 
-    # Guard: skip overall_metrics upsert if all values are zero
-    # This prevents a subsequent run with empty snapshot from overwriting
-    # real data with zeros (the member_metrics empty-body guard already
-    # protects member_metrics, but overall_metrics always produces 3 rows)
     has_real_data = any(
         r.get("total_works", 0) > 0 or r.get("sanctioned_amount", 0) > 0
         for r in overall
@@ -1257,13 +1271,28 @@ def stage_analytics_persist(pipeline_result, anomaly_result):
     else:
         print("  WARNING: Skipping overall_metrics upsert (all zeros - empty snapshot?)")
 
-    # Member metrics in batches
-    batch_size = 200
-    for start in range(0, len(members), batch_size):
-        batch = members[start:start + batch_size]
-        sb_upsert(db2_url, db2_key, "member_metrics", batch,
-                  conflict_cols=["member_id", "member_type"])
-        written += len(batch)
+    # Member metrics in batches (sequential with retry)
+    t_member = time.time()
+    import time as _t
+    batch_size = 500
+    member_batches = [members[start:start + batch_size] for start in range(0, len(members), batch_size)]
+
+    for i, batch in enumerate(member_batches):
+        for attempt in range(3):
+            try:
+                sb_upsert(db2_url, db2_key, "member_metrics", batch,
+                          conflict_cols=["member_id", "member_type"])
+                break
+            except Exception as e:
+                if attempt < 2:
+                    _t.sleep((attempt + 1) * 2)
+                else:
+                    print(f"  WARNING: member_metrics batch {i+1} upsert failed: {e}", flush=True)
+        if i < len(member_batches) - 1:
+            _t.sleep(0.3)
+    written += len(members)
+    print(f"  Member metrics upserted: {len(members)} in {len(member_batches)} batches "
+          f"({time.time()-t_member:.1f}s)", flush=True)
 
     # State metrics
     sb_upsert(db2_url, db2_key, "state_metrics", states,
@@ -1277,19 +1306,26 @@ def stage_analytics_persist(pipeline_result, anomaly_result):
     except Exception as _e:
         print(f"  WARNING: full re-rank skipped: {_e}")
 
-    # National statistics (delete old + insert new for each scope)
+    # National statistics (delete old + insert new for each scope) — sequential with retry
+    t_stats = time.time()
+    import time as _t
+
     for scope in ("BOTH", "MP", "MLA", None):
         scope_stats = [s for s in stats if s.get("scope") == scope]
         if scope_stats:
-            filter_val = f"eq.{scope}" if scope else "is.null"
-            try:
-                sb_delete(db2_url, db2_key, "national_statistics",
-                          {"scope": filter_val})
-            except Exception:
-                pass  # Table might be empty
-            sb_upsert(db2_url, db2_key, "national_statistics", scope_stats,
-                      conflict_cols=["metric_name", "scope"])
+            for attempt in range(3):
+                try:
+                    sb_upsert(db2_url, db2_key, "national_statistics", scope_stats,
+                              conflict_cols=["metric_name", "scope"])
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        _t.sleep((attempt + 1) * 2)
+                    else:
+                        print(f"  WARNING: national_stats scope={scope} upsert failed: {e}", flush=True)
             written += len(scope_stats)
+            _t.sleep(0.3)
+    print(f"  National statistics upserted in {time.time()-t_stats:.1f}s", flush=True)
 
     # Trends (upsert by year + member_type)
     if trends:
@@ -1345,15 +1381,24 @@ def stage_evidence_work_refs(evidence_records, work_analyses):
         except Exception:
             pass
 
-        # Write sequentially in batches
+        # Write sequentially in batches with retry
+        import time as _t
         batch_size = 500
         batches = [refs[start:start + batch_size]
                    for start in range(0, len(refs), batch_size)]
 
         written = 0
         for batch in batches:
-            sb_upsert(db2_url, db2_key, "evidence_work_refs", batch)
-            written += len(batch)
+            for attempt in range(3):
+                try:
+                    sb_upsert(db2_url, db2_key, "evidence_work_refs", batch)
+                    written += len(batch)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        _t.sleep((attempt + 1) * 2)
+                    else:
+                        print(f"  WARNING: evidence_work_refs batch failed: {e}", flush=True)
 
         print(f"  Evidence work refs: {written} (build={build_elapsed:.1f}s)")
     else:
@@ -1964,11 +2009,6 @@ def stage_cleanup(run_id=None, delta_dir=None, local_snapshot=None):
 
     return {"cleaned": len(cleaned), "items": cleaned}
 
-
-# ============================================================
-# MAIN PIPELINE
-# ============================================================
-
 def run_pipeline(snapshot_dir=None, reference_date=None,
                  delta_dir=None, run_id=None,
                  skip_gemini=False, skip_ingest=False,
@@ -1997,15 +2037,15 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
     if run_id is None:
         run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
-    print("=" * 70)
-    print(f"MPLADS PIPELINE — {PIPELINE_VERSION}")
-    print(f"Run ID: {run_id}")
-    print(f"Mode: {mode}")
-    print(f"DB1: {cfg.db1_url}")
-    print(f"DB2: {'CONFIGURED' if cfg.db2_ready else 'NOT CONFIGURED (dry-run)'}")
-    print(f"Gemini keys: {len(cfg.gemini_keys)}")
-    print(f"Started: {_now_iso()}")
-    print("=" * 70)
+    print("=" * 70, flush=True)
+    print(f"MPLADS PIPELINE — {PIPELINE_VERSION}", flush=True)
+    print(f"Run ID: {run_id}", flush=True)
+    print(f"Mode: {mode}", flush=True)
+    print(f"DB1: {cfg.db1_url}", flush=True)
+    print(f"DB2: {'CONFIGURED' if cfg.db2_ready else 'NOT CONFIGURED (dry-run)'}", flush=True)
+    print(f"Gemini keys: {len(cfg.gemini_keys)}", flush=True)
+    print(f"Started: {_now_iso()}", flush=True)
+    print("=" * 70, flush=True)
 
     results = {
         "pipeline_version": PIPELINE_VERSION,
@@ -2032,9 +2072,6 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
         work_refs_result = None
 
         if mode == "affected" and delta_dir:
-            # ============================================================
-            # AFFECTED-ONLY MODE
-            # ============================================================
 
             # Stage 5: Affected entities
             if start_stage in ("affected", "analyze"):
@@ -2183,13 +2220,11 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             timing["verify"] = _elapsed(t11)
 
         else:
-            # ============================================================
-            # FULL MODE
-            # ============================================================
 
             # Stage 5: Affected entities
             if start_stage in ("affected", "analyze"):
                 t5 = _timer()
+                print("\n>>> STAGE 5: AFFECTED ENTITIES...", flush=True)
                 affected_result = stage_affected(delta_dir, run_id)
                 results["stages"]["affected"] = affected_result
                 save_checkpoint(run_id, "affected", {
@@ -2197,9 +2232,11 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                     "state_count": affected_result["state_count"],
                 })
                 timing["affected"] = _elapsed(t5)
+                print(f">>> STAGE 5 done: {_elapsed(t5)}", flush=True)
 
             # Stage 6: Analyze (full)
             t6 = _timer()
+            print("\n>>> STAGE 6: FULL ANALYZE...", flush=True)
             analysis_result = stage_analyze(snapshot_dir, reference_date)
             results["stages"]["analyze"] = {
                 "members": len(analysis_result["pipeline"].member_metrics),
@@ -2208,10 +2245,11 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             }
             save_checkpoint(run_id, "analyze", results["stages"]["analyze"])
             timing["analyze"] = _elapsed(t6)
+            print(f">>> STAGE 6 done: {_elapsed(t6)}", flush=True)
 
             # Stage 7: Entity Anomaly
-            # Runs even in dry_run — it's deterministic with no DB writes.
             t7 = _timer()
+            print("\n>>> STAGE 7: ENTITY ANOMALY...", flush=True)
             anomaly_result = stage_anomaly(analysis_result, reference_date)
             results["stages"]["anomaly"] = {
                 "member_anomalies": len(anomaly_result["member_anomalies"]),
@@ -2219,6 +2257,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             }
             save_checkpoint(run_id, "anomaly", results["stages"]["anomaly"])
             timing["anomaly"] = _elapsed(t7)
+            print(f">>> STAGE 7 done: {_elapsed(t7)}", flush=True)
 
             if dry_run:
                 print("\n=== DRY RUN: Skipping DB writes, evidence, and Gemini ===")
@@ -2237,40 +2276,49 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
 
             # Stage 6b: Persist all work analysis to DB2 (full mode)
             t6b = _timer()
+            print("\n>>> STAGE 6b: WORK ANALYSIS PERSIST...", flush=True)
             work_analysis_result = stage_work_analysis_persist(
                 analysis_result["work_analyses"],
             )
             results["stages"]["work_analysis_persist"] = work_analysis_result
             save_checkpoint(run_id, "work_analysis_persist", work_analysis_result)
             timing["work_analysis_persist"] = _elapsed(t6b)
+            print(f">>> STAGE 6b done: {_elapsed(t6b)}", flush=True)
 
             # Stage 7b: Persist analytics to DB2
             t7b = _timer()
+            print("\n>>> STAGE 7b: ANALYTICS PERSIST...", flush=True)
             analytics_result = stage_analytics_persist(analysis_result, anomaly_result)
             results["stages"]["analytics_persist"] = analytics_result
             save_checkpoint(run_id, "analytics_persist", analytics_result)
             timing["analytics_persist"] = _elapsed(t7b)
+            print(f">>> STAGE 7b done: {_elapsed(t7b)}", flush=True)
 
             # Stage 8: Evidence
             t8 = _timer()
+            print("\n>>> STAGE 8: EVIDENCE...", flush=True)
             evidence_records = stage_evidence(analysis_result, anomaly_result)
             results["stages"]["evidence"] = {"records": len(evidence_records)}
             save_checkpoint(run_id, "evidence", results["stages"]["evidence"])
             timing["evidence"] = _elapsed(t8)
+            print(f">>> STAGE 8 done: {_elapsed(t8)}", flush=True)
 
             # Stage 8b: Evidence work refs
             t8b = _timer()
+            print("\n>>> STAGE 8b: EVIDENCE WORK REFS...", flush=True)
             work_refs_result = stage_evidence_work_refs(
                 evidence_records, analysis_result["work_analyses"]
             )
             results["stages"]["evidence_work_refs"] = work_refs_result
             save_checkpoint(run_id, "evidence_work_refs", work_refs_result)
             timing["evidence_work_refs"] = _elapsed(t8b)
+            print(f">>> STAGE 8b done: {_elapsed(t8b)}", flush=True)
 
             # Stage 9: Gemini
             t9 = _timer()
+            print("\n>>> STAGE 9: GEMINI...", flush=True)
             if skip_gemini:
-                print("\n=== GEMINI SKIPPED ===")
+                print("\n=== GEMINI SKIPPED ===", flush=True)
                 gemini_result = {"skipped": True, "reason": "skip_gemini_flag",
                                  "processed": 0, "success": 0, "failed": 0}
             else:
@@ -2281,16 +2329,20 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
                 "success": gemini_result.get("success", 0),
             })
             timing["gemini"] = _elapsed(t9)
+            print(f">>> STAGE 9 done: {_elapsed(t9)}", flush=True)
 
             # Stage 10: Persist to DB2
             t10 = _timer()
+            print("\n>>> STAGE 10: PERSIST EVIDENCE...", flush=True)
             persist_result = stage_persist(evidence_records)
             results["stages"]["persist"] = persist_result
             save_checkpoint(run_id, "persist", persist_result)
             timing["persist"] = _elapsed(t10)
+            print(f">>> STAGE 10 done: {_elapsed(t10)}", flush=True)
 
             # Stage 11: Verify
             t11 = _timer()
+            print("\n>>> STAGE 11: VERIFY...", flush=True)
             verify_result = stage_verify(
                 evidence_records, analysis_result, anomaly_result,
                 gemini_result, persist_result,
@@ -2301,10 +2353,7 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
             results["stages"]["verify"] = verify_result
             save_checkpoint(run_id, "verify", verify_result)
             timing["verify"] = _elapsed(t11)
-
-        # ================================================================
-        # COMMON: Verify, Cleanup, Timing
-        # ================================================================
+            print(f">>> STAGE 11 done: {_elapsed(t11)}", flush=True)
 
         if not verify_result["passed"]:
             print("\n=== VERIFICATION FAILED ===")
@@ -2335,28 +2384,23 @@ def run_pipeline(snapshot_dir=None, reference_date=None,
         raise
 
     finally:
-        print("\n" + "=" * 70)
-        print(f"PIPELINE STATUS: {results.get('status', 'UNKNOWN')}")
-        print(f"Run ID: {run_id}")
-        print(f"Mode: {mode}")
-        print(f"Completed: {results.get('completed_at', results.get('failed_at', 'N/A'))}")
+        print("\n" + "=" * 70, flush=True)
+        print(f"PIPELINE STATUS: {results.get('status', 'UNKNOWN')}", flush=True)
+        print(f"Run ID: {run_id}", flush=True)
+        print(f"Mode: {mode}", flush=True)
+        print(f"Completed: {results.get('completed_at', results.get('failed_at', 'N/A'))}", flush=True)
         if timing:
             total = sum(timing.values())
-            print(f"Total analysis time: {total:.1f}s")
+            print(f"Total analysis time: {total:.1f}s", flush=True)
             for key, val in timing.items():
-                print(f"  {key}: {val:.1f}s")
-        print("=" * 70)
+                print(f"  {key}: {val:.1f}s", flush=True)
+        print("=" * 70, flush=True)
 
     return results
 
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
-
-
-# ============================================================
-# CLI ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     import argparse

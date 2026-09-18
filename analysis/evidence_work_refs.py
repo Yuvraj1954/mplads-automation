@@ -89,7 +89,7 @@ def _build_member_refs(ev, works_by_member, member_type):
     member_type_for_ref = member_type
 
     # Risk works: flagged or high-risk
-    risk_works = [w for w in works if w.flag_count >= 1 or w.risk_level == "HIGH"]
+    risk_works = [w for w in works if (w.flag_count or 0) >= 1 or w.risk_level == "HIGH"]
     for w in risk_works[:5]:  # Top 5
         refs.append(_make_ref(
             entity_type=member_type,
@@ -172,7 +172,7 @@ def _build_state_refs(ev, works_by_state):
     refs = []
 
     # Risk works for state
-    risk_works = [w for w in state_works if w.flag_count >= 1 or w.risk_level == "HIGH"]
+    risk_works = [w for w in state_works if (w.flag_count or 0) >= 1 or w.risk_level == "HIGH"]
     risk_works.sort(key=lambda w: -(w.flag_count or 0))
     for w in risk_works[:5]:
         refs.append(_make_ref(

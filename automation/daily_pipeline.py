@@ -637,7 +637,7 @@ def _ensure_state_metrics_columns():
             return
         print(
             f"  WARNING: state_metrics columns missing in schema cache: {missing}. "
-            f"Run migration/2026_09_12_state_rank_40_40_20.sql in the DB2 "
+            f"Run the ranking-column migration in the DB2 "
             f"Supabase SQL editor once, then re-run the pipeline."
         )
     except Exception as exc:
@@ -671,7 +671,7 @@ def _ensure_member_metrics_columns():
             return
         print(
             f"  WARNING: member_metrics columns missing in schema cache: {missing}. "
-            f"Run migration/2026_09_12_member_rank_40_40_20.sql in the DB2 "
+            f"Run the ranking-column migration in the DB2 "
             f"Supabase SQL editor once, then re-run the pipeline."
         )
     except Exception as exc:
@@ -1091,7 +1091,7 @@ def _ensure_category_fy_views():
             if "PGRST205" in msg or "does not exist" in msg.lower():
                 print(
                     f"  WARNING: {view_name} view not found on DB1 — "
-                    f"run migration/2026_09_14_category_fy_views.sql manually"
+                    f"run the category/FY views migration manually"
                 )
             else:
                 print(f"  WARNING: could not verify {view_name} view: {exc}")
@@ -1190,10 +1190,6 @@ def main():
                 print(f"Cleared stale .current_snapshot_ts from previous run")
             except Exception:
                 pass
-
-    # ================================================================
-    # BOOTSTRAP MODE
-    # ================================================================
     if args.bootstrap:
         print("\n=== BOOTSTRAP MODE ===")
         if not cache_work_dir:
@@ -1247,10 +1243,6 @@ def main():
         _update_data_updated(status="complete")
         _print_timing(timing, pipeline_start)
         return
-
-    # ================================================================
-    # NORMAL PIPELINE
-    # ================================================================
     print("=== STEP 1: FETCH ===")
     t_fetch = _timer()
     if args.skip_fetch:

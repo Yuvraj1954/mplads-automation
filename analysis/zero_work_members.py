@@ -192,128 +192,107 @@ def _build_member_name_to_id(master_records, existing_member_map):
 
 
 def inject_zero_work_members(member_metrics, snapshot_dir,
+                             db1_member_map,
                              state_metrics_by_id=None,
                              works=None):
-    """Inject zero-work members into MemberMetrics after normal analysis.
+    """Inject zero-work members using DB1 as canonical population source.
 
-    Discovers the master population from allocated_limit snapshots and creates
-    MemberMetrics for members not already present (zero-work members).
+    Iterates over ALL canonical DB1 members (from db1_member_map) and creates
+    zero-work MemberMetrics for any member not already present from work analysis.
 
     Args:
         member_metrics: list of existing MemberMetrics from work analysis
-        snapshot_dir: path to snapshot directory with allocated_limit data
-        state_metrics_by_id: optional dict of state_id → StateMetrics
-        works: optional list of raw work records (for member name mapping)
+        snapshot_dir: path to snapshot directory (for allocation context)
+        db1_member_map: dict from build_db1_member_map() — the canonical
+                        {("MP"/"MLA", norm_name): {"id": db1_id, "constituency_id": cid}}
+        state_metrics_by_id: optional dict of state_id → StateMetrics (unused, kept for compat)
+        works: optional list of raw work records (unused, kept for compat)
 
     Returns:
         list of all MemberMetrics (existing + injected zero-work members)
     """
-    # Discover master population
-    master = discover_master_population(snapshot_dir)
-    if not master["all_records"]:
+    from analysis.snapshot_loader import normalize_member_name
+
+    if not db1_member_map:
         return member_metrics
 
-    # Build state map from master records
-    state_name_to_id = _build_state_map(master["all_records"])
+    # Build lookup of existing work-derived members by normalized name
+    work_derived_lookup = {}  # (member_type, norm_name) -> member_id
+    for m in member_metrics:
+        mname = getattr(m, "member_name", None)
+        if mname:
+            norm = normalize_member_name(mname) or mname
+            work_derived_lookup[(m.member_type, norm)] = m.member_id
 
-    # Build member name → (member_type, member_id) mapping from works
-    # This allows matching master population members to work-derived metrics
-    # Keyed by (member_type, name) so an MP and a Rajya Sabha member with the
-    # same name can never collide (Phase 3 identity correctness).
-    work_member_names = {}  # (member_type, name) -> (member_type, member_id)
-    if works:
-        for w in works:
-            mp_name = w.get("mp_name", "")
-            if mp_name:
-                member_type = w.get("member_type", "MP")
-                member_id = w.get("member_id")
-                key = (member_type, mp_name)
-                if key not in work_member_names:
-                    work_member_names[key] = (member_type, member_id)
-
-    # Build existing member IDs set
+    # Build set of existing (member_type, member_id) for fast membership check
     existing_ids = {(m.member_type, m.member_id) for m in member_metrics}
 
-    # ------------------------------------------------------------------
-    # APPENDED: Attach the authoritative master-population record to
-    # WORK-BEARING members too (matched by name). Previously only zero-work
-    # members carried `_master_record`, so `allocated_amount`, state_name and
-    # house/tenure context were 0/NULL for every member that actually had
-    # works. This makes allocation + identity available for all members.
-    # ------------------------------------------------------------------
-    master_by_name = {}
-    for record in master["all_records"]:
-        name = record.get("member_name")
-        if name and name not in master_by_name:
-            master_by_name[name] = record
+    # Load NDJSON allocation context for enrichment (state_name, allocated_amount)
+    master = discover_master_population(snapshot_dir)
+    context_by_name = {}
+    if master["all_records"]:
+        for record in master["all_records"]:
+            name = record.get("member_name")
+            if name:
+                norm = normalize_member_name(name) or name
+                if norm not in context_by_name:
+                    context_by_name[norm] = record
+
+    # Attach master context to WORK-BEARING members (enrichment)
     for m in member_metrics:
-        rec = master_by_name.get(getattr(m, "member_name", None))
+        mname = getattr(m, "member_name", None)
+        if mname:
+            norm = normalize_member_name(mname) or mname
+        else:
+            norm = None
+        rec = context_by_name.get(norm) if norm else None
         if rec:
             if getattr(m, "_master_record", None) is None:
                 m._master_record = rec
             if not getattr(m, "state_name", None):
                 m.state_name = rec.get("state_name")
-    # ------------------------------------------------------------------
 
-    # Build member name → ID mapping for zero-work members
-    # Use existing IDs where members match by name
-    # Separate id spaces per member_type so new zero-work MP ids never spill
-    # into the Rajya Sabha id space (>=100000) and vice versa.
-    def _max_id_for(mt):
-        return max((m.member_id for m in member_metrics
-                    if m.member_type == mt), default=0)
-
-    next_id = {
-        "MP": _max_id_for("MP") + 1,
-        "MLA": max(_max_id_for("MLA") + 1, 100000),
-    }
-
-    name_to_id = {}
-    # First, map work-derived member names to their IDs
-    for (mt, name), (_mt, mid) in work_member_names.items():
-        name_to_id[(mt, name)] = mid
-
-    # Then, assign new IDs to zero-work members not in works
-    for record in master["all_records"]:
-        mt = record["member_type"]
-        key = (mt, record["member_name"])
-        if key not in name_to_id:
-            name_to_id[key] = next_id[mt]
-            next_id[mt] += 1
-
-    # Create zero-work MemberMetrics
+    # Iterate over ALL canonical DB1 members — DB1 is the population source
     zero_work_members = []
-
-    for record in master["all_records"]:
-        member_name = record["member_name"]
-        member_type = record["member_type"]
+    for (member_type, norm_name), db1_info in db1_member_map.items():
+        db1_id = db1_info["id"]
+        constituency_id = db1_info.get("constituency_id")
 
         # Check if member already exists in work-derived metrics
-        # Match by name -> work_member_names mapping
-        wk_key = (member_type, member_name)
-        if wk_key in work_member_names:
-            mapped_type, mapped_id = work_member_names[wk_key]
-            if (mapped_type, mapped_id) in existing_ids:
-                continue
+        if (member_type, db1_id) in existing_ids:
+            continue
 
-        # Assign member_id (typed name map)
-        member_id = name_to_id[wk_key]
+        # Also check by normalized name (work-derived may have used a slightly
+        # different name but resolved to the same DB1 ID)
+        if (member_type, norm_name) in work_derived_lookup:
+            continue
 
-        # Get state_id
-        state_name = record.get("state_name", "")
-        state_id = state_name_to_id.get(state_name)
+        # Get context from NDJSON allocation files if available
+        ctx = context_by_name.get(norm_name)
+        state_name = ctx.get("state_name", "") if ctx else ""
+        allocated_amount = ctx.get("allocated_amount") if ctx else None
+        member_name = ctx.get("member_name", norm_name) if ctx else norm_name
+        house_name = ctx.get("house_name", "") if ctx else ""
+        tenure_label = ctx.get("tenure", "") if ctx else ""
+        tenure_start = parse_date(ctx.get("tenure_start_date")) if ctx else None
+        tenure_end = parse_date(ctx.get("tenure_end_date")) if ctx else None
 
-        # Parse tenure dates for context
-        tenure_start = parse_date(record.get("tenure_start_date"))
-        tenure_end = parse_date(record.get("tenure_end_date"))
+        # state_id: look up from state_metrics_by_id, or build from context
+        state_id = None
+        if state_name:
+            if state_metrics_by_id:
+                for sid, sm in state_metrics_by_id.items():
+                    if getattr(sm, "state_name", "") == state_name:
+                        state_id = sid
+                        break
 
-        # Create MemberMetrics with zero works
+        # Create zero-work MemberMetrics with canonical DB1 ID
         m = MemberMetrics(
-            member_id=member_id,
+            member_id=db1_id,
             member_type=member_type,
             member_name=member_name,
             state_id=state_id,
-            constituency_id=None,  # Not available in snapshot
+            constituency_id=constituency_id,
             total_works=0,
             recommended_works=0,
             sanctioned_works=0,
@@ -362,21 +341,24 @@ def inject_zero_work_members(member_metrics, snapshot_dir,
             ranking_qualified=False,
         )
 
-        # Attach master population context as extra attributes
-        # These preserve reliable identity/context for evidence building
-        m._master_record = record
+        # Attach context for evidence building
+        m._master_record = ctx
         m._tenure_start = tenure_start
         m._tenure_end = tenure_end
-        m._allocated_amount = record.get("allocated_amount")
-        m._house_name = record.get("house_name", "")
-        m._tenure_label = record.get("tenure", "")
+        m._allocated_amount = allocated_amount
+        m._house_name = house_name
+        m._tenure_label = tenure_label
 
         zero_work_members.append(m)
 
     all_members = list(member_metrics) + zero_work_members
 
-    print(f"  Master population discovered: {master['total_count']}")
-    print(f"  MP: {master['mp_count']}, MLA: {master['mla_count']}")
+    # Count by type for reporting
+    db1_mp_count = sum(1 for k in db1_member_map if k[0] == "MP")
+    db1_mla_count = sum(1 for k in db1_member_map if k[0] == "MLA")
+
+    print(f"  DB1 canonical population: {len(db1_member_map)} "
+          f"({db1_mp_count} MPs + {db1_mla_count} MLAs)")
     print(f"  Zero-work members injected: {len(zero_work_members)}")
     print(f"  Total members after injection: {len(all_members)}")
 
@@ -399,12 +381,19 @@ def attach_master_records(member_metrics, snapshot_dir, verbose=True):
     by_name = {}
     for r in master["all_records"]:
         name = r.get("member_name")
-        if name and name not in by_name:
-            by_name[name] = r
+        if name:
+            norm = normalize_member_name(name) or name
+            if norm not in by_name:
+                by_name[norm] = r
 
     attached = 0
     for m in member_metrics:
-        rec = by_name.get(getattr(m, "member_name", None))
+        mname = getattr(m, "member_name", None)
+        if mname:
+            norm = normalize_member_name(mname) or mname
+        else:
+            norm = None
+        rec = by_name.get(norm) if norm else None
         if rec:
             if getattr(m, "_master_record", None) is None:
                 m._master_record = rec

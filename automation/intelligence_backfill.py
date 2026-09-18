@@ -10,10 +10,9 @@ Stages:
      state_intelligence)
   3. National rank + percentile (within member_type for members)
   4. K-Means profiling (representative + state) -> cluster_id, cluster_label
-  5. XGBoost slow-completion project model + per-work delay probability
-  6. Isolation Forest anomaly per work
-  7. Risk engine (predictive + anomaly + statistical) per member / state
-  8. Model registry persistence
+  5. Isolation Forest anomaly per work
+  6. Risk engine (predictive + anomaly + statistical) per member / state
+  7. Model registry persistence
 
 Idempotent: each stage upserts. Re-runs produce the same authoritative values.
 
@@ -114,7 +113,6 @@ class _TimedCtx:
 from analysis.intelligence import allocation as alloc_mod
 from analysis.intelligence import score as score_mod
 from analysis.intelligence import profiling as prof_mod
-from analysis.intelligence import project_model as proj_mod
 from analysis.intelligence import anomaly_model as anom_mod
 from analysis.intelligence import risk as risk_mod
 from analysis.intelligence.registry import upsert_registry
@@ -221,7 +219,9 @@ async def _load_db2(db2):
                   constituency_id, total_works, completed_works,
                   fund_utilization_pct, avg_sanction_delay_days,
                   flagged_rate_pct, overdue_over_1_year, cost_anomaly_works,
-                  anomaly_score, performance_score, performance_classification
+                  anomaly_score, performance_score, performance_classification,
+                  completion_rate_pct, scale_score,
+                  performance_score_weighted, rank, ranking_qualified
            FROM public.member_metrics""")
     print(f"[{_now()}]    << DB2 member_metrics: {len(members)} rows in {_hr(time.monotonic()-t0)}", flush=True)
     print(f"[{_now()}]    >> DB2: load state_metrics ...", flush=True)
@@ -230,7 +230,9 @@ async def _load_db2(db2):
         """SELECT state_id, state_name, total_works, completed_works,
                   fund_utilization_pct, avg_sanction_delay_days,
                   overdue_over_1_year, flagged_works, risk_rate_pct,
-                  cost_anomaly_works, performance_score, performance_classification
+                  cost_anomaly_works, performance_score, performance_classification,
+                  completion_rate_pct, scale_score,
+                  performance_score_weighted, rank
            FROM public.state_metrics""")
     print(f"[{_now()}]    << DB2 state_metrics: {len(states)} rows in {_hr(time.monotonic()-t1)}", flush=True)
     return [dict(r) for r in members], [dict(r) for r in states]
@@ -358,58 +360,102 @@ def _to_float(v):
     return _safe(v, None)
 
 
+def _weighted_label(score):
+    """Classification from authoritative weighted score (0-100)."""
+    if score is None:
+        return "NO_DATA"
+    if score >= 85:
+        return "EXCEPTIONAL"
+    if score >= 70:
+        return "PERFORMER"
+    if score >= 50:
+        return "STABLE"
+    if score >= 35:
+        return "NEEDS_ATTENTION"
+    return "UNDERPERFORMER"
+
+
+def _confidence(total_works):
+    if total_works >= 20:
+        return "HIGH"
+    if total_works >= 5:
+        return "MEDIUM"
+    return "LOW"
+
+
 async def stage_score_and_ranking(db2, apply):
-    TIMER.start(2, "Performance score 0-100 + rank + percentile")
+    """Write member_intelligence / state_intelligence from the AUTHORITATIVE
+    performance_score_weighted in member_metrics/state_metrics.
+
+    The Wilson score (score_mod) is RETIRED as the primary performance score.
+    performance_score_100 now mirrors performance_score_weighted so downstream
+    consumers that still read that column get the correct value.
+    """
+    TIMER.start(2, "Performance score 0-100 + rank + percentile (weighted)")
     members, states = await _load_db2(db2)
-    with _timed("score: members"):
-        m_scores = score_mod.member_scores(members)
-    with _timed("score: states"):
-        s_scores = score_mod.state_scores(states)
 
-    # National rank + percentile within each member_type
-    by_type = defaultdict(list)
-    for k, v in m_scores.items():
-        if v["score"] is not None:
-            by_type[k[0]].append((k, v["score"]))
-    _step(f"computing member ranks within {len(by_type)} populations")
-    ranks_m = {}
-    for mt, items in by_type.items():
-        ranks = score_mod.rank_within(dict(items), higher_better=True)
-        ranks_m.update(ranks)
-    with _timed("rank: states"):
-        s_ranks = score_mod.rank_within(
-            {sid: v["score"] for sid, v in s_scores.items()}, higher_better=True
-        )
-
+    # ---- MEMBERS ----
     member_intel = []
-    for (mt, mid), s in m_scores.items():
-        nr, npct = ranks_m.get((mt, mid), (None, None))
+    qualified_count = 0
+    for m in members:
+        mid = m["member_id"]
+        mt = m["member_type"]
+        sw = m.get("performance_score_weighted")
+        total = m.get("total_works") or 0
+        rq = m.get("ranking_qualified", False)
+
+        # Use the authoritative weighted score and rank from member_metrics
+        score_100 = round(float(sw), 2) if sw is not None else None
+        label = _weighted_label(score_100) if rq else "NO_DATA"
+        conf = _confidence(total)
+        nr = m.get("rank")
+        npct = None
+        if nr is not None and rq:
+            # count qualified population of same type for percentile
+            n_qual = sum(1 for x in members
+                         if x["member_type"] == mt and x.get("ranking_qualified"))
+            npct = round(100.0 * (n_qual - nr) / max(n_qual - 1, 1), 2)
+        if rq:
+            qualified_count += 1
+
         member_intel.append({
             "member_id": mid, "member_type": mt,
-            "performance_score_100": s["score"],
-            "performance_label": s["label"],
-            "performance_confidence": s["confidence"],
+            "performance_score_100": score_100,
+            "performance_label": label,
+            "performance_confidence": conf,
             "national_rank": nr,
             "national_percentile": npct,
-            "sample_size": s["n"],
+            "sample_size": total,
         })
 
+    # ---- STATES ----
     state_intel = []
-    for sid, s in s_scores.items():
-        rk, pct = s_ranks.get(sid, (None, None))
+    n_states = len(states)
+    for s in states:
+        sid = s["state_id"]
+        sw = s.get("performance_score_weighted")
+        total = s.get("total_works") or 0
+        score_100 = round(float(sw), 2) if sw is not None else None
+        label = _weighted_label(score_100) if total > 0 else "NO_DATA"
+        conf = _confidence(total)
+        rk = s.get("rank")
+        pct = None
+        if rk is not None:
+            pct = round(100.0 * (n_states - rk) / max(n_states - 1, 1), 2)
+
         state_intel.append({
             "state_id": sid,
-            "performance_score_100": s["score"],
-            "performance_label": s["label"],
-            "performance_confidence": s["confidence"],
+            "performance_score_100": score_100,
+            "performance_label": label,
+            "performance_confidence": conf,
             "rank": rk,
             "national_percentile": pct,
-            "sample_size": s["n"],
+            "sample_size": total,
         })
-    _step(f"member scores computed: {sum(1 for v in m_scores.values() if v['score'] is not None)} "
-          f"of {len(m_scores)}")
-    _step(f"state scores computed:  {sum(1 for v in s_scores.values() if v['score'] is not None)} "
-          f"of {len(s_scores)}")
+
+    _step(f"member scores computed: {qualified_count} qualified of {len(members)}")
+    _step(f"state scores computed:  {len(state_intel)}")
+
     if apply:
         async with db2.acquire() as c:
             await c.executemany(
@@ -449,18 +495,35 @@ async def stage_score_and_ranking(db2, apply):
                   s["performance_confidence"], s["rank"], s["national_percentile"],
                   s["sample_size"]) for s in state_intel],
             )
-        print("  member_intelligence + state_intelligence updated")
-    return m_scores, s_scores
+        print("  member_intelligence + state_intelligence updated (weighted score)")
+
+    # Return dict format compatible with stage_profiling / stage_risk
+    m_scores_dict = {}
+    for m in member_intel:
+        m_scores_dict[(m["member_type"], m["member_id"])] = {
+            "score": m["performance_score_100"],
+            "label": m["performance_label"],
+            "confidence": m["performance_confidence"],
+            "n": m["sample_size"],
+        }
+    s_scores_dict = {}
+    for s in state_intel:
+        s_scores_dict[s["state_id"]] = {
+            "score": s["performance_score_100"],
+            "label": s["performance_label"],
+            "confidence": s["performance_confidence"],
+            "n": s["sample_size"],
+        }
+    return m_scores_dict, s_scores_dict
 
 
 async def stage_profiling(db2, m_scores, s_scores, apply):
     TIMER.start(4, "K-Means profiling")
     members, states = await _load_db2(db2)
     members_for_prof = [m for m in members
-                        if m_scores.get((m["member_type"], m["member_id"]),
-                                        {}).get("n", 0) >= 5]
+                        if (m.get("total_works") or 0) >= 5]
     states_for_prof = [s for s in states
-                       if s_scores.get(int(s["state_id"]), {}).get("n", 0) >= 5]
+                       if (s.get("total_works") or 0) >= 5]
     _step(f"K-Means inputs: {len(members_for_prof)} members, {len(states_for_prof)} states")
     with _timed("K-Means fit (members, k by silhouette, ARI stability)"):
         m_clu = prof_mod.profile_members(members_for_prof) if members_for_prof else {}
@@ -531,25 +594,12 @@ def _aggregate_work_risks(works_predictions, works_iso):
 
 
 async def stage_project_and_anomaly(db1, db2, apply):
-    TIMER.start(5, "Project delay model (XGBoost)")
-    TIMER.start(6, "Isolation Forest anomaly")
-    # We run both models in this stage (5 + 6).
+    TIMER.start(5, "Isolation Forest anomaly (XGBoost removed)")
     works = [dict(w) for w in await _load_works(db2)]
 
-    # XGBoost project model
-    print(f"  >> XGBoost: training on {len(works)} works ...", flush=True)
-    t0 = time.monotonic()
-    res, model, fnames, rows = proj_mod.train_and_evaluate(works)
-    _step(f"XGBoost trained in {_hr(time.monotonic()-t0)} "
-          f"(status={res['status']} n_total={res['n_total']} n_train={res.get('n_train','?')} "
-          f"n_test={res.get('n_test','?')} prev={res.get('target_prevalence',0):.3f})")
-    _step(f"XGBoost metrics: {res['metrics']}")
+    # XGBoost removed from production — delay_probability stays NULL
+    print(f"  >> XGBoost: REMOVED from production. Skipping.", flush=True)
     work_predictions = []
-    if res["status"] == "READY" and model is not None:
-        work_predictions = proj_mod.predict_works(works, model, fnames)
-        _step(f"XGBoost predictions: {len(work_predictions)} works scored")
-    elif res["status"] != "READY":
-        _step("XGBoost NOT_READY -> NO predictions persisted (no fake ML).")
 
     # Isolation Forest
     print(f"  >> IsolationForest: fitting on {len(works)} works ...", flush=True)
@@ -562,7 +612,6 @@ async def stage_project_and_anomaly(db1, db2, apply):
 
     if apply:
         with _timed("DB2 UPDATE per-work ML outputs (batched)"):
-            # Health check the shared pool
             try:
                 async with db2.acquire() as c:
                     await c.execute("SELECT 1")
@@ -574,49 +623,24 @@ async def stage_project_and_anomaly(db1, db2, apply):
                 db2 = get_db2_pool()
                 _step("DB2 pool reconnected via db_pool")
             async with db2.acquire() as c:
-                # Separate MP and MLA rows, batch executemany in chunks of 500.
-                # Only write isolation fields (XGBoost NOT_READY = no predictions).
                 mp_iso = [(i["isolation_score"], i["isolation_level"], i["work_id"])
                            for i in iso_results if i["member_type"] == "MP"]
                 mla_iso = [(i["isolation_score"], i["isolation_level"], i["work_id"])
                            for i in iso_results if i["member_type"] == "MLA"]
-                if work_predictions:
-                    mp_pred = [(p["delay_probability"], p["delay_risk_band"], p["work_id"])
-                               for p in work_predictions if p["member_type"] == "MP"]
-                    mla_pred = [(p["delay_probability"], p["delay_risk_band"], p["work_id"])
-                                for p in work_predictions if p["member_type"] == "MLA"]
-                else:
-                    mp_pred = []; mla_pred = []
-                for label, rows, sql_template in [
+                for label, rows_batch, sql_template in [
                     ("MP isolation", mp_iso, "UPDATE public.work_analysis SET isolation_score=$1, isolation_level=$2 WHERE work_id=$3 AND (isolation_score IS NULL OR isolation_level IS NULL)"),
                     ("MLA isolation", mla_iso, "UPDATE public.mla_work_analysis SET isolation_score=$1, isolation_level=$2 WHERE work_id=$3 AND (isolation_score IS NULL OR isolation_level IS NULL)"),
-                    ("MP delay_pred", mp_pred, "UPDATE public.work_analysis SET delay_probability=$1, delay_risk_band=$2 WHERE work_id=$3 AND (delay_probability IS NULL OR delay_risk_band IS NULL)"),
-                    ("MLA delay_pred", mla_pred, "UPDATE public.mla_work_analysis SET delay_probability=$1, delay_risk_band=$2 WHERE work_id=$3 AND (delay_probability IS NULL OR delay_risk_band IS NULL)"),
                 ]:
-                    if not rows:
+                    if not rows_batch:
                         continue
-                    _step(f"{label}: {len(rows)} rows, batching 500 ...")
-                    for start in range(0, len(rows), 500):
-                        chunk = rows[start:start+500]
+                    _step(f"{label}: {len(rows_batch)} rows, batching 500 ...")
+                    for start in range(0, len(rows_batch), 500):
+                        chunk = rows_batch[start:start+500]
                         await c.executemany(sql_template, chunk)
-                        _step(f"{label}: {min(start+500, len(rows))}/{len(rows)}")
-        # Registry entry for project model + isolation forest
-        with _timed("DB2 UPSERT model_registry (project_delay_xgb + isolation_forest)"):
+                        _step(f"{label}: {min(start+500, len(rows_batch))}/{len(rows_batch)}")
+        # Registry entry for isolation forest only (XGBoost removed)
+        with _timed("DB2 UPSERT model_registry (isolation_forest)"):
             async with db2.acquire() as c2:
-                await upsert_registry(c2,
-                    name="project_delay_xgb",
-                    version=res.get("version", "xgb-unknown"),
-                    model_type="XGBClassifier",
-                    training_date=datetime.now(timezone.utc),
-                    training_observations=res.get("n_train"),
-                    features=fnames,
-                    target="slow_completion (execution_days > 365)",
-                    validation_method="temporal split by recommendation_date",
-                    metrics={k: v for k, v in res.get("metrics", {}).items() if v is not None},
-                    threshold={"LOW": 0.30, "MODERATE": 0.50, "HIGH": 0.70, "CRITICAL": 0.70},
-                    calibration="default 0.5; bands fixed",
-                    status=res["status"],
-                    data_version=DATA_VERSION)
                 await upsert_registry(c2,
                     name="isolation_forest",
                     version=f"if-{datetime.now(timezone.utc).strftime('%Y%m%d')}",
@@ -631,8 +655,8 @@ async def stage_project_and_anomaly(db1, db2, apply):
                     calibration="min-max within dataset",
                     status="READY",
                     data_version=DATA_VERSION)
-        _step("DB1 per-work columns + DB2 model_registry updated")
-    TIMER.done("Project delay model + Isolation Forest")
+        _step("DB2 model_registry updated")
+    TIMER.done("Isolation Forest")
     return work_predictions, iso_results, works
 
 
@@ -821,12 +845,11 @@ async def main():
         m.affected_count = len(m_clu)
         timer.end("profiling")
 
-        # Stages 4-5: XGBoost + Isolation Forest (independent of profiling)
-        # Can run in parallel with stage 6 (risk) if no data dependency
-        m45 = timer.begin("xgb_isolation")
+        # Stage 5: Isolation Forest (XGBoost removed)
+        m45 = timer.begin("isolation")
         preds, iso, works = await stage_project_and_anomaly(db1, db2, apply)
         m45.affected_count = len(iso)
-        timer.end("xgb_isolation")
+        timer.end("isolation")
 
         # Stage 6: Risk engine (depends on score + anomaly results)
         m6 = timer.begin("risk")

@@ -3,5 +3,4 @@ python-dotenv
 supabase
 numpy
 asyncpg
-xgboost
 scikit-learn

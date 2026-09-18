@@ -1,13 +1,97 @@
 """Load NDJSON snapshot files into work records for analysis.
 
-Replaces the obsolete audit_runner.load_all_data() and audit_runner.build_work_records()
-with a direct loader that works with the current snapshot directory format.
+All member IDs are resolved against DB1 authoritative master tables
+(mps.mp_id, mlas.mla_id). Synthetic/encounter-order IDs are never used.
 """
 
 import json
+import os
+import re
 from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
+
+
+def normalize_member_name(name):
+    """Normalize a member name for identity matching.
+
+    Handles: title prefixes (Shri, Dr., Smt), parenthetical suffixes,
+    case differences, extra whitespace, and common transliteration variants.
+    """
+    if not name:
+        return ""
+    n = name.strip()
+    # Remove parenthetical suffixes like (2024-30)
+    n = re.sub(r'\s*\(.*?\)\s*$', '', n)
+    # Remove common title prefixes
+    n = re.sub(r'^(Shri|Smt\.?|Dr\.?|Mrs\.?|Ms\.?|Late)\s+', '', n, flags=re.IGNORECASE)
+    # Uppercase for comparison
+    n = n.upper()
+    # Normalize whitespace
+    n = " ".join(n.split())
+    return n
+
+
+def build_db1_member_map(db1_url, db1_key):
+    """Query DB1 mps and mlas to build authoritative member ID mapping.
+
+    Returns:
+        dict: {("MP", normalized_name): {"id": db1_mp_id, "constituency_id": cid},
+               ("MLA", normalized_name): {"id": db1_mla_id, "constituency_id": cid}}
+
+    Raises:
+        RuntimeError: If DB1 cannot be reached or returns unexpected data.
+    """
+    from supabase import create_client
+
+    client = create_client(db1_url, db1_key)
+
+    # Query all MPs with constituency_id
+    mp_rows = client.table("mps").select("mp_id, mp_name, constituency_id").execute().data
+    if not mp_rows:
+        raise RuntimeError("DB1 mps table returned zero rows")
+
+    # Query all MLAs with constituency_id
+    mla_rows = client.table("mlas").select("mla_id, mla_name, constituency_id").execute().data
+    if not mla_rows:
+        raise RuntimeError("DB1 mlas table returned zero rows")
+
+    member_map = {}
+
+    for row in mp_rows:
+        norm = normalize_member_name(row["mp_name"])
+        if norm:
+            key = ("MP", norm)
+            if key in member_map:
+                raise RuntimeError(
+                    f"DB1 duplicate normalized MP name: '{row['mp_name']}' "
+                    f"(normalized: '{norm}') maps to both "
+                    f"mp_id={member_map[key]['id']} and mp_id={row['mp_id']}"
+                )
+            member_map[key] = {
+                "id": row["mp_id"],
+                "constituency_id": row.get("constituency_id"),
+            }
+
+    for row in mla_rows:
+        norm = normalize_member_name(row["mla_name"])
+        if norm:
+            key = ("MLA", norm)
+            if key in member_map:
+                raise RuntimeError(
+                    f"DB1 duplicate normalized MLA name: '{row['mla_name']}' "
+                    f"(normalized: '{norm}') maps to both "
+                    f"mla_id={member_map[key]['id']} and mla_id={row['mla_id']}"
+                )
+            member_map[key] = {
+                "id": row["mla_id"],
+                "constituency_id": row.get("constituency_id"),
+            }
+
+    print(f"  DB1 member map: {len(member_map)} entries "
+          f"({len(mp_rows)} MPs + {len(mla_rows)} MLAs)")
+
+    return member_map
 
 
 def load_ndjson(snapshot_dir, subdir_name):
@@ -30,11 +114,26 @@ def load_ndjson(snapshot_dir, subdir_name):
 
 
 def parse_date(s):
+    """Parse a date string into a date object.
+
+    Supports:
+        %d-%b-%Y           (e.g., 04-Jun-2024)
+        %Y-%m-%d           (e.g., 2024-06-04)
+        %d-%m-%Y           (e.g., 04-06-2024)
+        %b %d, %Y %I:%M:%S %p  (e.g., Jun 4, 2024 12:00:00 AM)
+        %b %d, %Y          (e.g., Jun 4, 2024)
+    """
     if not s:
         return None
-    for fmt in ["%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y"]:
+    for fmt in [
+        "%Y-%m-%d",
+        "%d-%b-%Y",
+        "%d-%m-%Y",
+        "%b %d, %Y %I:%M:%S %p",
+        "%b %d, %Y",
+    ]:
         try:
-            return datetime.strptime(s, fmt).date()
+            return datetime.strptime(s.strip(), fmt).date()
         except (ValueError, TypeError):
             continue
     return None
@@ -72,12 +171,29 @@ def load_all_data(snapshot_dir):
 
 
 def build_work_records(mp_rec, mp_san, mp_comp, mp_exp,
-                       mla_rec, mla_san, mla_comp, mla_exp):
+                       mla_rec, mla_san, mla_comp, mla_exp,
+                       db1_member_map=None):
     """Build unified work records from raw datasets.
+
+    All member IDs are resolved against DB1 authoritative master tables.
+    If db1_member_map is provided, every NDJSON member name must resolve
+    to a DB1 mp_id/mla_id. Unresolved names raise ValueError.
+
+    Args:
+        db1_member_map: dict mapping ("MP"/"MLA", normalized_name) -> db1_id.
+                        If None, raises RuntimeError (synthetic IDs are never used).
 
     Returns:
         tuple of (works, state_map, constituency_map, member_map)
+        where member_map is {normalized_name: db1_id} for all resolved members.
     """
+    if db1_member_map is None:
+        raise RuntimeError(
+            "build_work_records() requires db1_member_map. "
+            "Synthetic member IDs are not permitted. "
+            "Call build_db1_member_map() first."
+        )
+
     san_by_dtl = {}
     for r in mp_san:
         dtl = r.get("WORK_RECOMMENDATION_DTL_ID")
@@ -117,9 +233,10 @@ def build_work_records(mp_rec, mp_san, mp_comp, mp_exp,
     works = []
     state_map = {}
     constituency_map = {}
-    member_map = {}
-    mla_member_map = {}
-    mla_next_id = 100000
+    member_map = {}  # normalized_name -> db1_id (authoritative)
+
+    unresolved_mp = []
+    unresolved_mla = []
 
     for r in mp_rec:
         dtl = r.get("WORK_RECOMMENDATION_DTL_ID")
@@ -152,17 +269,25 @@ def build_work_records(mp_rec, mp_san, mp_comp, mp_exp,
         constituency = r.get("CONSTITUENCY", "")
         mp_name = r.get("MP_NAME", "")
 
-        if state_name not in state_map:
-            state_map[state_name] = len(state_map) + 1
-        state_id = state_map[state_name]
+        state_key = state_name.strip().upper()
+        if state_key not in state_map:
+            state_map[state_key] = len(state_map) + 1
+        state_id = state_map[state_key]
 
-        if constituency not in constituency_map:
-            constituency_map[constituency] = len(constituency_map) + 1
-        cid = constituency_map[constituency]
+        const_key = constituency.strip().upper()
+        if const_key not in constituency_map:
+            constituency_map[const_key] = len(constituency_map) + 1
+        cid = constituency_map[const_key]
 
-        if mp_name not in member_map:
-            member_map[mp_name] = len(member_map) + 1
-        mid = member_map[mp_name]
+        norm_name = normalize_member_name(mp_name) or mp_name
+        _entry = db1_member_map.get(("MP", norm_name))
+        mid = _entry["id"] if _entry else None
+        if mid is None:
+            unresolved_mp.append(mp_name)
+            continue
+
+        if norm_name not in member_map:
+            member_map[norm_name] = mid
 
         works.append({
             "work_id": int(dtl),
@@ -214,22 +339,27 @@ def build_work_records(mp_rec, mp_san, mp_comp, mp_exp,
 
         state_name = r.get("STATE_NAME", "")
         constituency = r.get("CONSTITUENCY", "")
-        const_id = r.get("CONSTITUENCY_ID")
         mp_name = r.get("MP_NAME", "")
 
-        if state_name not in state_map:
-            state_map[state_name] = len(state_map) + 1
-        state_id = state_map[state_name]
+        state_key = state_name.strip().upper()
+        if state_key not in state_map:
+            state_map[state_key] = len(state_map) + 1
+        state_id = state_map[state_key]
 
-        if constituency not in constituency_map:
-            constituency_map[constituency] = len(constituency_map) + 1
-        cid = constituency_map[constituency]
+        const_key = constituency.strip().upper()
+        if const_key not in constituency_map:
+            constituency_map[const_key] = len(constituency_map) + 1
+        cid = constituency_map[const_key]
 
-        mla_key = (mp_name, const_id)
-        if mla_key not in mla_member_map:
-            mla_member_map[mla_key] = mla_next_id
-            mla_next_id += 1
-        mid = mla_member_map[mla_key]
+        norm_name = normalize_member_name(mp_name) or mp_name
+        _entry = db1_member_map.get(("MLA", norm_name))
+        mid = _entry["id"] if _entry else None
+        if mid is None:
+            unresolved_mla.append(mp_name)
+            continue
+
+        if norm_name not in member_map:
+            member_map[norm_name] = mid
 
         works.append({
             "work_id": int(dtl) + 1000000,
@@ -252,11 +382,21 @@ def build_work_records(mp_rec, mp_san, mp_comp, mp_exp,
             "work_stage": r.get("WORK_STAGE", ""),
         })
 
+    if unresolved_mp:
+        raise ValueError(
+            f"UNRESOLVED MP NAMES ({len(unresolved_mp)}): "
+            f"{unresolved_mp[:20]}"
+        )
+    if unresolved_mla:
+        raise ValueError(
+            f"UNRESOLVED MLA NAMES ({len(unresolved_mla)}): "
+            f"{unresolved_mla[:20]}"
+        )
+
     print(f"  Total works built: {len(works):,}")
     print(f"  MP: {sum(1 for w in works if w['member_type'] == 'MP'):,}")
     print(f"  MLA: {sum(1 for w in works if w['member_type'] == 'MLA'):,}")
     print(f"  Unique states: {len(state_map)}")
-    print(f"  Unique MP members: {len(member_map)}")
-    print(f"  Unique MLA members: {len(mla_member_map)}")
+    print(f"  Resolved members: {len(member_map)}")
 
     return works, state_map, constituency_map, member_map

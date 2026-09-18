@@ -10,9 +10,6 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 
-# ==========================================
-# Configuration
-# ==========================================
 
 load_dotenv()
 
@@ -74,16 +71,13 @@ MLA_DATASETS = {
     "works_completed": "Works Completed",
     "expenditure": "Expenditure on Completed and On-going Works as on Date",
     "calamity": "Amount consented for Calamity",
-    "allocated_limit": "Allocated Limit for Hon'ble MPs",
+    "allocated_limit": "Allocated Limit for Hon'ble MLAs",
 }
 
 # Combined datasets for backward compatibility
 DATASETS = MP_DATASETS
 
 
-# ==========================================
-# Create MPLADS session
-# ==========================================
 
 def create_session():
     session = requests.Session()
@@ -106,9 +100,6 @@ def create_session():
     return session
 
 
-# ==========================================
-# Establish MPLADS session
-# ==========================================
 
 def establish_session(session):
     dashboard = session.get(
@@ -121,9 +112,6 @@ def establish_session(session):
     print("✓ MPLADS session established")
 
 
-# ==========================================
-# Fetch one dataset
-# ==========================================
 
 def fetch_dataset(session, dataset_name, dataset_key, combo):
     print()
@@ -173,9 +161,6 @@ def fetch_dataset(session, dataset_name, dataset_key, combo):
     return data
 
 
-# ==========================================
-# Extract actual records
-# ==========================================
 
 def extract_records(data, dataset_name):
     if not data:
@@ -213,9 +198,6 @@ def extract_records(data, dataset_name):
     return dataset_key, records
 
 
-# ==========================================
-# Upload one NDJSON chunk
-# ==========================================
 
 def upload_chunk(
     dataset_name,
@@ -284,9 +266,6 @@ def upload_chunk(
     return result
 
 
-# ==========================================
-# Upload dataset as NDJSON chunks
-# ==========================================
 
 def upload_dataset(
     dataset_name,
@@ -419,9 +398,6 @@ def upload_dataset(
     }
 
 
-# ==========================================
-# Upload manifest
-# ==========================================
 
 def upload_manifest(
     dataset_name,
@@ -470,9 +446,6 @@ def upload_manifest(
     print("  ✓ Manifest uploaded")
 
 
-# ==========================================
-# Upload completion marker
-# ==========================================
 
 def build_completion_marker(timestamp, results):
     """Build and validate the canonical _COMPLETE.json marker.
@@ -571,9 +544,6 @@ def upload_completion_marker(marker, supabase_client=None):
     print("  ✓ Completion marker uploaded")
 
 
-# ==========================================
-# Process one dataset
-# ==========================================
 
 def process_dataset(
     session,
@@ -612,9 +582,6 @@ def process_dataset(
     return result
 
 
-# ==========================================
-# Main
-# ==========================================
 
 def fetch_member_type(
     session,
@@ -636,10 +603,6 @@ def fetch_member_type(
     failed = 0
     results = {}
     failed_datasets = []
-
-    # ==================================
-    # PHASE 1: Attempt ALL datasets once
-    # ==================================
 
     print()
     print("=" * 70)
@@ -677,10 +640,6 @@ def fetch_member_type(
                 "key": dataset_key,
                 "error": str(error),
             })
-
-    # ==================================
-    # PHASE 2: Retry only failures
-    # ==================================
 
     if failed_datasets:
         print()
@@ -968,10 +927,6 @@ def main():
         local_only=local_only,
     )
 
-    # ==================================
-    # Final summary
-    # ==================================
-
     print()
     print("=" * 70)
     print("FETCH COMPLETE")
@@ -1003,10 +958,6 @@ def main():
 
     print()
     print(f"Timestamp folder: {timestamp}")
-
-    # ==================================
-    # COMPLETION MARKER
-    # ==================================
 
     if total_failed:
         print()

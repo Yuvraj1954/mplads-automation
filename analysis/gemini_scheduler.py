@@ -230,12 +230,10 @@ class GeminiScheduler:
         # Build initial work queue using packing + token safety
         work_queue = queue.Queue()
 
-        # Step 1: Pack into chunks of items_per_request
         raw_chunks = []
         for i in range(0, total_records, self.items_per_request):
             raw_chunks.append(evidence_rows[i:i + self.items_per_request])
 
-        # Step 2: Apply token safety check to each chunk
         for chunk in raw_chunks:
             safe_sub_batches = check_token_safety(chunk)
             for sub_batch in safe_sub_batches:
@@ -314,8 +312,6 @@ class GeminiScheduler:
         print(f"  api_requests={self._total_api_requests}")
         print(f"  duration={duration:.2f}s")
 
-        # ── Final Retry Pass #1 ──────────────────────────────────────────
-        # Collect ONLY genuinely failed records (not successful, not already up-to-date)
         failed_entity_keys = set()
         for f in failures:
             failed_entity_keys.add((f["entity_type"], str(f["entity_id"])))
@@ -353,7 +349,6 @@ class GeminiScheduler:
             print("\n=== GEMINI FINAL RETRY #1 ===")
             print("  candidates=0 — skipped")
 
-        # ── Final Retry Pass #2 ──────────────────────────────────────────
         retry2_recovered = []
         retry2_still_failed = []
 
@@ -377,7 +372,6 @@ class GeminiScheduler:
             print("\n=== GEMINI FINAL RETRY #2 ===")
             print("  candidates=0 — skipped")
 
-        # ── Final Summary ────────────────────────────────────────────────
         total_recovered = len(retry1_recovered) + len(retry2_recovered)
         unresolved_count = len(retry2_still_failed)
         final_success = self._total_success

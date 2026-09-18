@@ -241,8 +241,6 @@ def classify_calculation_scope() -> Dict[str, str]:
         "fy_metrics": "GLOBAL",
         "clustering": "GLOBAL",  # K-Means needs full population
         "isolation_forest": "GLOBAL",  # needs full population for contamination
-        "xgboost_training": "GLOBAL",  # temporal split needs all data
-        "xgboost_scoring": "ENTITY",  # scoring can be per-work
         "intelligence_assembly": "GLOBAL",  # needs ranking/percentile
         "evidence": "ENTITY",
         "ai_analysis": "ENTITY",
@@ -269,7 +267,6 @@ _CONDITIONAL_GLOBAL = {
     "fy_metrics",  # needs rebuild if works changed
     "clustering",  # needs rebuild if member_metrics changed significantly
     "isolation_forest",  # needs rebuild if work features changed
-    "xgboost_training",  # needs rebuild if training data changed
 }
 
 

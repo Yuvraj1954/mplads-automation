@@ -341,7 +341,7 @@ jobs:
           echo "Pipeline cannot safely continue in affected mode."
           echo ""
           echo "To fix:"
-          echo "  1. Run: python3 automation/seed_cache.py /path/to/snapshot_dir"
+          echo "  1. Populate the snapshot cache via the bootstrap-snapshot-cache workflow."
           echo "  2. Or trigger this workflow with bootstrap=true after cache is populated."
           exit 1
 

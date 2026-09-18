@@ -55,9 +55,6 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 load_dotenv()
 
@@ -91,9 +88,6 @@ DATASETS = [
 ]
 
 
-# ============================================================
-# IDENTITY FIELDS (raw source field names)
-# ============================================================
 
 IDENTITY_FIELDS = {
     "allocated_limit": ["MP_NAME", "STATE_NAME", "CONSTITUENCY", "TENURE"],
@@ -255,9 +249,6 @@ MONTHS = {
 }
 
 
-# ============================================================
-# NORMALIZATION (matches injector exactly)
-# ============================================================
 
 def normalize_text(value: Any) -> Optional[str]:
     if value is None:
@@ -321,9 +312,6 @@ def is_total_row(record: Dict[str, Any]) -> bool:
     return "Total_Amt" in record
 
 
-# ============================================================
-# IDENTITY KEY
-# ============================================================
 
 def identity_key(dataset: str, record: Dict[str, Any]) -> Optional[str]:
     values = []
@@ -335,9 +323,6 @@ def identity_key(dataset: str, record: Dict[str, Any]) -> Optional[str]:
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
 
 
-# ============================================================
-# CONTENT HASH (for non-expenditure datasets)
-# ============================================================
 
 def content_hash(dataset: str, record: Dict[str, Any]) -> str:
     fields = CONTENT_FIELDS[dataset]
@@ -353,9 +338,6 @@ def content_hash(dataset: str, record: Dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-# ============================================================
-# EXPENDITURE FINGERPRINT (matches injector exactly)
-# ============================================================
 
 def fingerprint_part(value: Any) -> str:
     if value is None:
@@ -392,9 +374,6 @@ def expenditure_fingerprint(record: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-# ============================================================
-# SUPABASE STORAGE: LIST & DOWNLOAD
-# ============================================================
 
 def list_complete_snapshots() -> List[str]:
     """List all timestamps that have _COMPLETE.json with status 'complete'."""
@@ -649,9 +628,6 @@ def load_local_snapshot_files(snapshot_dir: Path) -> Dict[str, Dict[str, Any]]:
     return result
 
 
-# ============================================================
-# RECORD ITERATION
-# ============================================================
 
 def iter_records(folder: Path) -> Iterator[Dict[str, Any]]:
     """
@@ -683,9 +659,6 @@ def iter_records(folder: Path) -> Iterator[Dict[str, Any]]:
                 yield record
 
 
-# ============================================================
-# CHUNK WRITER
-# ============================================================
 
 class ChunkWriter:
     """
@@ -729,9 +702,6 @@ class ChunkWriter:
         return self.chunk_num
 
 
-# ============================================================
-# SNAPSHOT LOADING INTO SQLITE
-# ============================================================
 
 def create_table_sql(dataset: str) -> str:
     if dataset in ("expenditure", "mla_expenditure"):
@@ -922,9 +892,6 @@ def load_snapshot_to_sqlite(
     }
 
 
-# ============================================================
-# QUICK COMPARISON (file-level hash optimization)
-# ============================================================
 
 def quick_compare(
     old_dir: Path,
@@ -997,9 +964,6 @@ def quick_compare(
     return result
 
 
-# ============================================================
-# COMPARISON
-# ============================================================
 
 def compare_dataset(
     dataset: str,
@@ -1097,9 +1061,6 @@ def compare_dataset(
         }
 
 
-# ============================================================
-# MANIFEST
-# ============================================================
 
 def generate_manifest(
     old_timestamp: Optional[str],
@@ -1128,9 +1089,6 @@ def generate_manifest(
     return manifest
 
 
-# ============================================================
-# MAIN
-# ============================================================
 
 def main() -> int:
     parser = argparse.ArgumentParser(

@@ -1,13 +1,15 @@
 """Risk engine: transparent combination of independent evidence sources.
 
 Evidence sources (all 0..1, higher = worse):
-  - predictive:  project delay ML mean probability across an entity's works.
   - anomaly_if:  Isolation Forest 95th-percentile anomaly across works.
   - statistical: existing entity anomaly_score (member_metrics), normalised.
   - exposure:    log-scaled sanctioned amount (modifier only, not score).
 
+XGBoost has been removed from production. The predictive (delay_probability)
+slot is retired. Risk now uses two active evidence sources.
+
 Combination (defensible, not arbitrary weights):
-  score_0_1 = mean([predictive, anomaly_if, statistical])
+  score_0_1 = mean([anomaly_if, statistical])
   score_0_100 = score_0_1 * 100
 
 Risk level thresholds (percentile-based within entity population, justified by
@@ -62,8 +64,6 @@ def _evidence_for(aggregate, entity_score, n_total):
     per-work evidence and the final entity score.
     """
     parts = []
-    if aggregate.get("mean_delay_prob") is not None:
-        parts.append(f"predictive delay probability {aggregate['mean_delay_prob']:.2f}")
     if aggregate.get("isolation_95") is not None:
         parts.append(f"isolation anomaly 95th percentile {aggregate['isolation_95']:.2f}")
     if not parts:
@@ -86,7 +86,7 @@ def _evidence_for(aggregate, entity_score, n_total):
 
 def compute_member_risks(members, work_risk_aggregates, entity_anomaly_lookup):
     """members: list of dicts from member_metrics with id/type/score fields.
-    work_risk_aggregates: dict (mt, mid) -> {"mean_delay_prob": float, "n": int, "isolation_95": float, "isolation_n": int}
+    work_risk_aggregates: dict (mt, mid) -> {"isolation_95": float, "n": int}
     entity_anomaly_lookup: dict (mt, mid) -> anomaly_score (0..something, lower = worse)
     Returns dict (mt, mid) -> dict with score, level, confidence, evidence.
     """
@@ -94,7 +94,6 @@ def compute_member_risks(members, work_risk_aggregates, entity_anomaly_lookup):
     for m in members:
         key = (m["member_type"], m["member_id"])
         wr = work_risk_aggregates.get(key, {})
-        pred = _safe(wr.get("mean_delay_prob"))
         anom = _safe(wr.get("isolation_95"))
         ent_anom = entity_anomaly_lookup.get(key)
         # normalize entity_anomaly (median/MAD robust z; in our impl smaller = more anomalous;
@@ -103,7 +102,8 @@ def compute_member_risks(members, work_risk_aggregates, entity_anomaly_lookup):
             stat = 0.5  # unknown -> neutral
         else:
             stat = max(0.0, min(1.0, (ent_anom + 3.0) / 6.0))  # map -3..+3 to 0..1
-        s = (pred + anom + stat) / 3.0
+        # XGBoost removed: risk = mean(anomaly_if, statistical)
+        s = (anom + stat) / 2.0
         pre_scores.append((key, s * 100.0))
     # percentile thresholds within entity population
     scores = [v for _, v in pre_scores]
@@ -128,11 +128,11 @@ def compute_state_risks(states, work_risk_aggregates_state, entity_anomaly_state
     for s in states:
         sid = int(s["state_id"])
         wr = work_risk_aggregates_state.get(sid, {})
-        pred = _safe(wr.get("mean_delay_prob"))
         anom = _safe(wr.get("isolation_95"))
         ent_anom = entity_anomaly_state.get(sid)
         stat = 0.5 if ent_anom is None else max(0.0, min(1.0, (ent_anom + 3.0) / 6.0))
-        score = (pred + anom + stat) / 3.0 * 100.0
+        # XGBoost removed: risk = mean(anomaly_if, statistical)
+        score = (anom + stat) / 2.0 * 100.0
         pre_scores.append((sid, score))
     scores = [v for _, v in pre_scores]
     out = {}
