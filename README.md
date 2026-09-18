@@ -65,49 +65,6 @@ flowchart TD
 
 ---
 
-## 2 · The Idea in One Diagram
-
-```mermaid
-flowchart LR
-    subgraph SOT["🗄️ SOURCE OF TRUTH — DB1"]
-        direction TB
-        S1[raw government data]
-        S2[identities]
-        S3[members]
-        S4[works]
-        S5[allocations]
-        S6[expenditures]
-        S7[operational metadata]
-    end
-
-    subgraph INT["🧠 ANALYTICS / INTELLIGENCE — DB2"]
-        direction TB
-        I1[work analysis]
-        I2[member metrics]
-        I3[state metrics]
-        I4[scores]
-        I5[rankings]
-        I6[risk]
-        I7[anomalies]
-        I8[evidence]
-        I9[AI explanations]
-    end
-
-    SOT ==>|derivation only| INT
-
-    style SOT fill:#1e3a8a,stroke:#60a5fa,color:#fff
-    style INT fill:#4c1d95,stroke:#a78bfa,color:#fff
-```
-
-| | Role |
-|---|---|
-| **DB1** | Authoritative source / identity + operational data |
-| **DB2** | Canonical derived analytics and intelligence |
-
-**Production intelligence writes go to DB2.** DB1 stays a faithful representation of the government source and the identities derived from it.
-
----
-
 ## 3 · What the Daily Pipeline Actually Does
 
 ### Stage 1 — Source Fetch
