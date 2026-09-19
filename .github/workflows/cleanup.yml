@@ -12,10 +12,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Delete all runs except protected workflows
+      - name: Delete obsolete workflow runs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -27,6 +28,7 @@ jobs:
           echo "Protected workflows:"
           echo "  - MPLADS Daily Pipeline"
           echo "  - Dependency Graph"
+          echo "  - Current Cleanup Workflow"
           echo
 
           deleted=0
@@ -42,28 +44,36 @@ jobs:
           echo
 
           while IFS= read -r run; do
+
             RUN_ID=$(echo "$run" | jq -r '.databaseId')
             WORKFLOW=$(echo "$run" | jq -r '.workflowName')
             STATUS=$(echo "$run" | jq -r '.status')
             CONCLUSION=$(echo "$run" | jq -r '.conclusion // "null"')
             CREATED=$(echo "$run" | jq -r '.createdAt')
 
+            # Keep the two production workflows.
             if [[ "$WORKFLOW" == "MPLADS Daily Pipeline" ]] ||
                [[ "$WORKFLOW" == "Dependency Graph" ]]; then
 
               echo "KEEP   | $WORKFLOW | run $RUN_ID | $CONCLUSION | $CREATED"
               kept=$((kept + 1))
-
-            else
-
-              echo "DELETE | $WORKFLOW | run $RUN_ID | $CONCLUSION | $CREATED"
-
-              gh run delete "$RUN_ID" \
-                --repo "$REPO" \
-                --confirm
-
-              deleted=$((deleted + 1))
+              continue
             fi
+
+            # Never delete the currently running cleanup workflow.
+            if [[ "$RUN_ID" == "$CURRENT_RUN_ID" ]]; then
+              echo "KEEP   | Current cleanup run | run $RUN_ID"
+              kept=$((kept + 1))
+              continue
+            fi
+
+            echo "DELETE | $WORKFLOW | run $RUN_ID | $CONCLUSION | $CREATED"
+
+            gh api \
+              --method DELETE \
+              "/repos/$REPO/actions/runs/$RUN_ID"
+
+            deleted=$((deleted + 1))
 
           done < <(jq -c '.[]' /tmp/runs.json)
 
@@ -75,7 +85,7 @@ jobs:
           echo "Kept runs    : $kept"
           echo "=========================================="
 
-      - name: Verify cleanup
+      - name: Verify remaining workflow history
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -85,7 +95,7 @@ jobs:
 
           echo
           echo "=========================================="
-          echo " Verifying remaining history"
+          echo " Remaining Workflow History"
           echo "=========================================="
 
           gh run list \
@@ -103,29 +113,33 @@ jobs:
             | @tsv
           '
 
+          echo
+          echo "Checking for obsolete runs..."
+
           REMAINING=$(gh run list \
             --repo "$REPO" \
             --limit 1000 \
-            --json workflowName |
+            --json databaseId,workflowName |
             jq '
               [
                 .[]
                 | select(
                     .workflowName != "MPLADS Daily Pipeline"
                     and .workflowName != "Dependency Graph"
+                    and .workflowName != "Cleanup Workflow History"
                   )
               ]
               | length
             ')
 
-          echo
-          echo "Obsolete workflow runs remaining: $REMAINING"
+          echo "Obsolete runs remaining: $REMAINING"
 
           if [[ "$REMAINING" -ne 0 ]]; then
-            echo "ERROR: Cleanup incomplete."
+            echo "ERROR: Obsolete workflow runs remain."
             exit 1
           fi
 
           echo
           echo "SUCCESS"
           echo "Only protected workflow history remains."
+          
