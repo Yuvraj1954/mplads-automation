@@ -1,4 +1,4 @@
-name: Cleanup Failed Workflow Runs
+name: Cleanup Workflow History
 
 on:
   workflow_dispatch:
@@ -8,24 +8,126 @@ permissions:
 
 jobs:
   cleanup:
+    name: Remove obsolete workflow runs
     runs-on: ubuntu-latest
 
     steps:
-      - name: Delete non-successful MPLADS runs
+      - name: Delete all runs except protected workflows
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
         run: |
-          REPO="${{ github.repository }}"
-          WORKFLOW="mplads-daily.yml"
+          set -euo pipefail
+
+          echo "=========================================="
+          echo " GitHub Actions History Cleanup"
+          echo "=========================================="
+          echo
+          echo "Protected workflows:"
+          echo "  - MPLADS Daily Pipeline"
+          echo "  - Dependency Graph"
+          echo
+
+          deleted=0
+          kept=0
 
           gh run list \
             --repo "$REPO" \
-            --workflow "$WORKFLOW" \
-            --limit 100 \
-            --json databaseId,conclusion \
-            --jq '.[] | select(.conclusion != "success" and .conclusion != null) | .databaseId' |
-          while read RUN_ID; do
-            echo "Deleting failed/non-success run: $RUN_ID"
-            gh run delete "$RUN_ID" --repo "$REPO"
-          done
-          
+            --limit 1000 \
+            --json databaseId,workflowName,status,conclusion,createdAt \
+            --paginate > /tmp/runs.json
+
+          echo "Scanning workflow runs..."
+          echo
+
+          while IFS= read -r run; do
+
+            RUN_ID=$(echo "$run" | jq -r '.databaseId')
+            WORKFLOW=$(echo "$run" | jq -r '.workflowName')
+            STATUS=$(echo "$run" | jq -r '.status')
+            CONCLUSION=$(echo "$run" | jq -r '.conclusion // "null"')
+            CREATED=$(echo "$run" | jq -r '.createdAt')
+
+            if [[ "$WORKFLOW" == "MPLADS Daily Pipeline" ]] ||
+               [[ "$WORKFLOW" == "Dependency Graph" ]]; then
+
+              echo "KEEP   | $WORKFLOW | run $RUN_ID | $CONCLUSION | $CREATED"
+              kept=$((kept + 1))
+
+            else
+
+              echo "DELETE | $WORKFLOW | run $RUN_ID | $CONCLUSION | $CREATED"
+
+              gh run delete "$RUN_ID" \
+                --repo "$REPO" \
+                --confirm
+
+              deleted=$((deleted + 1))
+            fi
+
+          done < <(
+            jq -c '.[]' /tmp/runs.json
+          )
+
+          echo
+          echo "=========================================="
+          echo " Cleanup Complete"
+          echo "=========================================="
+          echo "Deleted runs : $deleted"
+          echo "Kept runs    : $kept"
+          echo "=========================================="
+
+      - name: Verify protected workflows remain
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "Verifying remaining workflow history..."
+          echo
+
+          gh run list \
+            --repo "$REPO" \
+            --limit 1000 \
+            --json databaseId,workflowName,status,conclusion,createdAt \
+            --paginate |
+          jq -r '
+            .[]
+            | [
+                .databaseId,
+                .workflowName,
+                (.conclusion // "null"),
+                .createdAt
+              ]
+            | @tsv
+          '
+
+          echo
+          echo "Checking for obsolete workflow runs..."
+
+          REMAINING=$(gh run list \
+            --repo "$REPO" \
+            --limit 1000 \
+            --json workflowName \
+            --paginate |
+            jq '
+              [
+                .[]
+                | select(
+                    .workflowName != "MPLADS Daily Pipeline"
+                    and .workflowName != "Dependency Graph"
+                  )
+              ]
+              | length
+            ')
+
+          if [[ "$REMAINING" -ne 0 ]]; then
+            echo "ERROR: $REMAINING obsolete workflow runs remain."
+            exit 1
+          fi
+
+          echo "SUCCESS: Only protected workflow history remains."
