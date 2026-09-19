@@ -36,13 +36,12 @@ jobs:
             --repo "$REPO" \
             --limit 1000 \
             --json databaseId,workflowName,status,conclusion,createdAt \
-            --paginate > /tmp/runs.json
+            > /tmp/runs.json
 
           echo "Scanning workflow runs..."
           echo
 
           while IFS= read -r run; do
-
             RUN_ID=$(echo "$run" | jq -r '.databaseId')
             WORKFLOW=$(echo "$run" | jq -r '.workflowName')
             STATUS=$(echo "$run" | jq -r '.status')
@@ -66,9 +65,7 @@ jobs:
               deleted=$((deleted + 1))
             fi
 
-          done < <(
-            jq -c '.[]' /tmp/runs.json
-          )
+          done < <(jq -c '.[]' /tmp/runs.json)
 
           echo
           echo "=========================================="
@@ -78,7 +75,7 @@ jobs:
           echo "Kept runs    : $kept"
           echo "=========================================="
 
-      - name: Verify protected workflows remain
+      - name: Verify cleanup
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -87,14 +84,14 @@ jobs:
           set -euo pipefail
 
           echo
-          echo "Verifying remaining workflow history..."
-          echo
+          echo "=========================================="
+          echo " Verifying remaining history"
+          echo "=========================================="
 
           gh run list \
             --repo "$REPO" \
             --limit 1000 \
-            --json databaseId,workflowName,status,conclusion,createdAt \
-            --paginate |
+            --json databaseId,workflowName,status,conclusion,createdAt |
           jq -r '
             .[]
             | [
@@ -106,14 +103,10 @@ jobs:
             | @tsv
           '
 
-          echo
-          echo "Checking for obsolete workflow runs..."
-
           REMAINING=$(gh run list \
             --repo "$REPO" \
             --limit 1000 \
-            --json workflowName \
-            --paginate |
+            --json workflowName |
             jq '
               [
                 .[]
@@ -125,9 +118,14 @@ jobs:
               | length
             ')
 
+          echo
+          echo "Obsolete workflow runs remaining: $REMAINING"
+
           if [[ "$REMAINING" -ne 0 ]]; then
-            echo "ERROR: $REMAINING obsolete workflow runs remain."
+            echo "ERROR: Cleanup incomplete."
             exit 1
           fi
 
-          echo "SUCCESS: Only protected workflow history remains."
+          echo
+          echo "SUCCESS"
+          echo "Only protected workflow history remains."
