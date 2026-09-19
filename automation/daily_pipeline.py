@@ -1560,10 +1560,11 @@ def main():
             f"Analysis pipeline failed: {analysis_result.get('error', 'unknown')}"
         )
 
-    print("=== STEP 9: INTELLIGENCE BACKFILL ===")
+    print("=== STEP 9: INTELLIGENCE BACKFILL (REQUIRED) ===")
     t_intelligence = _timer()
     if args.skip_intelligence:
         print("Skipping intelligence backfill (--skip-intelligence)")
+        print("WARNING: Intelligence fields may be stale — this is NOT recommended for production.")
         timing["intelligence"] = 0.0
     else:
         if not INTELLIGENCE_BACKFILL.exists():
@@ -1602,20 +1603,9 @@ def main():
         intelligence_cmd = [sys.executable, str(INTELLIGENCE_BACKFILL), "--apply"]
         if scope_file:
             intelligence_cmd.extend(["--scope", scope_file])
-        try:
-            run(intelligence_cmd)
-            timing["intelligence"] = _elapsed(t_intelligence)
-            print(f"Intelligence backfill completed in {timing['intelligence']:.1f}s")
-        except Exception as exc:
-            # Fail-safe: ML stage must not undo a successful core pipeline run.
-            # Surface the error clearly so operators can retry/backfill manually,
-            # but preserve the freshly ingested source data and analytics.
-            elapsed = _elapsed(t_intelligence)
-            print(f"WARNING: Intelligence backfill failed after {elapsed:.1f}s: {exc}",
-                  file=sys.stderr)
-            print("Core pipeline succeeded. Intelligence fields may be stale until "
-                  "the backfill is re-run manually.", file=sys.stderr)
-            timing["intelligence"] = elapsed
+        run(intelligence_cmd)
+        timing["intelligence"] = _elapsed(t_intelligence)
+        print(f"Intelligence backfill completed in {timing['intelligence']:.1f}s")
 
     print("=== STEP 10: CLEANUP ===")
     t_cleanup = _timer()
