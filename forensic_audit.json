@@ -1,0 +1,1421 @@
+{
+  "audit_timestamp": "2026-09-19T04:48:53.280805+00:00",
+  "elapsed_ms": 80170.5,
+  "verdict": "PIPELINE READY \u2014 NO DATA INTEGRITY ISSUES FOUND",
+  "sections": [
+    {
+      "section_id": 1,
+      "title": "DATABASE INVENTORY",
+      "checks": [
+        {
+          "name": "DB1 table list",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "30 tables on DB1",
+          "details": [
+            "calamities",
+            "constituencies",
+            "data_updated",
+            "ingestion_jobs",
+            "mla_allocations",
+            "mla_calamities",
+            "mla_work_analysis",
+            "mla_work_completions",
+            "mla_work_expenditures",
+            "mla_work_recommendations",
+            "mla_work_sanctions",
+            "mla_works",
+            "mlas",
+            "mp_allocations",
+            "mps",
+            "states",
+            "work_analysis",
+            "work_completions",
+            "work_expenditures",
+            "work_recommendations",
+            "work_sanctions",
+            "works",
+            "z_deprecated_ml_work_anomaly",
+            "z_deprecated_mla_work_analysis",
+            "z_deprecated_phase_a_evidence",
+            "z_deprecated_phase_a_member_metrics",
+            "z_deprecated_phase_a_state_metrics",
+            "z_deprecated_phase_a_statistics",
+            "z_deprecated_phase_a_trends",
+            "z_deprecated_work_analysis"
+          ],
+          "row_count": 30,
+          "query_ms": 1018.504292005673
+        },
+        {
+          "name": "DB1 backup/temp tables",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No backup/temp tables found",
+          "details": null,
+          "row_count": null,
+          "query_ms": null
+        },
+        {
+          "name": "DB2 table list",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "24 tables on DB2",
+          "details": [
+            "ai_analysis",
+            "category_metrics",
+            "entity_evidence",
+            "evidence_pipeline_metadata",
+            "evidence_work_refs",
+            "fy_metrics",
+            "gemini_retry_backlog",
+            "member_intelligence",
+            "member_metrics",
+            "ml_work_anomaly",
+            "mla_work_analysis",
+            "model_registry",
+            "national_statistics",
+            "overall_metrics",
+            "phase_a_evidence_archive",
+            "phase_a_member_metrics_archive",
+            "phase_a_state_metrics_archive",
+            "phase_a_statistics_archive",
+            "phase_a_trends_archive",
+            "pipeline_metadata",
+            "state_intelligence",
+            "state_metrics",
+            "trends",
+            "work_analysis"
+          ],
+          "row_count": 24,
+          "query_ms": 472.7827079768758
+        },
+        {
+          "name": "DB2 backup/temp tables",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No backup/temp tables found",
+          "details": null,
+          "row_count": null,
+          "query_ms": null
+        }
+      ]
+    },
+    {
+      "section_id": 2,
+      "title": "CANONICAL MEMBER POPULATION",
+      "checks": [
+        {
+          "name": "MP count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Expected 543, got 543",
+          "details": null,
+          "row_count": 543,
+          "query_ms": 1019.3578330217861
+        },
+        {
+          "name": "MLA count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Expected 233, got 233",
+          "details": null,
+          "row_count": 233,
+          "query_ms": 1017.2387080092449
+        },
+        {
+          "name": "Total canonical members",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Expected 776, got 776 (543 MPs + 233 MLAs)",
+          "details": null,
+          "row_count": 776,
+          "query_ms": null
+        },
+        {
+          "name": "Duplicate MP names",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicate MP names",
+          "details": null,
+          "row_count": null,
+          "query_ms": 1053.0745840223972
+        },
+        {
+          "name": "Duplicate MLA names",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicate MLA names",
+          "details": null,
+          "row_count": null,
+          "query_ms": 1015.4254170192871
+        },
+        {
+          "name": "MP unique IDs",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "543 unique mp_id values for 543 rows",
+          "details": null,
+          "row_count": 543,
+          "query_ms": null
+        },
+        {
+          "name": "MLA unique IDs",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "233 unique mla_id values for 233 rows",
+          "details": null,
+          "row_count": 233,
+          "query_ms": null
+        }
+      ]
+    },
+    {
+      "section_id": 3,
+      "title": "SYNTHETIC ID DETECTION",
+      "checks": [
+        {
+          "name": "DB1 mps synthetic IDs",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No synthetic IDs found",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 1239.055083016865
+        },
+        {
+          "name": "DB1 mlas synthetic IDs",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No synthetic IDs found",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 1055.1759579975624
+        },
+        {
+          "name": "DB2 member_metrics synthetic IDs",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No synthetic IDs found",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 607.2983329941053
+        },
+        {
+          "name": "DB2 member_intelligence synthetic IDs",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No synthetic IDs found",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 471.8103329942096
+        }
+      ]
+    },
+    {
+      "section_id": 4,
+      "title": "MP/MLA SEPARATION",
+      "checks": [
+        {
+          "name": "MP work_analysis count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "109,177 MP work records",
+          "details": null,
+          "row_count": 109177,
+          "query_ms": 1515.6718750076834
+        },
+        {
+          "name": "MLA work_analysis count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "25,658 MLA work records",
+          "details": null,
+          "row_count": 25658,
+          "query_ms": 639.4257500069216
+        },
+        {
+          "name": "Non-MP member_type in work_analysis",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All records in work_analysis are MP",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 4664.941374998307
+        },
+        {
+          "name": "Non-MLA member_type in mla_work_analysis",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All records in mla_work_analysis are MLA",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 1327.6382079930045
+        },
+        {
+          "name": "Member IDs in both MP and MLA work tables",
+          "status": "WARN",
+          "severity": "HIGH",
+          "category": "CURRENT_PRODUCTION_ISSUE",
+          "message": "Found 196 distinct member_ids with MP works AND MLA works (auto-ID overlap is normal)",
+          "details": [
+            {
+              "member_id": 1
+            },
+            {
+              "member_id": 2
+            },
+            {
+              "member_id": 5
+            },
+            {
+              "member_id": 6
+            },
+            {
+              "member_id": 7
+            },
+            {
+              "member_id": 8
+            },
+            {
+              "member_id": 9
+            },
+            {
+              "member_id": 11
+            },
+            {
+              "member_id": 12
+            },
+            {
+              "member_id": 14
+            },
+            {
+              "member_id": 15
+            },
+            {
+              "member_id": 16
+            },
+            {
+              "member_id": 17
+            },
+            {
+              "member_id": 18
+            },
+            {
+              "member_id": 19
+            },
+            {
+              "member_id": 21
+            },
+            {
+              "member_id": 22
+            },
+            {
+              "member_id": 24
+            },
+            {
+              "member_id": 25
+            },
+            {
+              "member_id": 26
+            }
+          ],
+          "row_count": 196,
+          "query_ms": 1569.3822909961455
+        }
+      ]
+    },
+    {
+      "section_id": 5,
+      "title": "DUPLICATE WORKS",
+      "checks": [
+        {
+          "name": "MP duplicate work_ids in work_analysis",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicate work_ids",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 999.3527919868939
+        },
+        {
+          "name": "MLA duplicate work_ids in mla_work_analysis",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicate work_ids",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 578.6307500093244
+        },
+        {
+          "name": "work_id overlap between MP and MLA tables",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No overlapping work_ids",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 542.3527079983614
+        },
+        {
+          "name": "MP work_analysis PK constraint",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "PK constraint exists: work_analysis_pkey",
+          "details": [
+            {
+              "conname": "work_analysis_pkey"
+            }
+          ],
+          "row_count": null,
+          "query_ms": 512.730874994304
+        },
+        {
+          "name": "MLA mla_work_analysis PK constraint",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "PK constraint exists: mla_work_analysis_pkey",
+          "details": [
+            {
+              "conname": "mla_work_analysis_pkey"
+            }
+          ],
+          "row_count": null,
+          "query_ms": 521.6479170194361
+        }
+      ]
+    },
+    {
+      "section_id": 6,
+      "title": "MEMBER METRICS INTEGRITY",
+      "checks": [
+        {
+          "name": "member_metrics total count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Expected 776, got 776",
+          "details": null,
+          "row_count": 776,
+          "query_ms": 486.2240410002414
+        },
+        {
+          "name": "member_metrics by type",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "MLA: 233, MP: 543",
+          "details": [
+            {
+              "member_type": "MLA",
+              "cnt": 233
+            },
+            {
+              "member_type": "MP",
+              "cnt": 543
+            }
+          ],
+          "row_count": null,
+          "query_ms": 504.9770830082707
+        },
+        {
+          "name": "Duplicate member_id+type in member_metrics",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicates",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 557.8242089832202
+        },
+        {
+          "name": "Synthetic IDs in member_metrics",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No synthetic IDs",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 475.41070901206695
+        }
+      ]
+    },
+    {
+      "section_id": 7,
+      "title": "MEMBER INTELLIGENCE INTEGRITY",
+      "checks": [
+        {
+          "name": "member_intelligence total count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Expected 776, got 776",
+          "details": null,
+          "row_count": 776,
+          "query_ms": 503.1204999831971
+        },
+        {
+          "name": "member_intelligence by type",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "MLA: 233, MP: 543",
+          "details": [
+            {
+              "member_type": "MLA",
+              "cnt": 233
+            },
+            {
+              "member_type": "MP",
+              "cnt": 543
+            }
+          ],
+          "row_count": null,
+          "query_ms": 516.6676670196466
+        },
+        {
+          "name": "Duplicate member_id+type in member_intelligence",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicates",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 497.90633298107423
+        },
+        {
+          "name": "Synthetic IDs in member_intelligence",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No synthetic IDs",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 506.2904999940656
+        },
+        {
+          "name": "Members in member_metrics but not member_intelligence",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All members have intelligence records",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 481.3150829868391
+        },
+        {
+          "name": "member_intelligence without member_metrics",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No orphan intelligence records",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 527.0942080242094
+        }
+      ]
+    },
+    {
+      "section_id": 8,
+      "title": "STATE TABLES INTEGRITY",
+      "checks": [
+        {
+          "name": "state_metrics count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Expected >= 36, got 36",
+          "details": null,
+          "row_count": 36,
+          "query_ms": 478.52620799676515
+        },
+        {
+          "name": "state_intelligence count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Expected >= 36, got 36",
+          "details": null,
+          "row_count": 36,
+          "query_ms": 481.3220000069123
+        },
+        {
+          "name": "Duplicate state_id in state_metrics",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicates",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 473.6589580134023
+        },
+        {
+          "name": "Duplicate state_id in state_intelligence",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicates",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 495.7837499969173
+        },
+        {
+          "name": "NULL state_id in state_metrics",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No NULL state_ids",
+          "details": null,
+          "row_count": 0,
+          "query_ms": null
+        },
+        {
+          "name": "NULL state_id in state_intelligence",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No NULL state_ids",
+          "details": null,
+          "row_count": 0,
+          "query_ms": null
+        },
+        {
+          "name": "States in state_metrics but not state_intelligence",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All states have intelligence",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 496.91820799489506
+        },
+        {
+          "name": "States in state_intelligence but not state_metrics",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No orphan intelligence records",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 477.83100002561696
+        }
+      ]
+    },
+    {
+      "section_id": 9,
+      "title": "EVIDENCE & GEMINI INTEGRITY",
+      "checks": [
+        {
+          "name": "entity_evidence total count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "812 evidence records",
+          "details": null,
+          "row_count": 812,
+          "query_ms": 504.24516599741764
+        },
+        {
+          "name": "Duplicate entity_type+entity_id in entity_evidence",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicates",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 497.0033329736907
+        },
+        {
+          "name": "ai_analysis total count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "812 AI analysis records",
+          "details": null,
+          "row_count": 812,
+          "query_ms": 482.9260419937782
+        },
+        {
+          "name": "Duplicate entity_type+entity_id in ai_analysis",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No duplicates",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 491.5591669850983
+        },
+        {
+          "name": "evidence_work_refs total count",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "11,975 evidence work references",
+          "details": null,
+          "row_count": 11975,
+          "query_ms": 505.1506669842638
+        },
+        {
+          "name": "gemini_retry_backlog status",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Total backlog: 252, Pending: 0",
+          "details": [
+            {
+              "status": "RESOLVED",
+              "cnt": 252
+            }
+          ],
+          "row_count": 252,
+          "query_ms": 486.16200001561083
+        }
+      ]
+    },
+    {
+      "section_id": 10,
+      "title": "ANOMALY DATA INTEGRITY",
+      "checks": [
+        {
+          "name": "ml_work_anomaly table exists",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Table exists",
+          "details": null,
+          "row_count": null,
+          "query_ms": 505.4152919910848
+        },
+        {
+          "name": "MP work_analysis isolation levels",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "HIGHLY_UNUSUAL: 10484, NORMAL: 84395, UNUSUAL: 14298",
+          "details": [
+            {
+              "isolation_level": "HIGHLY_UNUSUAL",
+              "cnt": 10484
+            },
+            {
+              "isolation_level": "NORMAL",
+              "cnt": 84395
+            },
+            {
+              "isolation_level": "UNUSUAL",
+              "cnt": 14298
+            }
+          ],
+          "row_count": null,
+          "query_ms": 720.5925419984851
+        },
+        {
+          "name": "MLA work_analysis isolation levels",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "HIGHLY_UNUSUAL: 5821, NORMAL: 15298, UNUSUAL: 4539",
+          "details": [
+            {
+              "isolation_level": "HIGHLY_UNUSUAL",
+              "cnt": 5821
+            },
+            {
+              "isolation_level": "NORMAL",
+              "cnt": 15298
+            },
+            {
+              "isolation_level": "UNUSUAL",
+              "cnt": 4539
+            }
+          ],
+          "row_count": null,
+          "query_ms": 515.1187909941655
+        },
+        {
+          "name": "MP works with isolation_score",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "109,177 MP works have isolation scores",
+          "details": null,
+          "row_count": 109177,
+          "query_ms": 561.0979999764822
+        },
+        {
+          "name": "MLA works with isolation_score",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "25,658 MLA works have isolation scores",
+          "details": null,
+          "row_count": 25658,
+          "query_ms": 498.02137500955723
+        },
+        {
+          "name": "MP works missing isolation_score",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All MP works have isolation scores",
+          "details": null,
+          "row_count": 0,
+          "query_ms": null
+        },
+        {
+          "name": "MLA works missing isolation_score",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All MLA works have isolation scores",
+          "details": null,
+          "row_count": 0,
+          "query_ms": null
+        },
+        {
+          "name": "model_registry contents",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "1 models registered",
+          "details": [
+            {
+              "model_name": "isolation_forest",
+              "model_type": "IsolationForest",
+              "status": "READY",
+              "training_observations": 134835
+            }
+          ],
+          "row_count": 1,
+          "query_ms": 483.19970900774933
+        },
+        {
+          "name": "XGBoost production artifacts",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No XGBoost artifacts found",
+          "details": null,
+          "row_count": null,
+          "query_ms": null
+        }
+      ]
+    },
+    {
+      "section_id": 11,
+      "title": "PERFORMANCE SCORES",
+      "checks": [
+        {
+          "name": "ranking_qualified members",
+          "status": "WARN",
+          "severity": "HIGH",
+          "category": "CURRENT_PRODUCTION_ISSUE",
+          "message": "Expected 776 qualified, got 720",
+          "details": null,
+          "row_count": 720,
+          "query_ms": 476.08779201982543
+        },
+        {
+          "name": "Performance score distribution (qualified members)",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Min: 0.16, Max: 92.25, Avg: 40.76, NULL: 0, Negative: 0, >100: 0",
+          "details": {
+            "min_score": "0.16",
+            "max_score": "92.25",
+            "avg_score": "40.7622083333333333",
+            "total": 720,
+            "null_scores": 0,
+            "negative_scores": 0,
+            "over_100": 0
+          },
+          "row_count": null,
+          "query_ms": 478.0996660119854
+        },
+        {
+          "name": "Scores within valid range [0,100]",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All scores within [0,100]",
+          "details": null,
+          "row_count": 0,
+          "query_ms": null
+        },
+        {
+          "name": "NULL scores for qualified members",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All qualified members have scores",
+          "details": null,
+          "row_count": 0,
+          "query_ms": null
+        },
+        {
+          "name": "Unqualified members breakdown",
+          "status": "INFO",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "56 unqualified members",
+          "details": [
+            {
+              "member_type": "MP",
+              "cnt": 5,
+              "performance_classification": "INSUFFICIENT_DATA"
+            },
+            {
+              "member_type": "MLA",
+              "cnt": 11,
+              "performance_classification": "INSUFFICIENT_DATA"
+            },
+            {
+              "member_type": "MLA",
+              "cnt": 35,
+              "performance_classification": "NO_DATA"
+            },
+            {
+              "member_type": "MP",
+              "cnt": 5,
+              "performance_classification": "NO_DATA"
+            }
+          ],
+          "row_count": 56,
+          "query_ms": 483.5239590029232
+        }
+      ]
+    },
+    {
+      "section_id": 12,
+      "title": "RANKING CONSISTENCY",
+      "checks": [
+        {
+          "name": "MLA max rank vs population",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Max rank 187 vs population 187 (OK)",
+          "details": null,
+          "row_count": 187,
+          "query_ms": 470.52870798506774
+        },
+        {
+          "name": "MP max rank vs population",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Max rank 533 vs population 533 (OK)",
+          "details": null,
+          "row_count": 533,
+          "query_ms": 470.52870798506774
+        },
+        {
+          "name": "Ranks exceeding population",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No ranks exceed population",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 854.1978330176789
+        },
+        {
+          "name": "Qualified members with NULL rank",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All qualified members have ranks",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 495.21716599701904
+        },
+        {
+          "name": "State max rank vs population",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Max state rank 36 vs population 36",
+          "details": {
+            "population": 36,
+            "max_rank": 36
+          },
+          "row_count": null,
+          "query_ms": 511.33108302019536
+        },
+        {
+          "name": "member_intelligence peer_rank coverage",
+          "status": "WARN",
+          "severity": "MEDIUM",
+          "category": "CURRENT_PRODUCTION_ISSUE",
+          "message": "720/776 have peer_rank",
+          "details": null,
+          "row_count": 720,
+          "query_ms": 491.2366659846157
+        },
+        {
+          "name": "member_intelligence peer_percentile coverage",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "720/720 have peer_percentile (with peer_rank)",
+          "details": null,
+          "row_count": 720,
+          "query_ms": null
+        }
+      ]
+    },
+    {
+      "section_id": 13,
+      "title": "RISK DATA INTEGRITY",
+      "checks": [
+        {
+          "name": "member_intelligence risk level distribution",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "CRITICAL: 78, HIGH: 155, LOW: 310, MODERATE: 233",
+          "details": [
+            {
+              "risk_level": "CRITICAL",
+              "cnt": 78
+            },
+            {
+              "risk_level": "HIGH",
+              "cnt": 155
+            },
+            {
+              "risk_level": "LOW",
+              "cnt": 310
+            },
+            {
+              "risk_level": "MODERATE",
+              "cnt": 233
+            }
+          ],
+          "row_count": null,
+          "query_ms": 480.60916701797396
+        },
+        {
+          "name": "Invalid risk_level values",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All risk levels are valid",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 498.8340839918237
+        },
+        {
+          "name": "Risk scores outside [0,100] range",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All risk scores in [0,100]",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 525.45441701659
+        },
+        {
+          "name": "Scored members without risk_level",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All scored members have risk_level",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 470.60283401515335
+        },
+        {
+          "name": "state_intelligence risk level distribution",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "LOW: 14, MODERATE: 22",
+          "details": [
+            {
+              "risk_level": "LOW",
+              "cnt": 14
+            },
+            {
+              "risk_level": "MODERATE",
+              "cnt": 22
+            }
+          ],
+          "row_count": null,
+          "query_ms": 505.7693330163602
+        }
+      ]
+    },
+    {
+      "section_id": 14,
+      "title": "ORPHAN RECORD CHECKS",
+      "checks": [
+        {
+          "name": "MP work_analysis members not in member_metrics",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No orphan MP works",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 578.2132500025909
+        },
+        {
+          "name": "MLA work_analysis members not in member_metrics",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No orphan MLA works",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 494.6923330135178
+        },
+        {
+          "name": "evidence_work_refs referencing non-existent work_ids",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No orphan evidence work refs",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 581.2449170043692
+        }
+      ]
+    },
+    {
+      "section_id": 15,
+      "title": "DB1/DB2 ROUTING VERIFICATION",
+      "checks": [
+        {
+          "name": "Intelligence/analytics tables on DB1",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No intelligence tables on DB1 (correct)",
+          "details": null,
+          "row_count": 0,
+          "query_ms": null
+        },
+        {
+          "name": "Deprecated/archival tables on DB1",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "HISTORICAL_ARCHIVAL",
+          "message": "8 z_deprecated_* tables (historical, harmless)",
+          "details": [
+            "z_deprecated_ml_work_anomaly",
+            "z_deprecated_mla_work_analysis",
+            "z_deprecated_phase_a_evidence",
+            "z_deprecated_phase_a_member_metrics",
+            "z_deprecated_phase_a_state_metrics",
+            "z_deprecated_phase_a_statistics",
+            "z_deprecated_phase_a_trends",
+            "z_deprecated_work_analysis"
+          ],
+          "row_count": null,
+          "query_ms": null
+        },
+        {
+          "name": "Unexpected tables on DB1",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "All 30 DB1 tables are expected (source + source copies + deprecated)",
+          "details": null,
+          "row_count": null,
+          "query_ms": null
+        }
+      ]
+    },
+    {
+      "section_id": 16,
+      "title": "NULL / INVALID DATA AUDIT",
+      "checks": [
+        {
+          "name": "work_analysis NULL work_id",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 465.47662498778664
+        },
+        {
+          "name": "mla_work_analysis NULL work_id",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 472.36083398456685
+        },
+        {
+          "name": "member_metrics NULL member_id",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 468.95549999317154
+        },
+        {
+          "name": "member_metrics NULL member_type",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 467.48533300706185
+        },
+        {
+          "name": "state_metrics NULL state_id",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 467.7699999883771
+        },
+        {
+          "name": "member_intelligence NULL member_id",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 471.66591699351557
+        },
+        {
+          "name": "state_intelligence NULL state_id",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 468.78095899592154
+        },
+        {
+          "name": "work_analysis NULL member_id",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 467.50616701319814
+        },
+        {
+          "name": "mla_work_analysis NULL member_id",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 467.3648749885615
+        },
+        {
+          "name": "member_metrics negative total_works",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 470.22758302045986
+        },
+        {
+          "name": "member_metrics negative completed_works",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 469.7656669886783
+        },
+        {
+          "name": "state_metrics negative total_works",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 467.1363749948796
+        },
+        {
+          "name": "member_metrics completion_rate_pct out of range",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 468.9644160098396
+        },
+        {
+          "name": "member_metrics fund_utilization_pct out of range",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 467.2570419788826
+        },
+        {
+          "name": "state_metrics completion_rate_pct out of range",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 468.3559580007568
+        },
+        {
+          "name": "state_metrics NULL state_name",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 467.79320799396373
+        },
+        {
+          "name": "member_metrics NULL member_name",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Clean",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 467.5516670104116
+        }
+      ]
+    },
+    {
+      "section_id": 17,
+      "title": "LATEST PIPELINE STATE",
+      "checks": [
+        {
+          "name": "data_updated status",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Status: complete, Completed: 2026-09-19 04:25:22.324084+00:00, Updated: 2026-09-19 04:25:22.324084+00:00",
+          "details": {
+            "id": 1,
+            "completed_at": "2026-09-19 04:25:22.324084+00:00",
+            "status": "complete",
+            "updated_at": "2026-09-19 04:25:22.324084+00:00"
+          },
+          "row_count": null,
+          "query_ms": 1023.9545829826966
+        },
+        {
+          "name": "member_intelligence calculated_at range",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Oldest: 2026-09-19 04:25:04.665991+00:00, Newest: 2026-09-19 04:25:06.766000+00:00, Total: 776",
+          "details": {
+            "oldest": "2026-09-19 04:25:04.665991+00:00",
+            "newest": "2026-09-19 04:25:06.766000+00:00",
+            "total": 776
+          },
+          "row_count": null,
+          "query_ms": 468.4285830007866
+        },
+        {
+          "name": "state_intelligence calculated_at range",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "Oldest: 2026-09-19 04:25:07.063292+00:00, Newest: 2026-09-19 04:25:07.063292+00:00",
+          "details": {
+            "oldest": "2026-09-19 04:25:07.063292+00:00",
+            "newest": "2026-09-19 04:25:07.063292+00:00"
+          },
+          "row_count": null,
+          "query_ms": 472.597207990475
+        },
+        {
+          "name": "Ingestion jobs for latest run",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "1 job records",
+          "details": [
+            {
+              "run_id": "delta_2026-09-19T04-14-14Z",
+              "status": "completed",
+              "cnt": 6
+            }
+          ],
+          "row_count": null,
+          "query_ms": 1102.3062920139637
+        }
+      ]
+    },
+    {
+      "section_id": 18,
+      "title": "PROJECT-DELAY ARTIFACT CHECK",
+      "checks": [
+        {
+          "name": "XGBoost/project-delay in model_registry",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No XGBoost/project-delay artifacts",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 480.16212502261624
+        },
+        {
+          "name": "XGBoost/project-delay columns in schema",
+          "status": "PASS",
+          "severity": "INFORMATIONAL",
+          "category": "INFORMATIONAL_WARNING",
+          "message": "No XGBoost/project-delay columns",
+          "details": null,
+          "row_count": 0,
+          "query_ms": 528.7580830045044
+        }
+      ]
+    }
+  ]
+}
