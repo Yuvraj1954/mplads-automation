@@ -17,6 +17,51 @@ const DB_BATCH_SIZE = 500;
 // HELPERS
 // ============================================================
 
+/**
+ * Normalize a member name for identity matching.
+ *
+ * Mirrors analysis/snapshot_loader.py:normalize_member_name() exactly.
+ * Strips: parenthetical suffixes, common Indian honorific prefixes,
+ * collapses whitespace, and uppercases for case-insensitive comparison.
+ *
+ * This ensures "Shri Parimal Nathwani (2026-32)" and
+ * "Parimal Nathwani (2026-32)" resolve to the same canonical identity.
+ */
+function normalizeMemberName(name: string | null): string {
+  if (!name) {
+    return "";
+  }
+  let n = name.trim();
+  // Remove parenthetical suffixes like (2024-30)
+  n = n.replace(/\s*\(.*?\)\s*$/, "");
+  // Remove common title prefixes
+  n = n.replace(
+    /^(Shri|Smt\.?|Dr\.?|Mrs\.?|Ms\.?|Late)\s+/i,
+    ""
+  );
+  // Uppercase for comparison
+  n = n.toUpperCase();
+  // Normalize whitespace
+  n = n.replace(/\s+/g, " ").trim();
+  return n;
+}
+
+/**
+ * Build a canonical identity key for MP/MLA resolution.
+ *
+ * Format: "<normalized_name>|<constituency_id>"
+ * Uses normalizeMemberName() so honorific/casing variations
+ * resolve to the same identity.
+ */
+function memberKey(
+  name: string | null,
+  constituencyId: number | null
+): string {
+  return `${normalizeMemberName(name)}|${
+    constituencyId ?? ""
+  }`;
+}
+
 function text(value: unknown): string | null {
   if (value === null || value === undefined) {
     return null;
@@ -574,12 +619,10 @@ async function resolveMps(
   }
 
   for (const row of data ?? []) {
-    const key =
-      `${String(row.mp_name)
-        .trim()
-        .toLowerCase()}|${
-        row.constituency_id ?? ""
-      }`;
+    const key = memberKey(
+      row.mp_name,
+      row.constituency_id
+    );
 
     result.set(
       key,
@@ -625,12 +668,10 @@ async function resolveMps(
       }
     }
 
-    const key =
-      `${mpName
-        .trim()
-        .toLowerCase()}|${
-        constituencyId ?? ""
-      }`;
+    const key = memberKey(
+      mpName,
+      constituencyId
+    );
 
     if (
       !result.has(key) &&
@@ -688,12 +729,10 @@ async function resolveMps(
     }
 
     for (const row of inserted ?? []) {
-      const key =
-        `${String(row.mp_name)
-          .trim()
-          .toLowerCase()}|${
-          row.constituency_id ?? ""
-        }`;
+      const key = memberKey(
+        row.mp_name,
+        row.constituency_id
+      );
 
       result.set(
         key,
@@ -829,9 +868,7 @@ async function ingestRecommended(
     if (mpName) {
       mpId =
         mps.get(
-          `${mpName.toLowerCase()}|${
-            constituencyId ?? ""
-          }`
+          memberKey(mpName, constituencyId)
         ) ?? null;
     }
 
@@ -1074,9 +1111,7 @@ async function ingestSanctioned(
     const mpId =
       mpName
         ? mps.get(
-            `${mpName.toLowerCase()}|${
-              constituencyId ?? ""
-            }`
+            memberKey(mpName, constituencyId)
           ) ?? null
         : null;
 
@@ -1410,9 +1445,7 @@ async function ingestExpenditure(
     const mpId =
       mpName
         ? mps.get(
-            `${mpName.toLowerCase()}|${
-              constituencyId ?? ""
-            }`
+            memberKey(mpName, constituencyId)
           ) ?? null
         : null;
 
@@ -1594,9 +1627,7 @@ async function ingestAllocated(
 
     const mpId =
       mps.get(
-        `${mpName.toLowerCase()}|${
-          constituencyId ?? ""
-        }`
+        memberKey(mpName, constituencyId)
       ) ?? null;
 
     if (!mpId) {
@@ -1860,12 +1891,10 @@ async function resolveMlas(
   }
 
   for (const row of data ?? []) {
-    const key =
-      `${String(row.mla_name)
-        .trim()
-        .toLowerCase()}|${
-        row.constituency_id ?? ""
-      }`;
+    const key = memberKey(
+      row.mla_name,
+      row.constituency_id
+    );
 
     result.set(
       key,
@@ -1911,12 +1940,10 @@ async function resolveMlas(
       }
     }
 
-    const key =
-      `${mlaName
-        .trim()
-        .toLowerCase()}|${
-        constituencyId ?? ""
-      }`;
+    const key = memberKey(
+      mlaName,
+      constituencyId
+    );
 
     if (
       !result.has(key) &&
@@ -1973,12 +2000,10 @@ async function resolveMlas(
     }
 
     for (const row of inserted ?? []) {
-      const key =
-        `${String(row.mla_name)
-          .trim()
-          .toLowerCase()}|${
-          row.constituency_id ?? ""
-        }`;
+      const key = memberKey(
+        row.mla_name,
+        row.constituency_id
+      );
 
       result.set(
         key,
@@ -2051,9 +2076,7 @@ async function ingestMlaAllocated(
 
     const mlaId =
       mlas.get(
-        `${mlaName.toLowerCase()}|${
-          constituencyId ?? ""
-        }`
+        memberKey(mlaName, constituencyId)
       ) ?? null;
 
     if (!mlaId) {
@@ -2178,9 +2201,7 @@ async function ingestMlaRecommended(
     if (mlaName) {
       mlaId =
         mlas.get(
-          `${mlaName.toLowerCase()}|${
-            constituencyId ?? ""
-          }`
+          memberKey(mlaName, constituencyId)
         ) ?? null;
     }
 
@@ -2461,9 +2482,7 @@ async function ingestMlaSanctioned(
     const mlaId =
       mlaName
         ? mlas.get(
-            `${mlaName.toLowerCase()}|${
-              constituencyId ?? ""
-            }`
+            memberKey(mlaName, constituencyId)
           ) ?? null
         : null;
 
@@ -2765,9 +2784,7 @@ async function ingestMlaExpenditure(
     const mlaId =
       mlaName
         ? mlas.get(
-            `${mlaName.toLowerCase()}|${
-              constituencyId ?? ""
-            }`
+            memberKey(mlaName, constituencyId)
           ) ?? null
         : null;
 
