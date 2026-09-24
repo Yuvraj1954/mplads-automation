@@ -572,12 +572,19 @@ class GeminiScheduler:
                 return
 
             if status == "ALL_RPM_LIMITED":
+                now = time.monotonic()
+                remaining = [
+                    l.cooldown_until - now
+                    for l in self.lanes
+                    if not l.rpd_exhausted and l.cooldown_until > now
+                ]
+                wait = min(remaining) if remaining else 60.0
+                wait = max(1.0, min(wait, 60.0))
                 with self._log_lock:
-                    now = time.monotonic()
                     if now - self._last_all_rpm_wait > 5.0:
-                        print("    All eligible lanes RPM-limited; waiting 60 seconds")
+                        print(f"    All eligible lanes RPM-limited; waiting {wait:.0f} seconds")
                         self._last_all_rpm_wait = now
-                time.sleep(1.0)
+                time.sleep(wait)
                 item.tried_lanes.clear()
                 continue
 
