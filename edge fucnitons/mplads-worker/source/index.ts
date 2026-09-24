@@ -124,7 +124,7 @@ serve(async (req) => {
 
     if (!selectedJob) {
 
-      const { count, error } =
+      const { count: completedCount, error: completedErr } =
         await supabase
           .from("ingestion_jobs")
           .select(
@@ -137,11 +137,32 @@ serve(async (req) => {
           .eq("run_id", runId)
           .eq("status", "completed");
 
-      if (error) {
+      if (completedErr) {
         throw new Error(
-          `Completion count failed: ${JSON.stringify(error)}`
+          `Completion count failed: ${JSON.stringify(completedErr)}`
         );
       }
+
+      const { count: pendingCount } =
+        await supabase
+          .from("ingestion_jobs")
+          .select("*", { count: "exact", head: true })
+          .eq("run_id", runId)
+          .eq("status", "pending");
+
+      const { count: processingCount } =
+        await supabase
+          .from("ingestion_jobs")
+          .select("*", { count: "exact", head: true })
+          .eq("run_id", runId)
+          .eq("status", "processing");
+
+      const { count: failedCount } =
+        await supabase
+          .from("ingestion_jobs")
+          .select("*", { count: "exact", head: true })
+          .eq("run_id", runId)
+          .eq("status", "failed");
 
       return new Response(
         JSON.stringify({
@@ -150,7 +171,13 @@ serve(async (req) => {
             "All ingestion jobs completed.",
           run_id: runId,
           completed:
-            count ?? 0,
+            completedCount ?? 0,
+          pending:
+            pendingCount ?? 0,
+          processing:
+            processingCount ?? 0,
+          failed:
+            failedCount ?? 0,
         }),
         {
           status: 200,

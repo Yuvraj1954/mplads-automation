@@ -1482,8 +1482,32 @@ def main():
                 completed_count = result.get("completed", 0)
                 remaining = result.get("progress", {}).get("remaining", None)
 
+                # --- Terminal state detection ---
+                # The Edge Function reports status counts when no pending jobs remain.
+                # If pending=0 and processing=0, all jobs are in a terminal state
+                # (completed or failed). This is true regardless of whether some failed.
+                pending = result.get("pending", None)
+                processing = result.get("processing", None)
+                failed = result.get("failed", None)
+
+                is_terminal = (
+                    pending is not None
+                    and processing is not None
+                    and pending == 0
+                    and processing == 0
+                )
+
                 if msg == "All ingestion jobs completed." and completed_count >= expected_jobs:
                     print(f"[Worker {worker_idx}] All {expected_jobs} ingestion jobs completed.")
+                    all_completed.set()
+                    break
+                elif is_terminal:
+                    # All jobs in terminal state (completed + failed). Let verify_run report failures.
+                    print(
+                        f"[Worker {worker_idx}] Ingestion terminal: "
+                        f"completed={completed_count} failed={failed} "
+                        f"pending={pending} processing={processing}"
+                    )
                     all_completed.set()
                     break
                 elif remaining == 0:
@@ -1494,8 +1518,23 @@ def main():
                     time.sleep(1)
                     continue
                 elif msg == "All ingestion jobs completed.":
-                    # In-flight jobs still being processed by other worker threads
+                    # Edge Function returned completion but missing status counts
+                    # (legacy response). Fall through to terminal check via verify_run.
+                    print(
+                        f"[Worker {worker_idx}] Worker reported completion "
+                        f"but counts unclear (completed={completed_count}). "
+                        f"Checking job status..."
+                    )
                     time.sleep(3)
+                    # Query DB directly to check terminal state
+                    try:
+                        terminal_check = verify_run(run_id, expected_jobs)
+                    except Exception:
+                        terminal_check = False
+                    if terminal_check:
+                        all_completed.set()
+                        break
+                    # Not terminal yet — in-flight jobs remain
                     continue
                 else:
                     print(f"[Worker {worker_idx}] Worker:", result)
