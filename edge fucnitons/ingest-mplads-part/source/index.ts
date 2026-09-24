@@ -2235,7 +2235,7 @@ async function ingestMlaRecommended(
   await upsertBatches(
     "mla_works",
     works,
-    "work_recommendation_dtl_id"
+    "work_recommendation_dtl_id,mla_id"
   );
 
   const workMap =
@@ -2517,7 +2517,7 @@ async function ingestMlaSanctioned(
     await upsertBatches(
       "mla_works",
       works,
-      "work_recommendation_dtl_id"
+      "work_recommendation_dtl_id,mla_id"
     );
   }
 
